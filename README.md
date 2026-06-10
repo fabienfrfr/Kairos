@@ -19,13 +19,13 @@ The objective is to achieve **universal edge-capability**. By using a shared lat
 ## Roadmap: Toward Universal Intelligence
 
 * **Multimodal Integration:** Early-stage training for image, video, audio & lidar tokens (1% of training).
-* **Unified Tokenizer:** Learning a cross-modal embedding space.
+* **Unified Tokenizer:** Learning a cross-modal embedding space. (Ndvia)
 * **Generative Capabilities:** Researching native diffusion decoding within the SSM framework.
 
 ## Data & Training
 
 * **Dataset:** Inspired by *SmolLM* (high-quality, filtered educational and reasoning data) + cross-modal alignment sets.
-* **Procedure:** Compact, curriculum-based training focused on cross-modal grounding and agentic reasoning within a 1B budget.
+* **Procedure:** Compact, curriculum-based training focused on cross-modal grounding and agentic reasoning within a 1B budget. Multimodality inspired by [MMaDA](https://github.com/Gen-Verse/MMaDA).
 
 ## References
 
