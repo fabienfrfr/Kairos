@@ -25,7 +25,7 @@ The objective is to achieve **universal edge-capability**. By using a shared lat
 ## Data & Training
 
 * **Dataset:** Inspired by *SmolLM* (high-quality, filtered educational and reasoning data) + cross-modal alignment sets.
-* **Procedure:** Compact, curriculum-based training focused on cross-modal grounding and agentic reasoning within a 1B budget. Multimodality inspired by [MMaDA](https://github.com/Gen-Verse/MMaDA).
+* **Procedure:** Compact, curriculum-based training focused on cross-modal grounding and agentic reasoning within a 1B budget.
 
 ## References
 
