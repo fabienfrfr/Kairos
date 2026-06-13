@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 from transformers.models.mistral.modeling_mistral import MistralAttention
-
+from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 # =========================
 # Attention
@@ -146,72 +149,97 @@ class LiZAttention(nn.Module):
 # =========================
 # Normalization
 # =========================
-class RMSNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-6):
-        super().__init__()
-
-    def forward(self, x):
-        pass
+class RMSNorm(LlamaRMSNorm):
+    """RMS Norm for stabilization"""
+    pass
 
 
 # =========================
 # FeedForward / MoE
 # =========================
-class FFN(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-
-    def forward(self, x):
-        pass
+class FFN(Qwen2MoeMLP):
+    """dense FFN (SwiGLU + optimisations HF)."""
+    pass
 
 
-class MoEGate(nn.Module):
-    def __init__(self, d_model, num_experts):
-        super().__init__()
+class MoEBlock(DeepseekV3MoE):
+    """MoE (routing + scaling + grouping)."""
+    pass
 
-    def forward(self, x):
-        pass
-
-
-class MoEExperts(nn.Module):
-    def __init__(self, d_model, num_experts):
-        super().__init__()
-
-    def forward(self, x, indices, weights):
-        pass
-
-
-class MoEBlock(nn.Module):
-    def __init__(self, d_model, num_experts):
-        super().__init__()
-
-    def forward(self, x):
-        pass
 
 
 # =========================
-# Transformer Block (LLaDA style)
+# Transformer Block
 # =========================
+
 class DiffusionBlock(nn.Module):
-    def __init__(self, d_model, n_heads, window_size, num_experts=None):
+    def __init__(self, config, layer_idx, window_size, num_experts=None):
         super().__init__()
 
-        self.norm1 = RMSNorm(d_model)
-        self.norm2 = RMSNorm(d_model)
+        self.norm1 = RMSNorm(config.hidden_size)
+        self.norm2 = RMSNorm(config.hidden_size)
 
-        self.attn = SlidingWindowAttention(d_model, n_heads, window_size)
-        self.delta = BidirectionalDeltaNet(d_model)
-
-        self.alpha = nn.Parameter(torch.tensor(0.3))
+        self.attn = LiZAttention(config, layer_idx, window_size)
 
         self.ffn = (
-            MoEBlock(d_model, num_experts)
+            MoEBlock(config)
             if num_experts is not None
-            else FFN(d_model)
+            else FFN(config)
         )
 
-    def forward(self, x, mask=None):
-        pass
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+
+        return x
+
+
+
+# =========================
+# Backbone (with Attention Residual)
+# =========================
+class CastingRMSNorm(nn.RMSNorm):
+    """Cast weight to input dtype on the fly so the fused kernel dispatches under autocast."""
+
+    def forward(self, x):
+        w = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
+        return F.rms_norm(x, self.normalized_shape, w, self.eps)
+
+class AttnResAggregator(nn.Module):
+    """Softmax attention over a list of prior sublayer outputs (arXiv 2603.15031)"""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(n_embd))
+        self.key_norm = CastingRMSNorm(n_embd)
+
+    def forward(self, prior_values):
+        V = torch.stack(prior_values, dim=0)             # [L, B, T, d]
+        K = self.key_norm(V)                             # [L, B, T, d]
+        logits = torch.einsum("d,lbtd->lbt", self.w, K)  # [L, B, T]
+        weights = F.softmax(logits, dim=0)               # over the L source dim
+        return (weights.unsqueeze(-1) * V).sum(dim=0)    # [B, T, d]
+
+
+class DiffusionBackbone(nn.Module):
+    def __init__(self, config, n_layers, window_size, num_experts=None):
+        super().__init__()
+
+        self.layers = nn.ModuleList([
+            DiffusionBlock(config, i, window_size, num_experts)
+            for i in range(n_layers)
+        ])
+
+        self.norm = RMSNorm(config.hidden_size)
+        self.aggregator = AttnResAggregator(config.hidden_size)
+
+    def forward(self, x):
+        states = [x]
+
+        for layer in self.layers:
+            h = self.aggregator(states)
+            x = layer(h)
+            states.append(x)
+        return self.norm(x)
 
 
 # =========================
@@ -240,30 +268,6 @@ class PositionEmbedding(nn.Module):
     def forward(self, x):
         pass
 
-
-# =========================
-# Backbone (Transformer)
-# =========================
-class DiffusionBackbone(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        n_layers,
-        n_heads,
-        window_size,
-        num_experts=None,
-    ):
-        super().__init__()
-
-        self.layers = nn.ModuleList([
-            DiffusionBlock(d_model, n_heads, window_size, num_experts)
-            for _ in range(n_layers)
-        ])
-
-        self.norm = RMSNorm(d_model)
-
-    def forward(self, x, mask=None):
-        pass
 
 
 # =========================
