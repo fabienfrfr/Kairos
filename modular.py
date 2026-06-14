@@ -1,11 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 from transformers.models.mistral.modeling_mistral import MistralAttention
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from transformers.models.generation_diffusion_gemma import DiffusionGemmaGenerationMixin
+from transformers.models.byt5.tokenization_byt5 import ByT5Tokenizer
 
 # =========================
 # Attention
@@ -64,18 +68,18 @@ class BidirectionalDeltaNet(Qwen3NextGatedDeltaNet):
 
 
 # =========================
-# Shared QKV Projection
+# Shared QKV-O Projection
 # =========================
-class SharedQKV(nn.Module):
+class SharedQKVO(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
         self.q = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, x):
         return self.q(x), self.k(x), self.v(x)
-
 
 
 class SharedQKVProjection(nn.Module):
@@ -116,23 +120,26 @@ class LiZAttention(nn.Module):
 
         self.hidden_size = config.hidden_size
 
-        # shared QKV
-        self.shared_qkv = SharedQKV(self.hidden_size)
+        # shared QKV (add output !! all classic projection is shared)
+        self.shared_qkvo = SharedQKV(self.hidden_size)
 
         # SWA
         self.swa = SlidingWindowAttention(config, layer_idx, window_size)
-        self.swa.q_proj = self.shared_qkv.q
-        self.swa.k_proj = self.shared_qkv.k
-        self.swa.v_proj = self.shared_qkv.v
+        self.swa.q_proj = self.shared_qkvo.q
+        self.swa.k_proj = self.shared_qkvo.k
+        self.swa.v_proj = self.shared_qkvo.v
+        self.swa.o_proj = self.shared_qkvo.o 
+
 
         # DeltaNet
         self.delta = BidirectionalDeltaNet(config, layer_idx)
-
         self.delta.in_proj_qkvz = SharedQKVProjection(
-            self.shared_qkv,
+            self.shared_qkvo,
             self.delta
         )
+        self.delta.out_proj = self.shared_qkvo.o
 
+        # Memory as gate
         self.alpha = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, x, position_embeddings=None):
@@ -171,7 +178,6 @@ class MoEBlock(DeepseekV3MoE):
 # =========================
 # Transformer Block
 # =========================
-
 class DiffusionBlock(nn.Module):
     def __init__(self, config, layer_idx, window_size, num_experts=None):
         super().__init__()
@@ -192,7 +198,6 @@ class DiffusionBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
 
         return x
-
 
 
 # =========================
@@ -245,52 +250,41 @@ class DiffusionBackbone(nn.Module):
 # =========================
 # Embeddings
 # =========================
+class ByteTokenizer(ByT5Tokenizer):
+    pass
+
+
 class TokenEmbedding(nn.Module):
     def __init__(self, vocab_size, d_model):
         super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.scale = d_model ** 0.5
 
     def forward(self, x):
-        pass
-
-
-class TimestepEmbedding(nn.Module):
-    def __init__(self, max_timesteps, d_model):
-        super().__init__()
-
-    def forward(self, t):
-        pass
-
-
-class PositionEmbedding(nn.Module):
-    def __init__(self, max_seq_len, d_model):
-        super().__init__()
-
-    def forward(self, x):
-        pass
-
+        return self.embed(x) * self.scale
 
 
 # =========================
 # Full Model (standard HF-like)
 # =========================
-class DiffusionLLM(nn.Module):
+class DiffusionGemmaBlockDiffusionOutputWithPast(CausalLMOutputWithPast):
+    encoder_last_hidden_state: torch.FloatTensor | None = None
+
+
+class DiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
     def __init__(
         self,
-        vocab_size=260,
+        vocab_size=259, #ByT5
         d_model=768,
         n_layers=12,
         n_heads=12,
         window_size=128,
-        max_seq_len=2048,
-        max_timesteps=1000,
         num_experts=None,
     ):
         super().__init__()
 
         # Embeddings
         self.token_embed = TokenEmbedding(vocab_size, d_model)
-        self.pos_embed = PositionEmbedding(max_seq_len, d_model)
-        self.time_embed = TimestepEmbedding(max_timesteps, d_model)
 
         # Backbone
         self.backbone = DiffusionBackbone(
@@ -305,49 +299,16 @@ class DiffusionLLM(nn.Module):
         self.norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward(self, x_t, t, mask=None):
-        pass
-
-
-# =========================
-# Diffusion Scheduler
-# =========================
-class DiffusionScheduler(nn.Module):
-    def __init__(self, num_timesteps, mask_token_id):
-        super().__init__()
-
-    def corrupt(self, x0, t):
-        pass
-
-
-# =========================
-# Loss
-# =========================
-class DiffusionLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, model, x0, t):
-        pass
-
-
-# =========================
-# Sampler
-# =========================
-class DiffusionSampler(nn.Module):
-    def __init__(self, mask_token_id, num_steps):
-        super().__init__()
-
-    def sample(self, model, seq_len):
-        pass
-
-
-# =========================
-# Trainer Wrapper
-# =========================
-class DiffusionTrainer(nn.Module):
-    def __init__(self, model, scheduler):
-        super().__init__()
-
-    def training_step(self, batch):
-        pass
+    def forward(
+        self,
+        input_ids=None,
+        decoder_input_ids=None,
+        self_conditioning_logits=None,
+        past_key_values=None,
+        **kwargs
+    ):
+        # TODO
+        return DiffusionGemmaBlockDiffusionOutputWithPast(
+            logits=logits,
+            past_key_values=kv_cache,
+        )

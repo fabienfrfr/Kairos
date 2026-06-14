@@ -119,3 +119,48 @@ class KairosModel(DiffusionGemmaPreTrainedModel):
             history.append(hidden_states)
             
         return hidden_states
+
+
+
+# =========================
+# Diffusion Scheduler
+# =========================
+class DiffusionScheduler(nn.Module):
+    def __init__(self, num_timesteps, mask_token_id):
+        super().__init__()
+
+    def corrupt(self, x0, t):
+        pass
+
+
+# =========================
+# Loss
+# =========================
+class DiffusionLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, model, x0, t):
+        pass
+
+
+# =========================
+# Sampler
+# =========================
+class DiffusionSampler(nn.Module):
+    def __init__(self, mask_token_id, num_steps):
+        super().__init__()
+
+    def sample(self, model, seq_len):
+        pass
+
+
+# =========================
+# Trainer Wrapper
+# =========================
+class DiffusionTrainer(nn.Module):
+    def __init__(self, model, scheduler):
+        super().__init__()
+
+    def training_step(self, batch):
+        pass
