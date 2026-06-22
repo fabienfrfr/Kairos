@@ -4,6 +4,12 @@ ENV_FILE=.env
 
 # --- Feature ---
 
+coverage: ## prod-level > 95%
+	uv run pytest --cov=src --cov-report=term-missing
+
+edit-notebook: ## Working test
+	uv run marimo edit notebook.py
+
 code-map: ## Export project structure to JSON
 	uv run python3 mapper.py --to-json
 

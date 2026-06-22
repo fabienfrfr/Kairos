@@ -1,0 +1,142 @@
+@startuml
+skinparam backgroundColor white
+skinparam roundcorner 10
+skinparam arrowColor #2C3E50
+skinparam Shadowing false
+
+skinparam activity {
+    BackgroundColor #0078D4
+    BorderColor #005A9E
+    FontColor white
+    FontSize 12
+    FontStyle bold
+}
+
+skinparam partition {
+    BorderColor #34495E
+    FontColor #2C3E50
+    FontSize 13
+    FontStyle bold
+}
+
+' ─────────────────────────────────────────
+' 1. INPUT
+' ─────────────────────────────────────────
+partition "1. Input Tokenization" #EBF5FB {
+    :Raw Text Input\n(bytes, audio, image, lidar tokens);
+    :ByT5 Byte Tokenizer\n(vocab = 259, no subword);
+}
+
+' ─────────────────────────────────────────
+' 2. CODEC
+' ─────────────────────────────────────────
+partition "2. Convolutional Codec — Encode" #E8F8F5 {
+    note right
+        **ConvCodec (stride = 3)**
+        * Depthwise Conv1d kernel=5
+        * Reduces sequence length × ⅓
+        * Shared encoder/decoder weights
+        * orig_len saved for decode
+    end note
+    :KairosEmbedding\n(token embed × √d_model);
+    :ConvCodec.encode\n(B, T, d) → (B, T/3, d);
+}
+
+' ─────────────────────────────────────────
+' 3. BACKBONE
+' ─────────────────────────────────────────
+partition "3. KairosDiffusionBackbone" #FEF9E7 {
+    note right
+        **Attention Residual (AttnRes)**
+        * Softmax over all prior layer outputs
+        * Weighted sum replaces plain residual
+        * Stabilizes deep signal propagation
+        * arXiv: 2603.15031
+    end note
+    :KairosAttnRes\nAggregate prior layer states;
+
+    fork
+        ' ── LEFT: SWA ──
+        :SWA — KairosAttention\nBidirectional sliding window;
+        note right
+            * Window size W (configurable)
+            * RoPE positional encoding
+            * GQA (num_kv_heads < num_heads)
+            * flex_attention (GPU) / eager (CPU)
+        end note
+    fork again
+        ' ── RIGHT: DeltaNet ──
+        :DeltaNet — KairosGatedDeltaNet\nBidirectional linear SSM;
+        note left
+            * Forward pass (stateful, cached)
+            * Backward pass (stateless flip)
+            * Gated delta rule (chunk / recurrent)
+            * Causal Conv1d on Q/K/V
+        end note
+    end fork
+
+    :KairosLiZAttention2 — Merge\nShared Q/K/V/O projections (LiZ)\nconcat(SWA, Delta) → out_proj;
+    note right
+        **LiZ (Linked-Z)**
+        * Forces aligned representation space
+        * delta.q/k/v/out_proj = swa.q/k/v/out
+        * Final mixer: Linear(2D → D)
+    end note
+
+    :KairosMoE / KairosFFN\n(16 experts, 4 active — DeepSeekV3 routing);
+}
+
+' ─────────────────────────────────────────
+' 4. DIFFUSION LOOP
+' ─────────────────────────────────────────
+if (Training mode ?\n(noise mask applied)) then (Yes — MDLM)
+    note right
+        **Diffusion Trainer**
+        * Timestep t ~ Uniform(ε, 1)
+        * Token masking p = (1−ε)t + ε
+        * Loss = CE(logits[mask], x0[mask]) / p
+        * Prompt tokens never masked
+    end note
+    :KairosDiffusionTrainer\nApply noise mask xt → logits → loss;
+else (No — Inference)
+    :KairosCache.clone()\nIsolated state per diffusion step\n(KV + conv_cache + ssm_cache);
+    :Iterative denoising\nSelf-conditioning: soft_emb = p(xt) @ W_e;
+endif
+
+' ─────────────────────────────────────────
+' 5. VALIDATION GATE
+' ─────────────────────────────────────────
+if (Forward stable ?\n(no NaN, loss > 0, grads ≠ None)) then (Yes)
+    :Extract metrics\nUpdate TRL / perplexity / velocity;
+else (No)
+    -[#red]->
+    :Debug — Bayesian adjustment\n(architecture / hyperparams / data);
+    -[#red]->
+    stop
+endif
+
+' ─────────────────────────────────────────
+' 6. OUTPUT
+' ─────────────────────────────────────────
+partition "5. Output Decoding" #F5EEF8 {
+    note right
+        **OutputHead**
+        * KairosNorm (RMSNorm)
+        * ConvCodec.decode: (B, T/3, d) → (B, T, d)
+        * lm_head weight tied to embedding
+    end note
+    :KairosNorm\nRMS normalization;
+    :ConvCodec.decode\n(B, T/3, d) → (B, T, d);
+    :lm_head (weight-tied)\n→ Logits (vocab = 259);
+}
+
+' ─────────────────────────────────────────
+' 7. CLOSE
+' ─────────────────────────────────────────
+partition "6. Generation & Evaluation" #EAFAF1 {
+    :DiffusionGemmaGenerationMixin\nSampling / greedy / beam;
+    :Benchmark\nTarget: Gemma-3 270M quality\nUnder T4 / 5060Ti budget;
+    :Retex\nDataset curation / arch refinement;
+}
+
+@enduml

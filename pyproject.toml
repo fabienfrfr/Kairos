@@ -5,8 +5,23 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "accelerate>=1.14.0",
+    "datasets>=5.0.0",
+    "einops>=0.8.2",
+    "huggingface-hub>=1.18.0",
+    "ipython>=9.14.1",
     "marimo>=0.23.9",
     "pathspec>=1.1.1",
+    "pytest>=9.1.0",
+    "pytest-cov>=7.1.0",
+    "tensorboard>=2.20.0",
     "torch>=2.12.0",
-    "transformers>=5.11.0",
+    "transformers>=5.12.0",
+]
+
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+  "integration"
 ]

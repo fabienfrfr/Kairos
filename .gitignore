@@ -1,5 +1,8 @@
 uv.lock
 project_structure.json
+/.vscode
+/data
+/tmp*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
