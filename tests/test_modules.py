@@ -1,8 +1,9 @@
 import pytest
 import torch
+import random
 
-from src.attentions import KairosCache
-from src.modeling import (
+from kairos.attentions import KairosCache
+from kairos.modeling import (
     KairosConfig,
     DiffusionBlock,
     KairosDiffusionBackbone,
@@ -12,10 +13,10 @@ from src.modeling import (
     ConvCodec,
 )
 
-from src.tokenizer import KairosTokenizer
-from src.dataset import KairosPretrainingDataset, KairosRLDataset
+from kairos.tokenizer import KairosTokenizer
+from kairos.dataset import KairosPretrainingDataset, KairosRLDataset, KairosSFTDataset
 
-from src.trainer import KairosDiffusionTrainer
+from kairos.trainer import KairosDiffusionTrainer
 
 # =========================
 # Fixtures
@@ -32,6 +33,54 @@ def mini_wiki_texts():
         "The Earth orbits the Sun.",
         "Water boils at 100 degrees Celsius."
     ]
+
+@pytest.fixture
+def mini_mcq():
+    return [
+        {
+            "inputs": "What is the capital of France?",
+            "multiple_choice_targets": ["Berlin", "Paris", "Madrid"],
+            "multiple_choice_scores":  [0, 1, 0],
+            "reasoning": "France is in Western Europe. Its capital is Paris.",
+        },
+        {
+            "inputs": "What orbits the Sun?",
+            "multiple_choice_targets": ["The Moon", "The Earth", "Mars"],
+            "multiple_choice_scores":  [0, 1, 0],
+            "reasoning": "The Earth orbits the Sun.",
+        },
+    ]
+
+
+MAX_LEN = 512  # ByT5 tokenizes byte-by-byte
+
+@pytest.fixture
+def mini_toolace():
+    """One ToolACE-style example: system + user + assistant + tool result + assistant."""
+    return [
+        {
+            "system": '[{"name": "get_weather", "description": "Get weather for a city.", "parameters": {"city": {"type": "string"}}}]',
+            "conversations": [
+                {"from": "user",      "value": "What is the weather in Paris?"},
+                {"from": "assistant", "value": "[get_weather(city=Paris)]"},
+                {"from": "tool",      "value": '[{"temperature": 22, "condition": "sunny"}]'},
+                {"from": "assistant", "value": "It is 22°C and sunny in Paris."},
+            ],
+        }
+    ]
+
+
+@pytest.fixture
+def mini_alpaca():
+    """One alpaca-style example: instruction + input + output."""
+    return [
+        {
+            "instruction": "Translate the following sentence to French.",
+            "input": "The sky is blue.",
+            "output": "Le ciel est bleu.",
+        }
+    ]
+
 
 
 @pytest.fixture
@@ -284,16 +333,117 @@ def test_dataset_preprocess(tokenizer, mini_wiki_texts):
     assert (input_ids != tokenizer.pad_token_id).any()
 
 
-def test_rl_dataset_basic():
-    ds = KairosRLDataset(max_samples=1, timeout=10)
+# --- ToolACE tests ---
+
+def test_sft_toolace_length(tokenizer, mini_toolace):
+    ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
+    assert len(ds) == 1
+
+
+def test_sft_toolace_keys(tokenizer, mini_toolace):
+    ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
+    for key in ("input_ids", "gen_mask", "prompt_len"):
+        assert key in ds[0]
+
+
+def test_sft_toolace_shapes(tokenizer, mini_toolace):
+    ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
+    s = ds[0]
+    assert s["input_ids"].shape == (MAX_LEN,)
+    assert s["gen_mask"].shape  == (MAX_LEN,)
+
+
+def test_sft_toolace_prompt_never_noised(tokenizer, mini_toolace):
+    ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
+    s    = ds[0]
+    plen = s["prompt_len"].item()
+    assert s["gen_mask"][:plen].sum() == 0
+
+
+def test_sft_toolace_generation_region_exists(tokenizer, mini_toolace):
+    ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
+    assert ds[0]["gen_mask"].sum() > 0
+
+
+def test_sft_toolace_last_assistant_is_generation(tokenizer, mini_toolace):
+    """The generation region must correspond to the last assistant turn only."""
+    ds   = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
+    s    = ds[0]
+    plen = s["prompt_len"].item()
+
+    # Decode the generation region and check it contains the last assistant answer
+    gen_ids = s["input_ids"][plen:]
+    decoded = tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True).strip()
+    assert "22" in decoded or "sunny" in decoded or "Paris" in decoded
+
+
+# --- Alpaca tests ---
+
+def test_sft_alpaca_length(tokenizer, mini_alpaca):
+    ds = KairosSFTDataset(tokenizer, examples=mini_alpaca, max_len=MAX_LEN)
+    assert len(ds) == 1
+
+
+def test_sft_alpaca_generation_is_output(tokenizer, mini_alpaca):
+    """The generation region must contain the expected French translation."""
+    ds   = KairosSFTDataset(tokenizer, examples=mini_alpaca, max_len=MAX_LEN)
+    s    = ds[0]
+    plen = s["prompt_len"].item()
+
+    gen_ids = s["input_ids"][plen:]
+    decoded = tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True).strip()
+    assert "bleu" in decoded.lower()
+
+# --- BigBench tests ---
+
+def test_rldataset_length(tokenizer, mini_mcq):
+    ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
+    assert len(ds) == 2
+ 
+ 
+def test_rldataset_keys(tokenizer, mini_mcq):
+    ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
     sample = ds[0]
-
-    assert "text" in sample
-    assert "choices" in sample
-    assert "scores" in sample
-    assert "level" in sample
-    assert "mask_ratio" in sample
-
+    for key in ("input_ids", "gen_mask", "prompt_len", "mask_ratio", "choices", "scores", "level"):
+        assert key in sample
+ 
+ 
+def test_rldataset_shapes(tokenizer, mini_mcq):
+    ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=256)
+    s = ds[0]
+    assert s["input_ids"].shape == (256,)
+    assert s["gen_mask"].shape  == (256,)
+ 
+ 
+def test_rldataset_prompt_never_noised(tokenizer, mini_mcq):
+    ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
+    for i in range(len(ds)):
+        s    = ds[i]
+        plen = s["prompt_len"].item()
+        assert s["gen_mask"][:plen].sum() == 0
+ 
+ 
+def test_rldataset_generation_region_exists(tokenizer, mini_mcq):
+    ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
+    for i in range(len(ds)):
+        assert ds[i]["gen_mask"].sum() > 0
+ 
+ 
+def test_rldataset_uncertainty_choice_present(tokenizer, mini_mcq):
+    ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
+    for i in range(len(ds)):
+        assert "not sure / I don't know" in ds[i]["choices"]
+ 
+ 
+def test_rldataset_anti_reversal_curse(tokenizer, mini_mcq):
+    """Same examples, different seeds → at least one sample must differ."""
+    random.seed(0)
+    ds1 = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=128)
+    random.seed(99)
+    ds2 = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=128)
+ 
+    diffs = sum(not torch.equal(ds1[i]["input_ids"], ds2[i]["input_ids"]) for i in range(len(ds1)))
+    assert diffs > 0
 
 
 # =========================

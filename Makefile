@@ -7,10 +7,13 @@ ENV_FILE=.env
 coverage: ## prod-level > 95%
 	uv run pytest --cov=src --cov-report=term-missing
 
-edit-notebook: ## Working test
-	uv run marimo edit notebook.py
+notebook: ## Working test
+	uv run marimo edit notebook/playground.py
 
-code-map: ## Export project structure to JSON
+jupyter: ## If you want to use Kaggle T4x2
+	uv run marimo export ipynb notebook/playground.py -o notebook.ipynb
+
+mapper: ## Export project structure to JSON
 	uv run python3 mapper.py --to-json
 
 ##@ Maintenance

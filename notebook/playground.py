@@ -6,9 +6,16 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    # !pip install -q marimo
     import marimo as mo
 
     return (mo,)
+
+
+@app.cell
+def _():
+    # !pip install -q git+https://github.com/fabienfrfr/Kairos@dev
+    return
 
 
 @app.cell
@@ -16,6 +23,11 @@ def _(mo):
     mo.md("""
     # 🌀 Kairos — Training Notebook
     Build · Inspect · Train · Checkpoint
+
+
+    ⚠️ **Work in Progress (WIP)**
+
+    This notebook is actively under development. Some components (training loop, logging, checkpointing, etc.) may be incomplete, experimental, or subject to change. Use for testing and exploration only.
     """)
     return
 
@@ -35,18 +47,18 @@ def _():
 
     from transformers import TrainingArguments
 
-    from src.modeling import KairosConfig, KairosDiffusionLLM, ConvCodec
-    from src.attentions import KairosCache
-    from src.tokenizer import KairosTokenizer
-    from src.dataset import KairosPretrainingDataset
-    from src.trainer import KairosDiffusionTrainer
+    from kairos.modeling import KairosConfig, KairosDiffusionLLM, ConvCodec
+    from kairos.attentions import KairosCache
+    from kairos.tokenizer import KairosTokenizer
+    from kairos.dataset import KairosPretrainingDataset
+    from kairos.trainer import KairosDiffusionTrainer
 
     return (
         DataLoader,
         KairosConfig,
-        KairosPretrainingDataset,
         KairosDiffusionLLM,
         KairosDiffusionTrainer,
+        KairosPretrainingDataset,
         KairosTokenizer,
         Path,
         SummaryWriter,
@@ -69,6 +81,98 @@ def _(mo, torch):
         kind="info",
     )
     return (device,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    *Estimate pretraining compute time*
+
+    Based on Training Compute-Optimal Large Language Models : https://arxiv.org/abs/2203.15556
+
+    Verify calculus for token/s
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    GPU_FLOPS = {
+        "T4": 65,
+        "RTX_5060Ti": 200,
+        "RTX_5070Ti": 300,
+        "A100": 312,
+        "H100": 1000,
+    }
+
+
+    GPU_BW = {
+        "T4": 300e9,
+        "RTX_5060Ti": 600e9,
+        "RTX_5070Ti": 800e9,
+        "A100": 1500e9,
+        "H100": 3000e9,
+    }
+
+
+    gpu = mo.ui.dropdown(
+        list(GPU_FLOPS.keys()),
+        value="T4",
+        label="GPU"
+    )
+
+
+    eff = mo.ui.slider(
+        0.05, 0.5,
+        step=0.05,
+        value=0.3,
+        label="GPU efficiency"
+    )
+
+    params = mo.ui.slider(
+        1, 50,
+        value=5,
+        label="Active params (millions)"
+    )
+
+    tokens = mo.ui.slider(
+        1, 50,
+        value=30, # cosmopedia
+        label="Training tokens (billions)"
+    )
+
+    mo.vstack([gpu, params, tokens, eff])
+    return GPU_BW, GPU_FLOPS, eff, gpu, params, tokens
+
+
+@app.cell
+def _(GPU_BW, GPU_FLOPS, eff, gpu, mo, params, tokens):
+    flops = GPU_FLOPS[gpu.value] * 1e12
+    bw = GPU_BW[gpu.value]
+
+    params_total = params.value * 1e6
+    tokens_total = tokens.value * 1e9
+
+    n_ops = 6  # compute cost (qkvo+ffn+1)
+
+    # --- compute bound ---
+    tok_s_compute = (flops / (n_ops * params_total)) * eff.value
+
+    # --- memory bound ---
+    bytes_per_token = 4 * params_total  # fp16 rule-of-thumb
+    tok_s_memory = bw / bytes_per_token
+
+    # --- real ---
+    tok_s_real = min(tok_s_compute, tok_s_memory)
+    time_days = tokens_total / tok_s_real / 86400
+
+    mo.md(f"""
+    ### 🧠 Compute-bound` {tok_s_compute:.0f} tok/s`
+    ### 💾 Memory-bound` {tok_s_memory:.0f} tok/s`
+    ### ⚖️ Real throughput` {tok_s_real:.0f} tok/s`
+    ### ⏱️ Training time` {time_days:.1f} days`
+    """)
+    return
 
 
 @app.cell

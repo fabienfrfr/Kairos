@@ -4,6 +4,12 @@ project_structure.json
 /data
 /tmp*
 
+*.zim
+*.bz2
+*.jsonl
+# Jupyter is forbidden here (use marimo and export)
+#*.ipynb
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
