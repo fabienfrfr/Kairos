@@ -4,7 +4,24 @@ from transformers.models.byt5.tokenization_byt5 import ByT5Tokenizer
 class KairosTokenizer(ByT5Tokenizer):
     pass
 
+# enrich with multimodality (draw inspiration of pixelbytetokenizer)
 
+"""
+Create dataset from : 
+
+IMAGE  -> Flickr8k (1000 images)
+
+AUDIO  -> AudioCaps (1000 clips)
+
+VIDEO  -> MSR-VTT (1000 vidéos)
+
+LIDAR  -> nuScenes mini
+
+IMU    -> MotionSense
+
+ffurfaro/PixelBytes-OptimalControl
+
+"""
 
 # ==========================================================
 # Reserved Special Tokens

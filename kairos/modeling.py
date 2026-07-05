@@ -28,7 +28,7 @@ class KairosConfig(PretrainedConfig):
         vocab_size=259,
         intermediate_size=2048,
         window_size=128,
-        stride = 3,
+        stride = 5, # need to find for multimodality
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -38,6 +38,10 @@ class KairosConfig(PretrainedConfig):
         self.num_hidden_layers = n_layers
         self.vocab_size = vocab_size
         self.num_modalities = kwargs.get("num_modalities", 8)
+        self.text_modality_id = kwargs.get("text_modality_id", 0)
+
+        # Convolutionnal Byte-Codec
+        self.stride = stride
 
         # SWA full-Attention
         self.sliding_window_size = window_size
@@ -75,10 +79,6 @@ class KairosConfig(PretrainedConfig):
         self.topk_group = kwargs.get("topk_group", 1)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", False)
         self.top_k = self.num_experts_per_tok
-
-
-        # Convolutionnal Byte-Codec
-        self.stride = stride
 
         # Layers config (required by KairosCache)
         self.layers_config = kwargs.get(
@@ -378,7 +378,9 @@ class KairosDiffusionLLM(
 
         # Default modality = TEXT
         if modality_ids is None:
-            modality_ids = torch.zeros_like(x)
+            modality_ids = torch.full_like(
+                    x, self.config.text_modality_id,
+                )
 
         # Multimodal embedding
         h = self.embedding(
