@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from dataclasses import dataclass
+
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
@@ -35,6 +37,7 @@ class KairosConfig(PretrainedConfig):
         self.num_attention_heads = n_heads
         self.num_hidden_layers = n_layers
         self.vocab_size = vocab_size
+        self.num_modalities = kwargs.get("num_modalities", 8)
 
         # SWA full-Attention
         self.sliding_window_size = window_size
@@ -185,7 +188,10 @@ class KairosDiffusionBackbone(nn.Module):
 # =========================
 # Embeddings, Codec & Head
 # =========================
+
 class KairosEmbedding(nn.Module):
+    """Token + modality embeddings."""
+
     def __init__(
         self,
         vocab_size: int,
@@ -206,25 +212,30 @@ class KairosEmbedding(nn.Module):
         token_ids: torch.LongTensor,
         modality_ids: torch.LongTensor,
     ):
-        token_h = self.token_embed(token_ids)
-        modality_h = self.modality_embed(modality_ids)
-
-        h = (token_h + modality_h) * self.scale
+        h = self.token_embed(token_ids)
+        h = h + self.modality_embed(modality_ids)
+        h = h * self.scale
 
         return self.codec(h, mode="encode")
 
 
-
 class OutputHead(nn.Module):
-    def __init__(self, embedding: KairosEmbedding, codec):
+    """Token + modality prediction heads."""
+
+    def __init__(
+        self,
+        embedding: KairosEmbedding,
+        codec,
+    ):
         super().__init__()
 
         self.codec = codec
 
         d_model = embedding.token_embed.embedding_dim
-        
-        self.vocab_size = embedding.token_embed.num_embeddings
 
+        # Used by trainer/tests
+        self.vocab_size = embedding.token_embed.num_embeddings
+        self.num_modalities = embedding.modality_embed.num_embeddings
 
         self.token_head = nn.Linear(
             d_model,
@@ -232,12 +243,23 @@ class OutputHead(nn.Module):
             bias=False,
         )
 
+        self.modality_head = nn.Linear(
+            d_model,
+            self.num_modalities,
+            bias=False,
+        )
+
         # Weight tying
         self.token_head.weight = embedding.token_embed.weight
+        self.modality_head.weight = embedding.modality_embed.weight
 
     def forward(self, h):
         h = self.codec(h, mode="decode")
-        return self.token_head(h)
+
+        token_logits = self.token_head(h)
+        modality_logits = self.modality_head(h)
+
+        return token_logits, modality_logits
 
 
 class ConvCodec(nn.Module):
@@ -283,8 +305,11 @@ class ConvCodec(nn.Module):
 # =========================
 # Full Model (standard HF-like)
 # =========================
-class DiffusionGemmaBlockDiffusionOutputWithPast(CausalLMOutputWithPast):
+
+@dataclass
+class KairosOutput(CausalLMOutputWithPast):
     encoder_last_hidden_state: torch.FloatTensor | None = None
+    modality_logits: torch.FloatTensor | None = None
 
 
 class KairosDiffusionLLM(
@@ -306,7 +331,6 @@ class KairosDiffusionLLM(
         )
 
         # Multimodal embedding
-
         if vocab_size is None:
             vocab_size = config.vocab_size
 
@@ -324,9 +348,7 @@ class KairosDiffusionLLM(
         )
 
         # Final normalization
-        self.norm = KairosNorm(
-            config.hidden_size
-        )
+        self.norm = KairosNorm(config.hidden_size)
 
         # Output projection
         self.lm_head = OutputHead(
@@ -388,10 +410,11 @@ class KairosDiffusionLLM(
         h = self.norm(h)
 
         # Vocabulary projection
-        logits = self.lm_head(h)
+        token_logits, modality_logits = self.lm_head(h)
 
         # HF-compatible output
-        return DiffusionGemmaBlockDiffusionOutputWithPast(
-            logits=logits,
-            past_key_values=None,  # TODO: cache support
+        return KairosOutput(
+            logits=token_logits,
+            modality_logits=modality_logits,
+            past_key_values=None,
         )
