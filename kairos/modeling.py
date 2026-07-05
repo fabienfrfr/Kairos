@@ -186,33 +186,58 @@ class KairosDiffusionBackbone(nn.Module):
 # Embeddings, Codec & Head
 # =========================
 class KairosEmbedding(nn.Module):
-    def __init__(self, vocab_size, d_model, codec):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_modalities: int,
+        d_model: int,
+        codec,
+    ):
         super().__init__()
 
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.scale = d_model ** 0.5
+        self.token_embed = nn.Embedding(vocab_size, d_model)
+        self.modality_embed = nn.Embedding(num_modalities, d_model)
+
+        self.scale = d_model**0.5
         self.codec = codec
 
-    def forward(self, x):
-        h = self.embed(x) * self.scale
+    def forward(
+        self,
+        token_ids: torch.LongTensor,
+        modality_ids: torch.LongTensor,
+    ):
+        token_h = self.token_embed(token_ids)
+        modality_h = self.modality_embed(modality_ids)
+
+        h = (token_h + modality_h) * self.scale
+
         return self.codec(h, mode="encode")
 
 
-class OutputHead(nn.Module):
-    def __init__(self, embedding, codec):
-        super().__init__()
 
-        d = embedding.embed.embedding_dim
-        self.vocab_size = embedding.embed.num_embeddings
+class OutputHead(nn.Module):
+    def __init__(self, embedding: KairosEmbedding, codec):
+        super().__init__()
 
         self.codec = codec
 
-        self.lm_head = nn.Linear(d, self.vocab_size, bias=False)
-        self.lm_head.weight = embedding.embed.weight
+        d_model = embedding.token_embed.embedding_dim
+        
+        self.vocab_size = embedding.token_embed.num_embeddings
+
+
+        self.token_head = nn.Linear(
+            d_model,
+            self.vocab_size,
+            bias=False,
+        )
+
+        # Weight tying
+        self.token_head.weight = embedding.token_embed.weight
 
     def forward(self, h):
         h = self.codec(h, mode="decode")
-        return self.lm_head(h)
+        return self.token_head(h)
 
 
 class ConvCodec(nn.Module):
@@ -262,19 +287,35 @@ class DiffusionGemmaBlockDiffusionOutputWithPast(CausalLMOutputWithPast):
     encoder_last_hidden_state: torch.FloatTensor | None = None
 
 
-class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
+class KairosDiffusionLLM(
+    PreTrainedModel,
+    DiffusionGemmaGenerationMixin,
+):
     def __init__(
         self,
         config,
-        vocab_size=259,
+        vocab_size=None,  # bytes + special multimodal tokens
         num_experts=None,
     ):
         super().__init__(config)
 
         # Codec
-        self.codec = ConvCodec(config.hidden_size, stride=config.stride)
-        # Embedding (learned tokenizer via conv + stride)
-        self.token_embed = KairosEmbedding(vocab_size, config.hidden_size, self.codec)
+        self.codec = ConvCodec(
+            config.hidden_size,
+            stride=config.stride,
+        )
+
+        # Multimodal embedding
+
+        if vocab_size is None:
+            vocab_size = config.vocab_size
+
+        self.embedding = KairosEmbedding(
+            vocab_size=vocab_size,
+            num_modalities=config.num_modalities,
+            d_model=config.hidden_size,
+            codec=self.codec,
+        )
 
         # Backbone (SWA / DeltaNet etc.)
         self.backbone = KairosDiffusionBackbone(
@@ -282,46 +323,75 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
             num_experts=num_experts,
         )
 
-        # Output head
-        self.norm = KairosNorm(config.hidden_size)
-        self.lm_head = OutputHead(self.token_embed, self.codec)
+        # Final normalization
+        self.norm = KairosNorm(
+            config.hidden_size
+        )
 
+        # Output projection
+        self.lm_head = OutputHead(
+            self.embedding,
+            self.codec,
+        )
 
     def forward(
         self,
         input_ids=None,
         decoder_input_ids=None,
+        modality_ids=None,
         self_conditioning_logits=None,
         past_key_values=None,
         cache_params=None,
-        **kwargs
+        **kwargs,
     ):
-        # canvas
+        # Input sequence (DiffusionGemma compatibility)
         if decoder_input_ids is not None:
             x = decoder_input_ids
         elif input_ids is not None:
             x = input_ids
         else:
-            raise ValueError("You must provide input_ids or decoder_input_ids")
+            raise ValueError(
+                "You must provide input_ids or decoder_input_ids"
+            )
 
-        # embedding
-        h = self.token_embed(x)
+        # Default modality = TEXT
+        if modality_ids is None:
+            modality_ids = torch.zeros_like(x)
 
-        # self-conditioning (diffusion)
+        # Multimodal embedding
+        h = self.embedding(
+            token_ids=x,
+            modality_ids=modality_ids,
+        )
+
+        # Self-conditioning (diffusion)
         if self_conditioning_logits is not None:
-            probs = torch.softmax(self_conditioning_logits, dim=-1)
-            soft_emb = probs @ self.token_embed.embed.weight
+            probs = torch.softmax(
+                self_conditioning_logits,
+                dim=-1,
+            )
+
+            soft_emb = (
+                probs
+                @ self.embedding.token_embed.weight
+            )
+
             h = h + soft_emb
 
-        # backbone
-        h = self.backbone(h, cache_params=cache_params)
+        # Backbone
+        h = self.backbone(
+            h,
+            cache_params=cache_params,
+        )
+
+        # Final norm
         h = self.norm(h)
 
-        # projection vocab
+        # Vocabulary projection
         logits = self.lm_head(h)
 
-        # HF-compatible
+        # HF-compatible output
         return DiffusionGemmaBlockDiffusionOutputWithPast(
             logits=logits,
-            past_key_values=None,  # need or not ?
+            past_key_values=None,  # TODO: cache support
         )

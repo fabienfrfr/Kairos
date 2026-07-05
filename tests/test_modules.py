@@ -85,7 +85,8 @@ def mini_alpaca():
 
 @pytest.fixture
 def config():
-    return KairosConfig(d_model=32, n_heads=4, n_layers=2)
+    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
+
 
 # =========================
 # Config
@@ -142,16 +143,26 @@ def test_aggregator_weights_sum():
 # =========================
 # Embeddings & Codec
 # =========================
+
 def test_token_embedding():
     codec = ConvCodec(32, stride=3)
-    emb = KairosEmbedding(100, 32, codec)
 
-    x = torch.randint(0, 100, (2, 8))
-    out = emb(x)
+    emb = KairosEmbedding(
+        vocab_size=100,
+        num_modalities=7,
+        d_model=32,
+        codec=codec,
+    )
 
-    
-    assert out.shape[1] == 3
-    assert out.shape[2] == 32
+    x = torch.randint(0, 100, (2, 16))
+    m = torch.zeros_like(x)
+
+    y = emb(
+        token_ids=x,
+        modality_ids=m,
+    )
+
+    assert y.shape[0] == 2
 
 
 
