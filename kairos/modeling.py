@@ -8,11 +8,10 @@ from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationMixin
 
 
-from .attentions import KairosLiZAttention2
+from .attentions import KairosLiZAttention2, KairosNorm
 
 # =========================
 # PretrainedConfig
@@ -39,6 +38,11 @@ class KairosConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.num_modalities = kwargs.get("num_modalities", 8)
         self.text_modality_id = kwargs.get("text_modality_id", 0)
+
+        self.modality_scales = {
+            0: [0, 1],  # text
+            1: [1, 2],  # image
+        }
 
         # Convolutionnal Byte-Codec
         self.stride = stride
@@ -89,14 +93,6 @@ class KairosConfig(PretrainedConfig):
 
         # warning
         assert d_model % n_heads == 0, "hidden_size must be divisible by n_heads"
-
-
-# =========================
-# Normalization
-# =========================
-class KairosNorm(LlamaRMSNorm):
-    """RMS Norm for stabilization"""
-    pass
 
 
 # =========================
@@ -197,7 +193,6 @@ class KairosEmbedding(nn.Module):
         vocab_size: int,
         num_modalities: int,
         d_model: int,
-        codec,
     ):
         super().__init__()
 
@@ -205,7 +200,6 @@ class KairosEmbedding(nn.Module):
         self.modality_embed = nn.Embedding(num_modalities, d_model)
 
         self.scale = d_model**0.5
-        self.codec = codec
 
     def forward(
         self,
@@ -216,24 +210,19 @@ class KairosEmbedding(nn.Module):
         h = h + self.modality_embed(modality_ids)
         h = h * self.scale
 
-        return self.codec(h, mode="encode")
+        return h
 
 
 class OutputHead(nn.Module):
     """Token + modality prediction heads."""
-
     def __init__(
         self,
         embedding: KairosEmbedding,
-        codec,
     ):
         super().__init__()
 
-        self.codec = codec
-
         d_model = embedding.token_embed.embedding_dim
 
-        # Used by trainer/tests
         self.vocab_size = embedding.token_embed.num_embeddings
         self.num_modalities = embedding.modality_embed.num_embeddings
 
@@ -249,13 +238,10 @@ class OutputHead(nn.Module):
             bias=False,
         )
 
-        # Weight tying
         self.token_head.weight = embedding.token_embed.weight
         self.modality_head.weight = embedding.modality_embed.weight
 
     def forward(self, h):
-        h = self.codec(h, mode="decode")
-
         token_logits = self.token_head(h)
         modality_logits = self.modality_head(h)
 
@@ -263,99 +249,101 @@ class OutputHead(nn.Module):
 
 
 class PyramidalConvCodec(nn.Module):
-    """Feature V-Pyramidal Convolutional Codec"""
+    """ Parallel multi-scale convolutional codec. """
+
     def __init__(
         self,
         d_model: int,
-        stride: int = 3,
-        depth: int = 3,
+        stride: int = 5,
+        num_scales: int = 3,
     ):
         super().__init__()
 
         self.stride = stride
-        self.depth = depth
+        self.num_scales = num_scales
 
-        self.encoders = nn.ModuleList([
-            nn.Conv1d(
-                d_model,
-                d_model,
-                kernel_size=5,
-                stride=stride,
-                padding=2,
-                groups=d_model,
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+
+        for level in range(num_scales):
+
+            scale_stride = stride ** (level + 1)
+            kernel_size = scale_stride // 2
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+
+            padding = kernel_size // 2
+
+            self.encoders.append(
+                nn.Conv1d(
+                    d_model,
+                    d_model,
+                    kernel_size=kernel_size,
+                    stride=scale_stride,
+                    padding=padding,
+                    groups=d_model,
+                )
             )
-            for _ in range(depth)
-        ])
 
-        self.decoders = nn.ModuleList([
-            nn.ConvTranspose1d(
-                d_model,
-                d_model,
-                kernel_size=5,
-                stride=stride,
-                padding=2,
-                output_padding=stride - 1,
-                groups=d_model,
+            self.decoders.append(
+                nn.ConvTranspose1d(
+                    d_model,
+                    d_model,
+                    kernel_size=kernel_size,
+                    stride=scale_stride,
+                    padding=padding,
+                    output_padding=max(scale_stride - 1, 0),
+                    groups=d_model,
+                )
             )
-            for _ in range(depth)
-        ])
+        
+
+        self.norm = KairosNorm(num_scales * d_model)
+        self.fusion = nn.Linear(num_scales * d_model,  d_model)
 
 
-        # 1D, 2D, 3D modality bases
-        self.modality_scales = {
-            0: (0, 1),  # 3, 9
-            1: (1, 2),  # 9, 27
-            2: (2, 3),  # 27, 81
-        }
+    def encode(self, x):
+        h = x.transpose(1, 2)  # [B, D, T]
+        scales = []
 
-        self.orig_len = None
-        self.lengths = []
+        for encoder in self.encoders:
+            scales.append(
+                encoder(h).transpose(1, 2)
+            )
 
-    def forward(self, x, mode="encode", modality_id=0):
-        a, b = self.modality_scales[modality_id]
+        return scales
 
+    def decode(self, scales):
+        reconstructed = []
+
+        for scale, decoder in zip(
+            scales,
+            self.decoders,
+        ):
+
+            h = scale.transpose(1, 2)
+            h = decoder(h)
+            h = h.transpose(1, 2)
+
+            reconstructed.append(h)
+
+        h = torch.cat(reconstructed, dim=-1)
+        h = self.norm(h)
+        return self.fusion(h)
+
+    def forward(self,  x, mode="encode"):
         if mode == "encode":
-            self.orig_len = x.shape[1]
+            return self.encode(x)
 
-            h = x.transpose(1, 2)
-
-            enc_a = self.encoders[a]
-            enc_b = self.encoders[b]
-
-            ha = enc_a(h).transpose(1, 2)
-            hb = enc_b(h).transpose(1, 2)
-
-            L = min(ha.shape[1], hb.shape[1])
-
-            # not ok !! one compression = one backbone transformer ! (here its dummy : you lost info !)
-            # we want like a parallele transformer backbone "squared" sized by stride
-            ha = ha[:, :L]
-            hb = hb[:, :L]
-
-            return torch.cat([ha, hb], dim=-1)
-
-        elif mode == "decode":
-            ha, hb = torch.chunk(x, 2, dim=-1)
-
-            dec_a = self.decoders[a]
-            dec_b = self.decoders[b]
-
-            ha = dec_a(ha.transpose(1, 2)).transpose(1, 2)
-            hb = dec_b(hb.transpose(1, 2)).transpose(1, 2)
-
-            h = 0.5 * (
-                ha[:, :self.orig_len]
-                + hb[:, :self.orig_len]
-            )
-
-            return h
+        if mode == "decode":
+            return self.decode(x)
 
         raise ValueError("mode must be 'encode' or 'decode'")
+
 
 # =========================
 # Full Model (standard HF-like)
 # =========================
-
 @dataclass
 class KairosOutput(CausalLMOutputWithPast):
     encoder_last_hidden_state: torch.FloatTensor | None = None
@@ -369,42 +357,36 @@ class KairosDiffusionLLM(
     def __init__(
         self,
         config,
-        vocab_size=None,  # bytes + special multimodal tokens
+        vocab_size=None,
         num_experts=None,
     ):
         super().__init__(config)
 
-        # Codec
         self.codec = PyramidalConvCodec(
-            config.hidden_size,
-            stride=config.stride,
+            config.hidden_size, stride=config.stride,
         )
 
-        # Multimodal embedding
         if vocab_size is None:
             vocab_size = config.vocab_size
 
+        # Embedding
         self.embedding = KairosEmbedding(
             vocab_size=vocab_size,
             num_modalities=config.num_modalities,
             d_model=config.hidden_size,
-            codec=self.codec,
         )
 
-        # Backbone (SWA / DeltaNet etc.)
-        self.backbone = KairosDiffusionBackbone(
-            config=config,
-            num_experts=num_experts,
-        )
+        # One backbone per pyramid scale
+        self.backbones = nn.ModuleList([
+            KairosDiffusionBackbone(
+                config=config,
+                num_experts=num_experts,
+            )
+            for _ in range(self.codec.num_scales)
+        ])
 
-        # Final normalization
         self.norm = KairosNorm(config.hidden_size)
-
-        # Output projection
-        self.lm_head = OutputHead(
-            self.embedding,
-            self.codec,
-        )
+        self.lm_head = OutputHead(self.embedding)
 
     def forward(
         self,
@@ -416,52 +398,52 @@ class KairosDiffusionLLM(
         cache_params=None,
         **kwargs,
     ):
-        # Input sequence (DiffusionGemma compatibility)
+        # Input selection
         if decoder_input_ids is not None:
             x = decoder_input_ids
         elif input_ids is not None:
             x = input_ids
         else:
-            raise ValueError(
-                "You must provide input_ids or decoder_input_ids"
-            )
+            raise ValueError("You must provide input_ids or decoder_input_ids")
 
-        # Default modality = TEXT
+        # Default modality
         if modality_ids is None:
-            modality_ids = torch.full_like(
-                    x, self.config.text_modality_id,
-                )
+            modality_ids = torch.full_like(x, self.config.text_modality_id)
 
-        # Multimodal embedding
-        h = self.embedding(
-            token_ids=x,
-            modality_ids=modality_ids,
-        )
+        # Embedding  h : [B,T,D]
+        h = self.embedding(token_ids=x, modality_ids=modality_ids)
 
-        # Self-conditioning (diffusion)
+        # Diffusion self-conditioning
         if self_conditioning_logits is not None:
-            probs = torch.softmax(
-                self_conditioning_logits, dim=-1,
-            )
 
-            soft_emb = (
-                probs @ self.embedding.token_embed.weight
-            )
-
+            probs = torch.softmax(self_conditioning_logits,dim=-1)
+            soft_emb = (probs@ self.embedding.token_embed.weight)
             h = h + soft_emb
 
-        # Backbone
-        h = self.backbone(
-            h, cache_params=cache_params,
-        )
+        # Pyramid encoding
+        scales = self.codec(h, mode="encode")
+
+        # Parallel backbones
+        features = []
+
+        for backbone, scale in zip(
+            self.backbones,
+            scales,
+        ):
+            feat = backbone(
+                scale, cache_params=cache_params,
+            )
+            features.append(feat)
+
+        # Pyramid decoding / fusion
+        h = self.codec(features, mode="decode")
 
         # Final norm
         h = self.norm(h)
 
-        # Vocabulary projection
+        # Heads
         token_logits, modality_logits = self.lm_head(h)
 
-        # HF-compatible output
         return KairosOutput(
             logits=token_logits,
             modality_logits=modality_logits,

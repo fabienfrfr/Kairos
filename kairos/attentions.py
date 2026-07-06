@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from einops import rearrange
 import math
 
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.cache_utils import DynamicCache
 
 # =========================
@@ -45,6 +46,13 @@ except ImportError:
         torch_causal_conv1d_update,
     )
     causal_conv1d_update = torch_causal_conv1d_update
+
+# =========================
+# Normalization
+# =========================
+class KairosNorm(LlamaRMSNorm):
+    """RMS Norm for stabilization"""
+    pass
 
 # =========================
 # Cache Diffusion 
@@ -436,6 +444,7 @@ class KairosGatedDeltaNet(nn.Module):
         )
         
         # ---- bidirectionnal output merging ----
+        self.merge_norm = KairosNorm(2 * self.value_dim)
         self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False) # intermediate state
         self.out_proj = nn.Linear(self.hidden_size, config.hidden_size, bias=False) # shareable with swa
 
@@ -549,8 +558,9 @@ class KairosGatedDeltaNet(nn.Module):
         B, L = out_f.shape[:2]
         # concat bidir
         out = torch.cat([out_f, out_b], dim=-1)  # (B, L, H, 2*dv)
-        # flatten heads
+        # flatten heads and reshape
         out = out.reshape(B, L, -1)  # (B, L, 2 * value_dim)
+        out = self.merge_norm(out)
         # linear
         out = self.out_left_right(out) # concat to swa value dim
         out = self.out_proj(out)  # (B, L, hidden_size) -> shareable
@@ -591,6 +601,7 @@ class KairosLiZAttention2(nn.Module):
         self.delta.out_proj = self.swa.out
         
         # Final mixer
+        self.norm = KairosNorm(2 * self.hidden_size)
         self.out_proj = nn.Linear(
             2 * self.hidden_size,
             self.hidden_size,
@@ -612,8 +623,9 @@ class KairosLiZAttention2(nn.Module):
             cache_params=cache_params
         )  # (B, L, D)
 
-        # ---- concat ----
+        # ---- concat & norm ----
         out = torch.cat([swa_out, delta_out], dim=-1)
+        out = self.norm(out)
 
         # ---- final projection ----
         out = self.out_proj(out)

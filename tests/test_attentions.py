@@ -220,28 +220,47 @@ def test_deltanet_stability():
     assert not torch.isinf(out).any()
 
 
+
 def test_deltanet_bidir_consistency():
     model = get_deltanet_model()
 
     x = get_deltanet_inputs()
 
-    # internal forward
-    out_f = model.process(x)
+    forward_features = model.process(x)
 
-    # internal backward
-    x_rev = torch.flip(x, dims=[1])
-    out_b = model.process(x_rev)
-    out_b = torch.flip(out_b, dims=[1])
+    backward_features = model.process(
+        torch.flip(x, dims=[1])
+    )
+    backward_features = torch.flip(
+        backward_features,
+        dims=[1],
+    )
 
-    # full model output
-    out = model(x)
+    actual_output = model(x)
 
-    # reconstruct expected output
-    reconstructed = torch.cat([out_f, out_b], dim=-1)
-    reconstructed = reconstructed.reshape(out.shape[0], out.shape[1], -1)
-    projected = model.out_proj(model.out_left_right(reconstructed))
+    features = torch.cat(
+        [forward_features, backward_features],
+        dim=-1,
+    )
 
-    assert torch.allclose(out, projected, atol=1e-5)
+    features = features.reshape(
+        actual_output.shape[0],
+        actual_output.shape[1],
+        -1,
+    )
+
+    features = model.merge_norm(features)
+
+    expected_output = model.out_proj(
+        model.out_left_right(features)
+    )
+
+    assert torch.allclose(
+        actual_output,
+        expected_output,
+        atol=1e-5,
+    )
+
 
 
 def test_deltanet_bidir_effect():
