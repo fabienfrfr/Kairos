@@ -252,15 +252,7 @@ class OutputHead(nn.Module):
 # Codec & Router Scaling
 # =========================
 class KairosScaleRouter(nn.Module):
-    """
-    Build routing segments for each scale.
-
-    modality_scales = {
-        0: [0, 1],  # text
-        1: [1, 2],  # image
-        2: [2, 3],  # video
-    }
-    """
+    """ Build routing segments for each scale. """
 
     def __init__(self, modality_scales):
         super().__init__()
@@ -376,7 +368,6 @@ class PyramidalConvCodec(nn.Module):
             )
 
         self.norm = KairosNorm(d_model * num_scales)
-
         self.fusion = nn.Linear(
             d_model * num_scales,
             d_model,
@@ -385,7 +376,6 @@ class PyramidalConvCodec(nn.Module):
     def encode(self, x):
 
         h = x.transpose(1, 2)
-
         scales = []
 
         for encoder in self.encoders:
@@ -402,20 +392,16 @@ class PyramidalConvCodec(nn.Module):
             self.decoders,
         ):
             h = decoder(scale.transpose(1, 2))
-
             reconstructed.append(h.transpose(1, 2))
 
         min_len = min(x.shape[1] for x in reconstructed)
-
         reconstructed = [x[:, :min_len] for x in reconstructed]
-
         h = torch.cat(
             reconstructed,
             dim=-1,
         )
 
         h = self.norm(h)
-
         return self.fusion(h)
 
 
@@ -505,12 +491,8 @@ class KairosDiffusionLLM(
 
             h = h + (probs @ self.embedding.token_embed.weight)
 
-        # --------------------------------------------------
         # Encode
-        # --------------------------------------------------
-
         scales = self.codec.encode(h)
-
         routing = self.router.build(
             modality_ids,
             scales,
@@ -518,10 +500,7 @@ class KairosDiffusionLLM(
 
         features = []
 
-        # --------------------------------------------------
         # Gather -> Backbone -> Scatter
-        # --------------------------------------------------
-
         for scale_idx, (
             scale,
             backbone,
@@ -555,14 +534,10 @@ class KairosDiffusionLLM(
 
             features.append(output)
 
-        # --------------------------------------------------
         # Decode
-        # --------------------------------------------------
 
         h = self.codec.decode(features)
-
         h = self.norm(h)
-
         token_logits, modality_logits = self.lm_head(h)
 
         return KairosOutput(
