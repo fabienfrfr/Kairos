@@ -262,44 +262,73 @@ class OutputHead(nn.Module):
         return token_logits, modality_logits
 
 
-class ConvCodec(nn.Module):
-    def __init__(self, d_model, stride=3):
+class PyramidalConvCodec(nn.Module):
+    """Feature V-Pyramidal Convolutional Codec"""
+    def __init__(
+        self,
+        d_model: int,
+        stride: int = 3,
+        depth: int = 3,
+    ):
         super().__init__()
 
         self.stride = stride
+        self.depth = depth
 
-        self.enc = nn.Conv1d(
-            d_model,
-            d_model,
-            kernel_size=5,
-            stride=stride,
-            padding=2,
-            groups=d_model
-        )
+        self.encoders = nn.ModuleList([
+            nn.Conv1d(
+                d_model,
+                d_model,
+                kernel_size=5,
+                stride=stride,
+                padding=2,
+                groups=d_model,
+            )
+            for _ in range(depth)
+        ])
 
-        self.dec = nn.ConvTranspose1d(
-            d_model,
-            d_model,
-            kernel_size=5,
-            stride=stride,
-            padding=2,
-            output_padding=stride - 1,
-            groups=d_model
-        )
-        # buffer
-        self.orig_len = 0
+        self.decoders = nn.ModuleList([
+            nn.ConvTranspose1d(
+                d_model,
+                d_model,
+                kernel_size=5,
+                stride=stride,
+                padding=2,
+                output_padding=stride - 1,
+                groups=d_model,
+            )
+            for _ in range(depth)
+        ])
+
+        self.lengths = []
 
     def forward(self, x, mode="encode"):
-        # x: (B, T, d)
         if mode == "encode":
-            self.orig_len = x.shape[1] # to fix : not-thread-safe
-            return self.enc(x.transpose(1, 2)).transpose(1, 2)
-            
+            self.lengths = []
+
+            h = x.transpose(1, 2)
+
+            for enc in self.encoders:
+                self.lengths.append(h.shape[-1])
+                h = enc(h)
+
+            return h.transpose(1, 2)
+
         elif mode == "decode":
-            h = self.dec(x.transpose(1, 2)).transpose(1, 2)
-            return h[:, :self.orig_len, :]
-        else:
-            raise ValueError("mode must be 'encode' or 'decode'")
+            h = x.transpose(1, 2)
+
+            for dec, length in zip(
+                reversed(self.decoders),
+                reversed(self.lengths),
+            ):
+                h = dec(h)
+                h = h[..., :length]
+
+            return h.transpose(1, 2)
+
+        raise ValueError(
+            "mode must be 'encode' or 'decode'"
+        )
 
 
 # =========================
@@ -325,7 +354,7 @@ class KairosDiffusionLLM(
         super().__init__(config)
 
         # Codec
-        self.codec = ConvCodec(
+        self.codec = PyramidalConvCodec(
             config.hidden_size,
             stride=config.stride,
         )
@@ -391,21 +420,18 @@ class KairosDiffusionLLM(
         # Self-conditioning (diffusion)
         if self_conditioning_logits is not None:
             probs = torch.softmax(
-                self_conditioning_logits,
-                dim=-1,
+                self_conditioning_logits, dim=-1,
             )
 
             soft_emb = (
-                probs
-                @ self.embedding.token_embed.weight
+                probs @ self.embedding.token_embed.weight
             )
 
             h = h + soft_emb
 
         # Backbone
         h = self.backbone(
-            h,
-            cache_params=cache_params,
+            h, cache_params=cache_params,
         )
 
         # Final norm

@@ -47,7 +47,7 @@ def _():
 
     from transformers import TrainingArguments
 
-    from kairos.modeling import KairosConfig, KairosDiffusionLLM, ConvCodec
+    from kairos.modeling import KairosConfig, KairosDiffusionLLM, PyramidalConvCodec
     from kairos.attentions import KairosCache
     from kairos.tokenizer import KairosTokenizer
     from kairos.dataset import KairosPretrainingDataset
@@ -198,7 +198,7 @@ def _(mo):
         16, 512, step=16, value=64, label="SWA window size"
     )
     cfg_stride = mo.ui.slider(
-        1, 6, step=1, value=3, label="ConvCodec stride"
+        1, 6, step=1, value=3, label="PyramidalConvCodec stride"
     )
     cfg_experts = mo.ui.slider(
         0, 32, step=2, value=3,

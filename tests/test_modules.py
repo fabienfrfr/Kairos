@@ -10,7 +10,7 @@ from kairos.modeling import (
     KairosEmbedding,
     KairosDiffusionLLM,
     KairosAttnRes,
-    ConvCodec,
+    PyramidalConvCodec,
 )
 
 from kairos.tokenizer import KairosTokenizer
@@ -145,7 +145,7 @@ def test_aggregator_weights_sum():
 # =========================
 
 def test_token_embedding():
-    codec = ConvCodec(32, stride=3)
+    codec = PyramidalConvCodec(32, stride=3)
 
     emb = KairosEmbedding(
         vocab_size=100,
@@ -168,7 +168,7 @@ def test_token_embedding():
 
 
 def test_codec_roundtrip():
-    codec = ConvCodec(32, stride=3)
+    codec = PyramidalConvCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
 
     encoded = codec(x, "encode")

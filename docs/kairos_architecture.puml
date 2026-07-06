@@ -32,14 +32,14 @@ partition "1. Input Tokenization" #EBF5FB {
 ' ─────────────────────────────────────────
 partition "2. Convolutional Codec — Encode" #E8F8F5 {
     note right
-        **ConvCodec (stride = 3)**
+        **PyramidalConvCodec (stride = 3)**
         * Depthwise Conv1d kernel=5
         * Reduces sequence length × ⅓
         * Shared encoder/decoder weights
         * orig_len saved for decode
     end note
     :KairosEmbedding\n(token embed × √d_model);
-    :ConvCodec.encode\n(B, T, d) → (B, T/3, d);
+    :PyramidalConvCodec.encode\n(B, T, d) → (B, T/3, d);
 }
 
 ' ─────────────────────────────────────────
@@ -122,11 +122,11 @@ partition "5. Output Decoding" #F5EEF8 {
     note right
         **OutputHead**
         * KairosNorm (RMSNorm)
-        * ConvCodec.decode: (B, T/3, d) → (B, T, d)
+        * PyramidalConvCodec.decode: (B, T/3, d) → (B, T, d)
         * lm_head weight tied to embedding
     end note
     :KairosNorm\nRMS normalization;
-    :ConvCodec.decode\n(B, T/3, d) → (B, T, d);
+    :PyramidalConvCodec.decode\n(B, T/3, d) → (B, T, d);
     :lm_head (weight-tied)\n→ Logits (vocab = 259);
 }
 
