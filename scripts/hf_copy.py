@@ -5,7 +5,7 @@ from huggingface_hub import HfApi, snapshot_download, upload_folder
 api = HfApi()
 
 datasets = [
-    ("HuggingFaceTB/cosmopedia","ffurfaro/cosmopedia"),
+    ("HuggingFaceTB/cosmopedia", "ffurfaro/cosmopedia"),
     ("tasksource/bigbench", "ffurfaro/bigbench"),
     ("yahma/alpaca-cleaned", "ffurfaro/alpaca-cleaned"),
     ("Team-ACE/ToolACE", "ffurfaro/ToolACE"),

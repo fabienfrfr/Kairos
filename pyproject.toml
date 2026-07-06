@@ -17,6 +17,7 @@ dependencies = [
     "nbformat>=5.10.4",
     "pathspec>=1.1.1",
     "pytest>=8.4.2",
+    "ruff>=0.15.20",
     "tensorboard>=2.19.0",
     "torch>=2.10.0",
     "transformers>=5.12.1", # mandatoy for gemma
@@ -42,3 +43,10 @@ dev = [
     "mwparserfromhell>=0.7.2",
     "pytest-cov>=7.1.0",
 ]
+
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"

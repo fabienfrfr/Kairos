@@ -7,6 +7,7 @@ from kairos.attentions import KairosAttention, KairosRotaryEmbedding
 from kairos.attentions import KairosGatedDeltaNet
 from kairos.attentions import KairosLiZAttention2
 
+
 # =========================
 # Config
 # =========================
@@ -18,8 +19,9 @@ class DummySWAConfig:
     max_position_embeddings = 64
     rope_theta = 10000.0
 
-    layers_config = ["l"]       # attention only
+    layers_config = ["l"]  # attention only
     slw_wsize = -1
+
 
 class DummyDeltaConfig:
     hidden_size = 32
@@ -38,7 +40,7 @@ class DummyDeltaConfig:
 
     use_uscaling = False
 
-    layers_config = ["d"]       # deltanet only
+    layers_config = ["d"]  # deltanet only
     sliding_window_size = 16
     slw_wsize = -1
 
@@ -220,7 +222,6 @@ def test_deltanet_stability():
     assert not torch.isinf(out).any()
 
 
-
 def test_deltanet_bidir_consistency():
     model = get_deltanet_model()
 
@@ -228,9 +229,7 @@ def test_deltanet_bidir_consistency():
 
     forward_features = model.process(x)
 
-    backward_features = model.process(
-        torch.flip(x, dims=[1])
-    )
+    backward_features = model.process(torch.flip(x, dims=[1]))
     backward_features = torch.flip(
         backward_features,
         dims=[1],
@@ -251,16 +250,13 @@ def test_deltanet_bidir_consistency():
 
     features = model.merge_norm(features)
 
-    expected_output = model.out_proj(
-        model.out_left_right(features)
-    )
+    expected_output = model.out_proj(model.out_left_right(features))
 
     assert torch.allclose(
         actual_output,
         expected_output,
         atol=1e-5,
     )
-
 
 
 def test_deltanet_bidir_effect():
@@ -277,7 +273,6 @@ def test_deltanet_bidir_effect():
 
     # they should NOT be identical
     assert not torch.allclose(out_f, out_b, atol=1e-3)
-
 
 
 def test_deltanet_backward():
@@ -317,7 +312,6 @@ def test_deltanet_order_sensitivity():
     assert not torch.allclose(out1, out2)
 
 
-
 def test_deltanet_signal_propagation():
     model = get_deltanet_model()
 
@@ -328,9 +322,11 @@ def test_deltanet_signal_propagation():
 
     assert out[:, 16].abs().mean() > out[:, 0].abs().mean()
 
+
 # =========================
 # DELTANET CACHE TESTS
 # =========================
+
 
 def test_deltanet_cache_not_mutated():
     """
@@ -381,7 +377,6 @@ def test_deltanet_cache_clone_isolation():
             assert not torch.allclose(a, b)
 
 
-
 def test_deltanet_cache_effect():
     """
     Ensure that different context states produce different outputs,
@@ -430,6 +425,7 @@ def test_deltanet_cache_determinism():
 # SWA CACHE TESTS
 # =========================
 
+
 def test_swa_cache_consistency():
     """
     Ensure that step-by-step attention equals full-sequence attention.
@@ -450,8 +446,8 @@ def test_swa_cache_consistency():
 
     outs = []
     for i in range(16):
-        xi = x[:, i:i+1]
-        pi = pos[:, i:i+1]
+        xi = x[:, i : i + 1]
+        pi = pos[:, i : i + 1]
 
         out = attn(xi, rope(xi, pi), cache_params=cache)
         outs.append(out)
@@ -460,8 +456,6 @@ def test_swa_cache_consistency():
 
     assert step.shape == full.shape
     assert not torch.isnan(step).any()
-
-
 
 
 def test_swa_cache_trim():
@@ -481,8 +475,8 @@ def test_swa_cache_trim():
     pos = torch.arange(32).unsqueeze(0)
 
     for i in range(32):
-        xi = x[:, i:i+1]
-        pi = pos[:, i:i+1]
+        xi = x[:, i : i + 1]
+        pi = pos[:, i : i + 1]
         attn(xi, rope(xi, pi), cache_params=cache)
 
     k = cache._key_cache[0]
@@ -502,8 +496,8 @@ def test_swa_cache_no_trim_when_small_sequence():
     pos = torch.arange(8).unsqueeze(0)
 
     for i in range(8):
-        xi = x[:, i:i+1]
-        pi = pos[:, i:i+1]
+        xi = x[:, i : i + 1]
+        pi = pos[:, i : i + 1]
         attn(xi, rope(xi, pi), cache_params=cache)
 
     k = cache._key_cache[0]
@@ -517,8 +511,8 @@ def test_swa_cache_no_trim_when_small_sequence():
 def test_deltanet_diffusion_stability():
     model = get_deltanet_model()
 
-    x_N = torch.randn(1, 16, 32) # past sequence
-    x_M = torch.randn(1, 8, 32) # diffusion sequence
+    x_N = torch.randn(1, 16, 32)  # past sequence
+    x_M = torch.randn(1, 8, 32)  # diffusion sequence
 
     cache = KairosCache(model.config)
     _ = model(x_N, cache)
@@ -530,7 +524,6 @@ def test_deltanet_diffusion_stability():
 
     for o in outs[1:]:
         assert torch.allclose(outs[0], o, atol=1e-5)
-
 
 
 def test_swa_partial_diffusion_stability():

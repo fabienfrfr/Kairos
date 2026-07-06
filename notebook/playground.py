@@ -70,14 +70,9 @@ def _():
 
 @app.cell
 def _(mo, torch):
-    device = (
-        "cuda" if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     mo.callout(
-        mo.md(f"**Device:** `{device}`  |  "
-              f"**CUDA:** `{torch.cuda.get_device_name(0) if device == 'cuda' else 'N/A'}`"),
+        mo.md(f"**Device:** `{device}`  |  **CUDA:** `{torch.cuda.get_device_name(0) if device == 'cuda' else 'N/A'}`"),
         kind="info",
     )
     return (device,)
@@ -105,7 +100,6 @@ def _(mo):
         "H100": 1000,
     }
 
-
     GPU_BW = {
         "T4": 300e9,
         "RTX_5060Ti": 600e9,
@@ -114,31 +108,17 @@ def _(mo):
         "H100": 3000e9,
     }
 
+    gpu = mo.ui.dropdown(list(GPU_FLOPS.keys()), value="T4", label="GPU")
 
-    gpu = mo.ui.dropdown(
-        list(GPU_FLOPS.keys()),
-        value="T4",
-        label="GPU"
-    )
+    eff = mo.ui.slider(0.05, 0.5, step=0.05, value=0.3, label="GPU efficiency")
 
-
-    eff = mo.ui.slider(
-        0.05, 0.5,
-        step=0.05,
-        value=0.3,
-        label="GPU efficiency"
-    )
-
-    params = mo.ui.slider(
-        1, 50,
-        value=5,
-        label="Active params (millions)"
-    )
+    params = mo.ui.slider(1, 50, value=5, label="Active params (millions)")
 
     tokens = mo.ui.slider(
-        1, 50,
-        value=30, # cosmopedia
-        label="Training tokens (billions)"
+        1,
+        50,
+        value=30,  # cosmopedia
+        label="Training tokens (billions)",
     )
 
     mo.vstack([gpu, params, tokens, eff])
@@ -185,30 +165,19 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    cfg_d_model = mo.ui.slider(
-        32, 768, step=32, value=256, label="d_model (hidden size)"
-    )
-    cfg_n_heads = mo.ui.slider(
-        2, 16, step=2, value=4, label="n_heads"
-    )
-    cfg_n_layers = mo.ui.slider(
-        1, 24, step=1, value=4, label="n_layers"
-    )
-    cfg_window = mo.ui.slider(
-        16, 512, step=16, value=64, label="SWA window size"
-    )
-    cfg_stride = mo.ui.slider(
-        1, 6, step=1, value=3, label="PyramidalConvCodec stride"
-    )
-    cfg_experts = mo.ui.slider(
-        0, 32, step=2, value=3,
-        label="MoE experts (0 = dense FFN)"
-    )
+    cfg_d_model = mo.ui.slider(32, 768, step=32, value=256, label="d_model (hidden size)")
+    cfg_n_heads = mo.ui.slider(2, 16, step=2, value=4, label="n_heads")
+    cfg_n_layers = mo.ui.slider(1, 24, step=1, value=4, label="n_layers")
+    cfg_window = mo.ui.slider(16, 512, step=16, value=64, label="SWA window size")
+    cfg_stride = mo.ui.slider(1, 6, step=1, value=3, label="PyramidalConvCodec stride")
+    cfg_experts = mo.ui.slider(0, 32, step=2, value=3, label="MoE experts (0 = dense FFN)")
 
-    mo.vstack([
-        mo.hstack([cfg_d_model, cfg_n_heads, cfg_n_layers]),
-        mo.hstack([cfg_window, cfg_stride, cfg_experts]),
-    ])
+    mo.vstack(
+        [
+            mo.hstack([cfg_d_model, cfg_n_heads, cfg_n_layers]),
+            mo.hstack([cfg_window, cfg_stride, cfg_experts]),
+        ]
+    )
     return (
         cfg_d_model,
         cfg_experts,
@@ -250,16 +219,17 @@ def _(
         num_experts=num_experts_arg,
     ).to(device)
 
-    total_params   = sum(p.numel() for p in model.parameters())
-    active_params  = sum(
-        p.numel() for n, p in model.named_parameters()
+    total_params = sum(p.numel() for p in model.parameters())
+    active_params = sum(
+        p.numel()
+        for n, p in model.named_parameters()
         if "experts" not in n or any(f"experts.{i}" in n for i in range(config.num_experts_per_tok))
     )
 
     mo.callout(
         mo.md(
-            f"**Total params:** `{total_params/1e6:.2f}M`  \n"
-            f"**Active params (est.):** `{active_params/1e6:.2f}M`  \n"
+            f"**Total params:** `{total_params / 1e6:.2f}M`  \n"
+            f"**Active params (est.):** `{active_params / 1e6:.2f}M`  \n"
             f"**Layers config:** `{config.layers_config}`  \n"
             f"**MoE:** `{'Yes — ' + str(cfg_experts.value) + ' experts' if num_experts_arg else 'No — dense FFN'}`"
         ),
@@ -280,13 +250,15 @@ def _(mo):
 def _(mo, model):
     rows = []
     for name, param in model.named_parameters():
-        rows.append({
-            "Layer": name,
-            "Shape": str(list(param.shape)),
-            "Params": f"{param.numel():,}",
-            "Trainable": "✅" if param.requires_grad else "❌",
-            "dtype": str(param.dtype).replace("torch.", ""),
-        })
+        rows.append(
+            {
+                "Layer": name,
+                "Shape": str(list(param.shape)),
+                "Params": f"{param.numel():,}",
+                "Trainable": "✅" if param.requires_grad else "❌",
+                "dtype": str(param.dtype).replace("torch.", ""),
+            }
+        )
 
     mo.ui.table(
         rows,
@@ -326,20 +298,22 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    train_lr          = mo.ui.number(1e-4, 1e-2, step=1e-5, value=3e-4, label="Learning rate")
-    train_batch       = mo.ui.slider(1, 64, step=1, value=8, label="Batch size")
-    train_epochs      = mo.ui.slider(1, 100, step=1, value=5, label="Epochs")
-    train_max_len     = mo.ui.slider(32, 512, step=32, value=128, label="Max sequence length")
-    train_save_steps  = mo.ui.slider(10, 500, step=10, value=50, label="Save every N steps")
-    train_log_steps   = mo.ui.slider(1, 50, step=1, value=10, label="Log every N steps")
-    train_output_dir  = mo.ui.text(value="checkpoints/kairos", label="Output directory")
-    train_run_name    = mo.ui.text(value="run_01", label="Run name (TensorBoard)")
+    train_lr = mo.ui.number(1e-4, 1e-2, step=1e-5, value=3e-4, label="Learning rate")
+    train_batch = mo.ui.slider(1, 64, step=1, value=8, label="Batch size")
+    train_epochs = mo.ui.slider(1, 100, step=1, value=5, label="Epochs")
+    train_max_len = mo.ui.slider(32, 512, step=32, value=128, label="Max sequence length")
+    train_save_steps = mo.ui.slider(10, 500, step=10, value=50, label="Save every N steps")
+    train_log_steps = mo.ui.slider(1, 50, step=1, value=10, label="Log every N steps")
+    train_output_dir = mo.ui.text(value="checkpoints/kairos", label="Output directory")
+    train_run_name = mo.ui.text(value="run_01", label="Run name (TensorBoard)")
 
-    mo.vstack([
-        mo.hstack([train_lr, train_batch, train_epochs]),
-        mo.hstack([train_max_len, train_save_steps, train_log_steps]),
-        mo.hstack([train_output_dir, train_run_name]),
-    ])
+    mo.vstack(
+        [
+            mo.hstack([train_lr, train_batch, train_epochs]),
+            mo.hstack([train_max_len, train_save_steps, train_log_steps]),
+            mo.hstack([train_output_dir, train_run_name]),
+        ]
+    )
     return (
         train_batch,
         train_epochs,
@@ -373,11 +347,15 @@ def _(mo):
 
 @app.cell
 def _(dataset_source, mo):
-    custom_texts_input = mo.ui.text_area(
-        value="Paris is the capital of France.\nThe Earth orbits the Sun.\nWater boils at 100 degrees Celsius.",
-        label="Custom texts (one per line)",
-        rows=6,
-    ) if dataset_source.value == "custom texts" else None
+    custom_texts_input = (
+        mo.ui.text_area(
+            value="Paris is the capital of France.\nThe Earth orbits the Sun.\nWater boils at 100 degrees Celsius.",
+            label="Custom texts (one per line)",
+            rows=6,
+        )
+        if dataset_source.value == "custom texts"
+        else None
+    )
 
     if custom_texts_input:
         custom_texts_input
@@ -407,7 +385,9 @@ def _(
         )
 
     mo.callout(
-        mo.md(f"**Samples:** `{len(dataset)}`  |  **Max len:** `{train_max_len.value}`  |  **Source:** `{dataset_source.value}`"),
+        mo.md(
+            f"**Samples:** `{len(dataset)}`  |  **Max len:** `{train_max_len.value}`  |  **Source:** `{dataset_source.value}`"
+        ),
         kind="success",
     )
     return dataset, tokenizer
@@ -457,7 +437,7 @@ def _(
 
     # ── dirs ──
     run_dir = Path(train_output_dir.value) / train_run_name.value
-    tb_dir  = run_dir / "tensorboard"
+    tb_dir = run_dir / "tensorboard"
     ckpt_dir = run_dir / "checkpoints"
     run_dir.mkdir(parents=True, exist_ok=True)
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -465,15 +445,20 @@ def _(
 
     # ── save config ──
     import json as _json
+
     with open(run_dir / "config.json", "w") as _f:
-        _json.dump({
-            "d_model": config.hidden_size,
-            "n_heads": config.num_attention_heads,
-            "n_layers": config.num_hidden_layers,
-            "sliding_window_size": config.sliding_window_size,
-            "stride": config.stride,
-            "vocab_size": 259,
-        }, _f, indent=2)
+        _json.dump(
+            {
+                "d_model": config.hidden_size,
+                "n_heads": config.num_attention_heads,
+                "n_layers": config.num_hidden_layers,
+                "sliding_window_size": config.sliding_window_size,
+                "stride": config.stride,
+                "vocab_size": 259,
+            },
+            _f,
+            indent=2,
+        )
 
     writer = SummaryWriter(log_dir=str(tb_dir))
 
@@ -485,7 +470,7 @@ def _(
         logging_steps=train_log_steps.value,
         save_steps=train_save_steps.value,
         save_total_limit=3,
-        report_to=[],          # on gère TensorBoard manuellement
+        report_to=[],  # on gère TensorBoard manuellement
         dataloader_pin_memory=(device == "cuda"),
         remove_unused_columns=False,
         no_cuda=(device != "cuda"),
@@ -514,8 +499,8 @@ def _(
     )
 
     global_step = 0
-    best_loss   = float("inf")
-    log_rows    = []
+    best_loss = float("inf")
+    log_rows = []
 
     model.train()
 
@@ -524,7 +509,6 @@ def _(
         title="Training Kairos",
         subtitle="epoch 1",
     ) as _bar:
-
         for epoch in range(1, train_epochs.value + 1):
             epoch_loss = 0.0
 
@@ -543,45 +527,48 @@ def _(
                 optimizer.step()
                 scheduler.step()
 
-                loss_val   = loss.item()
+                loss_val = loss.item()
                 epoch_loss += loss_val
                 global_step += 1
 
                 # ── TensorBoard ──
                 if global_step % train_log_steps.value == 0:
                     lr_now = scheduler.get_last_lr()[0]
-                    writer.add_scalar("train/loss",    loss_val,   global_step)
-                    writer.add_scalar("train/lr",      lr_now,     global_step)
-                    writer.add_scalar("train/epoch",   epoch,      global_step)
+                    writer.add_scalar("train/loss", loss_val, global_step)
+                    writer.add_scalar("train/lr", lr_now, global_step)
+                    writer.add_scalar("train/epoch", epoch, global_step)
 
                     # gradient norm
-                    grad_norm = math.sqrt(sum(
-                        p.grad.norm().item() ** 2
-                        for p in model.parameters()
-                        if p.grad is not None
-                    ))
+                    grad_norm = math.sqrt(
+                        sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None)
+                    )
                     writer.add_scalar("train/grad_norm", grad_norm, global_step)
 
-                    log_rows.append({
-                        "step":  global_step,
-                        "epoch": epoch,
-                        "loss":  f"{loss_val:.4f}",
-                        "lr":    f"{lr_now:.2e}",
-                        "grad_norm": f"{grad_norm:.3f}",
-                    })
+                    log_rows.append(
+                        {
+                            "step": global_step,
+                            "epoch": epoch,
+                            "loss": f"{loss_val:.4f}",
+                            "lr": f"{lr_now:.2e}",
+                            "grad_norm": f"{grad_norm:.3f}",
+                        }
+                    )
 
                 # ── Checkpoint ──
                 if global_step % train_save_steps.value == 0:
                     ckpt_path = ckpt_dir / f"step_{global_step:06d}.pt"
-                    torch.save({
-                        "step":            global_step,
-                        "epoch":           epoch,
-                        "model_state":     model.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "scheduler_state": scheduler.state_dict(),
-                        "loss":            loss_val,
-                        "config":          config.to_dict(),
-                    }, ckpt_path)
+                    torch.save(
+                        {
+                            "step": global_step,
+                            "epoch": epoch,
+                            "model_state": model.state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "scheduler_state": scheduler.state_dict(),
+                            "loss": loss_val,
+                            "config": config.to_dict(),
+                        },
+                        ckpt_path,
+                    )
                     writer.add_text(
                         "checkpoints",
                         f"Saved `{ckpt_path.name}` — loss {loss_val:.4f}",
@@ -597,14 +584,21 @@ def _(
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 best_path = ckpt_dir / "best.pt"
-                torch.save({
-                    "step":        global_step,
-                    "epoch":       epoch,
-                    "model_state": model.state_dict(),
-                    "loss":        best_loss,
-                    "config":      config.to_dict(),
-                }, best_path)
-                writer.add_text("checkpoints", f"🏆 New best at epoch {epoch} — loss {best_loss:.4f}", global_step)
+                torch.save(
+                    {
+                        "step": global_step,
+                        "epoch": epoch,
+                        "model_state": model.state_dict(),
+                        "loss": best_loss,
+                        "config": config.to_dict(),
+                    },
+                    best_path,
+                )
+                writer.add_text(
+                    "checkpoints",
+                    f"🏆 New best at epoch {epoch} — loss {best_loss:.4f}",
+                    global_step,
+                )
 
     writer.flush()
     writer.close()
@@ -626,10 +620,12 @@ def _(log_rows, mo, run_button):
     if not run_button.value or not log_rows:
         mo.stop(True)
 
-    mo.vstack([
-        mo.md("## 📊 Training Logs"),
-        mo.ui.table(log_rows, label="Step logs", pagination=True, page_size=20),
-    ])
+    mo.vstack(
+        [
+            mo.md("## 📊 Training Logs"),
+            mo.ui.table(log_rows, label="Step logs", pagination=True, page_size=20),
+        ]
+    )
     return
 
 
@@ -666,13 +662,15 @@ def _(Path, ckpt_browser_dir, mo, torch):
             for _f in _files:
                 try:
                     _ck = torch.load(_f, map_location="cpu", weights_only=True)
-                    _rows.append({
-                        "File":    _f.name,
-                        "Step":    _ck.get("step", "?"),
-                        "Epoch":   _ck.get("epoch", "?"),
-                        "Loss":    f"{_ck.get('loss', 0):.4f}",
-                        "Size":    f"{_f.stat().st_size / 1e6:.1f} MB",
-                    })
+                    _rows.append(
+                        {
+                            "File": _f.name,
+                            "Step": _ck.get("step", "?"),
+                            "Epoch": _ck.get("epoch", "?"),
+                            "Loss": f"{_ck.get('loss', 0):.4f}",
+                            "Size": f"{_f.stat().st_size / 1e6:.1f} MB",
+                        }
+                    )
                 except Exception as _e:
                     _rows.append({"File": _f.name, "Step": "error", "Epoch": "?", "Loss": "?", "Size": "?"})
 
@@ -690,7 +688,7 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    resume_path   = mo.ui.text(value="", label="Checkpoint path (.pt)")
+    resume_path = mo.ui.text(value="", label="Checkpoint path (.pt)")
     resume_button = mo.ui.run_button(label="Load checkpoint")
     mo.hstack([resume_path, resume_button])
     return resume_button, resume_path

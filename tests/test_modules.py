@@ -18,6 +18,7 @@ from kairos.dataset import KairosPretrainingDataset, KairosRLDataset, KairosSFTD
 
 from kairos.trainer import KairosDiffusionTrainer
 
+
 # =========================
 # Fixtures
 # =========================
@@ -31,8 +32,9 @@ def mini_wiki_texts():
     return [
         "Paris is the capital of France.",
         "The Earth orbits the Sun.",
-        "Water boils at 100 degrees Celsius."
+        "Water boils at 100 degrees Celsius.",
     ]
+
 
 @pytest.fixture
 def mini_mcq():
@@ -40,19 +42,20 @@ def mini_mcq():
         {
             "inputs": "What is the capital of France?",
             "multiple_choice_targets": ["Berlin", "Paris", "Madrid"],
-            "multiple_choice_scores":  [0, 1, 0],
+            "multiple_choice_scores": [0, 1, 0],
             "reasoning": "France is in Western Europe. Its capital is Paris.",
         },
         {
             "inputs": "What orbits the Sun?",
             "multiple_choice_targets": ["The Moon", "The Earth", "Mars"],
-            "multiple_choice_scores":  [0, 1, 0],
+            "multiple_choice_scores": [0, 1, 0],
             "reasoning": "The Earth orbits the Sun.",
         },
     ]
 
 
 MAX_LEN = 512  # ByT5 tokenizes byte-by-byte
+
 
 @pytest.fixture
 def mini_toolace():
@@ -61,9 +64,9 @@ def mini_toolace():
         {
             "system": '[{"name": "get_weather", "description": "Get weather for a city.", "parameters": {"city": {"type": "string"}}}]',
             "conversations": [
-                {"from": "user",      "value": "What is the weather in Paris?"},
+                {"from": "user", "value": "What is the weather in Paris?"},
                 {"from": "assistant", "value": "[get_weather(city=Paris)]"},
-                {"from": "tool",      "value": '[{"temperature": 22, "condition": "sunny"}]'},
+                {"from": "tool", "value": '[{"temperature": 22, "condition": "sunny"}]'},
                 {"from": "assistant", "value": "It is 22°C and sunny in Paris."},
             ],
         }
@@ -80,7 +83,6 @@ def mini_alpaca():
             "output": "Le ciel est bleu.",
         }
     ]
-
 
 
 @pytest.fixture
@@ -144,6 +146,7 @@ def test_aggregator_weights_sum():
 # Embeddings & Codec
 # =========================
 
+
 def test_token_embedding():
     codec = PyramidalConvCodec(32, stride=3)
 
@@ -165,8 +168,6 @@ def test_token_embedding():
     assert y.shape[0] == 2
 
 
-
-
 def test_codec_roundtrip():
     codec = PyramidalConvCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
@@ -175,6 +176,7 @@ def test_codec_roundtrip():
     decoded = codec(encoded, "decode")
 
     assert decoded.shape == x.shape
+
 
 # =========================
 # Model
@@ -219,6 +221,7 @@ def test_backward_pass(config):
 # Trainer
 # =========================
 
+
 def test_diffusion_trainer_loss(config):
     B, L, vocab = 2, 8, 50
 
@@ -236,7 +239,7 @@ def test_diffusion_trainer_loss(config):
     # checks
     assert loss is not None
     assert torch.is_tensor(loss)
-    assert loss.dim() == 0          # scalar
+    assert loss.dim() == 0  # scalar
     assert not torch.isnan(loss)
     assert loss > 0
 
@@ -289,6 +292,7 @@ def test_diffusion_trainer_applies_noise(config):
 
     assert "logits" in captured
 
+
 # =========================
 # Dataset
 # =========================
@@ -308,11 +312,7 @@ def test_dataset_with_wikitext(tokenizer):
     from datasets import load_dataset
 
     try:
-        ds_raw = load_dataset(
-            "Salesforce/wikitext",
-            "wikitext-2-raw-v1",
-            split="train[:1%]"
-        )
+        ds_raw = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train[:1%]")
     except Exception as e:
         pytest.skip(f"Dataset download failed: {e}")
 
@@ -346,6 +346,7 @@ def test_dataset_preprocess(tokenizer, mini_wiki_texts):
 
 # --- ToolACE tests ---
 
+
 def test_sft_toolace_length(tokenizer, mini_toolace):
     ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
     assert len(ds) == 1
@@ -361,12 +362,12 @@ def test_sft_toolace_shapes(tokenizer, mini_toolace):
     ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
     s = ds[0]
     assert s["input_ids"].shape == (MAX_LEN,)
-    assert s["gen_mask"].shape  == (MAX_LEN,)
+    assert s["gen_mask"].shape == (MAX_LEN,)
 
 
 def test_sft_toolace_prompt_never_noised(tokenizer, mini_toolace):
     ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
-    s    = ds[0]
+    s = ds[0]
     plen = s["prompt_len"].item()
     assert s["gen_mask"][:plen].sum() == 0
 
@@ -378,8 +379,8 @@ def test_sft_toolace_generation_region_exists(tokenizer, mini_toolace):
 
 def test_sft_toolace_last_assistant_is_generation(tokenizer, mini_toolace):
     """The generation region must correspond to the last assistant turn only."""
-    ds   = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
-    s    = ds[0]
+    ds = KairosSFTDataset(tokenizer, examples=mini_toolace, max_len=MAX_LEN)
+    s = ds[0]
     plen = s["prompt_len"].item()
 
     # Decode the generation region and check it contains the last assistant answer
@@ -390,6 +391,7 @@ def test_sft_toolace_last_assistant_is_generation(tokenizer, mini_toolace):
 
 # --- Alpaca tests ---
 
+
 def test_sft_alpaca_length(tokenizer, mini_alpaca):
     ds = KairosSFTDataset(tokenizer, examples=mini_alpaca, max_len=MAX_LEN)
     assert len(ds) == 1
@@ -397,62 +399,64 @@ def test_sft_alpaca_length(tokenizer, mini_alpaca):
 
 def test_sft_alpaca_generation_is_output(tokenizer, mini_alpaca):
     """The generation region must contain the expected French translation."""
-    ds   = KairosSFTDataset(tokenizer, examples=mini_alpaca, max_len=MAX_LEN)
-    s    = ds[0]
+    ds = KairosSFTDataset(tokenizer, examples=mini_alpaca, max_len=MAX_LEN)
+    s = ds[0]
     plen = s["prompt_len"].item()
 
     gen_ids = s["input_ids"][plen:]
     decoded = tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True).strip()
     assert "bleu" in decoded.lower()
 
+
 # --- BigBench tests ---
+
 
 def test_rldataset_length(tokenizer, mini_mcq):
     ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
     assert len(ds) == 2
- 
- 
+
+
 def test_rldataset_keys(tokenizer, mini_mcq):
     ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
     sample = ds[0]
     for key in ("input_ids", "gen_mask", "prompt_len", "mask_ratio", "choices", "scores", "level"):
         assert key in sample
- 
- 
+
+
 def test_rldataset_shapes(tokenizer, mini_mcq):
     ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=256)
     s = ds[0]
     assert s["input_ids"].shape == (256,)
-    assert s["gen_mask"].shape  == (256,)
- 
- 
+    assert s["gen_mask"].shape == (256,)
+
+
 def test_rldataset_prompt_never_noised(tokenizer, mini_mcq):
     ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
     for i in range(len(ds)):
-        s    = ds[i]
+        s = ds[i]
         plen = s["prompt_len"].item()
         assert s["gen_mask"][:plen].sum() == 0
- 
- 
+
+
 def test_rldataset_generation_region_exists(tokenizer, mini_mcq):
     ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
     for i in range(len(ds)):
         assert ds[i]["gen_mask"].sum() > 0
- 
- 
+
+
 def test_rldataset_uncertainty_choice_present(tokenizer, mini_mcq):
     ds = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=64)
     for i in range(len(ds)):
         assert "not sure / I don't know" in ds[i]["choices"]
- 
- 
+
+
 def test_rldataset_anti_reversal_curse(tokenizer, mini_mcq):
     """Same examples, different seeds → at least one sample must differ."""
     random.seed(0)
     ds1 = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=128)
     random.seed(99)
     ds2 = KairosRLDataset(tokenizer, examples=mini_mcq, max_len=128)
- 
+
     diffs = sum(not torch.equal(ds1[i]["input_ids"], ds2[i]["input_ids"]) for i in range(len(ds1)))
     assert diffs > 0
 
@@ -461,114 +465,113 @@ def test_rldataset_anti_reversal_curse(tokenizer, mini_mcq):
 # Cache
 # =========================
 
+
 # DiffusionBlock + cache_params
 def test_diffusion_block_accepts_cache_params(config):
     """DiffusionBlock.forward must accept cache_params without raising."""
     block = DiffusionBlock(config, layer_idx=0)
     cache = KairosCache(config)
- 
+
     x = torch.randn(1, 8, 32)
     out = block(x, cache_params=cache)
- 
+
     assert out.shape == x.shape
- 
- 
+
+
 def test_diffusion_block_output_differs_with_cache(config):
     """
     Output with a populated cache must differ from output without cache,
     proving cache_params is actually consumed by the attention layer.
     """
     block = DiffusionBlock(config, layer_idx=0)
- 
+
     x_ctx = torch.randn(1, 16, 32)
-    x_q   = torch.randn(1, 8,  32)
- 
+    x_q = torch.randn(1, 8, 32)
+
     # without cache
     out_no_cache = block(x_q)
- 
+
     # with a pre-populated cache
     cache = KairosCache(config)
     _ = block(x_ctx, cache_params=cache)
     out_with_cache = block(x_q, cache_params=cache)
- 
+
     assert not torch.allclose(out_no_cache, out_with_cache, atol=1e-4), (
         "Cache had no effect on output — cache_params is probably not forwarded"
     )
- 
- 
+
+
 def test_diffusion_block_cache_not_mutated(config):
     """
     Cloned cache must not be mutated by a DiffusionBlock forward pass
     (diffusion safety: each denoising step must start from the same N-state).
     """
     block = DiffusionBlock(config, layer_idx=0)
- 
+
     x_ctx = torch.randn(1, 16, 32)
     cache = KairosCache(config)
     _ = block(x_ctx, cache_params=cache)
- 
+
     ref = cache.clone()
- 
+
     x_m = torch.randn(1, 8, 32)
     _ = block(x_m, cache_params=cache.clone())
- 
+
     for c1, c2 in zip(cache.ssm_caches, ref.ssm_caches):
         if c1 is not None:
             assert torch.allclose(c1, c2), "ssm_cache was mutated on the original cache"
- 
+
     for idx in cache._key_cache:
         k1 = cache._key_cache[idx]
         k2 = ref._key_cache[idx]
         if k1 is not None:
             assert torch.allclose(k1, k2), f"KV cache at layer {idx} was mutated"
- 
- 
+
+
 def test_diffusion_block_cache_determinism(config):
     """
     Same cache clone + same input → identical output.
     Critical for stable iterative diffusion.
     """
     block = DiffusionBlock(config, layer_idx=0)
- 
+
     x_ctx = torch.randn(1, 16, 32)
     cache = KairosCache(config)
     _ = block(x_ctx, cache_params=cache)
- 
+
     x_m = torch.randn(1, 8, 32)
- 
+
     out1 = block(x_m, cache_params=cache.clone())
     out2 = block(x_m, cache_params=cache.clone())
- 
-    assert torch.allclose(out1, out2, atol=1e-5), (
-        "Non-deterministic output with identical cache clones"
-    )
- 
- 
+
+    assert torch.allclose(out1, out2, atol=1e-5), "Non-deterministic output with identical cache clones"
+
+
 def test_diffusion_block_no_cache_backward(config):
     """Gradient must flow through DiffusionBlock without cache."""
     block = DiffusionBlock(config, layer_idx=0)
- 
+
     x = torch.randn(2, 8, 32, requires_grad=True)
     out = block(x)
     out.mean().backward()
- 
+
     assert x.grad is not None
     assert not torch.isnan(x.grad).any()
- 
- 
+
+
 def test_diffusion_block_with_cache_backward(config):
     """Gradient must also flow when cache_params is provided."""
     block = DiffusionBlock(config, layer_idx=0)
     cache = KairosCache(config)
- 
+
     x = torch.randn(2, 8, 32, requires_grad=True)
     out = block(x, cache_params=cache)
     out.mean().backward()
- 
+
     assert x.grad is not None
     assert not torch.isnan(x.grad).any()
- 
- 
+
+
 # Backbone propagates cache
 def test_backbone_propagates_cache(config):
     """
@@ -577,71 +580,67 @@ def test_backbone_propagates_cache(config):
     """
     backbone = KairosDiffusionBackbone(config)
     cache = KairosCache(config)
- 
+
     x = torch.randn(1, 8, 32)
     out = backbone(x, cache_params=cache)
- 
+
     assert out.shape == x.shape
     assert not torch.isnan(out).any()
- 
- 
+
+
 def test_backbone_cache_conditions_output(config):
     """
     Backbone output must differ depending on cache content.
     """
     backbone = KairosDiffusionBackbone(config)
- 
+
     x_ctx1 = torch.randn(1, 16, 32)
     x_ctx2 = torch.randn(1, 16, 32)
-    x_q    = torch.randn(1, 8,  32)
- 
+    x_q = torch.randn(1, 8, 32)
+
     cache1 = KairosCache(config)
     cache2 = KairosCache(config)
- 
+
     _ = backbone(x_ctx1, cache_params=cache1)
     _ = backbone(x_ctx2, cache_params=cache2)
- 
+
     out1 = backbone(x_q, cache_params=cache1.clone())
     out2 = backbone(x_q, cache_params=cache2.clone())
- 
+
     assert not torch.allclose(out1, out2, atol=1e-4), (
         "Backbone ignores cache — different contexts produce identical outputs"
     )
- 
- 
+
+
 # Full model propagates cache
 def test_model_forward_with_cache(config):
     """KairosDiffusionLLM.forward must accept cache_params end-to-end."""
     model = KairosDiffusionLLM(config)
     cache = KairosCache(config)
- 
+
     x = torch.randint(0, 259, (1, 16))
     out = model(input_ids=x, cache_params=cache)
- 
+
     assert out.logits is not None
     assert not torch.isnan(out.logits).any()
- 
- 
+
+
 def test_model_diffusion_stability_with_cache(config):
     """
     Five denoising iterations with cloned cache → identical outputs.
     End-to-end diffusion stability test.
     """
     model = KairosDiffusionLLM(config)
- 
+
     x_ctx = torch.randint(0, 259, (1, 16))
-    x_m   = torch.randint(0, 259, (1, 8))
- 
+    x_m = torch.randint(0, 259, (1, 8))
+
     cache = KairosCache(config)
     _ = model(input_ids=x_ctx, cache_params=cache)
- 
-    outs = [
-        model(input_ids=x_m, cache_params=cache.clone()).logits
-        for _ in range(5)
-    ]
- 
+
+    outs = [model(input_ids=x_m, cache_params=cache.clone()).logits for _ in range(5)]
+
     for o in outs[1:]:
         assert torch.allclose(outs[0], o, atol=1e-5), (
             "Diffusion instability: identical cache clones produce different logits"
         )
- 

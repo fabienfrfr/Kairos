@@ -19,7 +19,7 @@ def extract_function_block(system: str):
         elif c == "]":
             depth -= 1
             if depth == 0:
-                block = system[start:i + 1]
+                block = system[start : i + 1]
                 try:
                     json.loads(block)
                     return block
@@ -58,12 +58,14 @@ def build_toolace_view():
         if not instruction or not inputs or not outputs:
             continue
 
-        records.append({
-            "instruction": instruction,
-            "input": json.dumps(inputs, ensure_ascii=False),   # JSON STRING
-            "output": json.dumps(outputs, ensure_ascii=False), # JSON STRING
-            "seed_data": "ToolACE",
-        })
+        records.append(
+            {
+                "instruction": instruction,
+                "input": json.dumps(inputs, ensure_ascii=False),  # JSON STRING
+                "output": json.dumps(outputs, ensure_ascii=False),  # JSON STRING
+                "seed_data": "ToolACE",
+            }
+        )
 
     return Dataset.from_list(records)
 
@@ -73,12 +75,14 @@ def build_alpaca_view():
     records = []
 
     for row in raw:
-        records.append({
-            "instruction": row.get("instruction", ""),
-            "input": row.get("input", "") or "",
-            "output": row.get("output", "") or "",
-            "seed_data": "alpaca-cleaned",
-        })
+        records.append(
+            {
+                "instruction": row.get("instruction", ""),
+                "input": row.get("input", "") or "",
+                "output": row.get("output", "") or "",
+                "seed_data": "alpaca-cleaned",
+            }
+        )
 
     return Dataset.from_list(records)
 

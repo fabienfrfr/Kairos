@@ -17,6 +17,7 @@ import pathspec
 DEFAULT_OUTPUT = "project_structure.json"
 DEFAULT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+
 # --- Utility Functions ---
 def read_file_content(file_path: str) -> str:
     """Reads the content of a file."""
@@ -42,7 +43,7 @@ def get_gitignore_spec(root_dir: str) -> pathspec.PathSpec:
         ".venv/",
         ".DS_Store",
         "node_modules/",
-        "*.svg", # promote .puml, .tikz or mermaid
+        "*.svg",  # promote .puml, .tikz or mermaid
     ]
     gitignore_path = os.path.join(root_dir, ".gitignore")
 
@@ -127,9 +128,7 @@ def generate_json_from_code(root_dir: str, output_json_path: str) -> None:
 # --- CLI ---
 def main():
     parser = argparse.ArgumentParser(description="Code Mapper: Sync code and JSON.")
-    parser.add_argument(
-        "--from-json", nargs="?", const=DEFAULT_OUTPUT, help="JSON to Code."
-    )
+    parser.add_argument("--from-json", nargs="?", const=DEFAULT_OUTPUT, help="JSON to Code.")
     parser.add_argument("--to-json", nargs="*", help="Code to JSON [ROOT] [OUTPUT].")
 
     args = parser.parse_args()

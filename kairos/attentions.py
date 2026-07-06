@@ -8,12 +8,13 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.cache_utils import DynamicCache
 
 # =========================
-# Backend 
+# Backend
 # =========================
 # Attention (Flex or eager)
 if torch.cuda.is_available():
     try:
         from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
         flex_attention = torch.compile(flex_attention)
         ATTN_IMPL = "flex"
     except Exception:
@@ -37,7 +38,7 @@ from transformers.models.qwen3_next.modeling_qwen3_next import (
     torch_recurrent_gated_delta_rule,
 )
 
-# Conv 
+# Conv
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
@@ -45,17 +46,21 @@ except ImportError:
     from transformers.models.qwen3_next.modeling_qwen3_next import (
         torch_causal_conv1d_update,
     )
+
     causal_conv1d_update = torch_causal_conv1d_update
+
 
 # =========================
 # Normalization
 # =========================
 class KairosNorm(LlamaRMSNorm):
     """RMS Norm for stabilization"""
+
     pass
 
+
 # =========================
-# Cache Diffusion 
+# Cache Diffusion
 # =========================
 class KairosCache(DynamicCache):
     """
@@ -77,7 +82,7 @@ class KairosCache(DynamicCache):
         self._value_cache = {}
 
         for idx, layer_type in enumerate(config.layers_config):
-            if 'l' in layer_type or 'd' in layer_type:  # attention layers
+            if "l" in layer_type or "d" in layer_type:  # attention layers
                 self._key_cache[idx] = None
                 self._value_cache[idx] = None
 
@@ -117,7 +122,7 @@ class KairosCache(DynamicCache):
     # Sliding window trim
     # =========================
     def trim(self, layer_idx):
-        if 'l' not in self.layers_config[layer_idx]:  # trim SWA only
+        if "l" not in self.layers_config[layer_idx]:  # trim SWA only
             return
 
         window = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
@@ -133,10 +138,7 @@ class KairosCache(DynamicCache):
     # DeltaNet state access
     # =========================
     def get_ssm_cache(self, layer_idx):
-        return (
-            self.conv_caches[layer_idx],
-            self.ssm_caches[layer_idx]
-        )
+        return (self.conv_caches[layer_idx], self.ssm_caches[layer_idx])
 
     def get_total_seen(self, layer_idx):
         return self.past_length[layer_idx]
@@ -150,29 +152,18 @@ class KairosCache(DynamicCache):
         """
         new_cache = KairosCache(self.config)
 
-        new_cache.conv_caches = [
-            c.clone() if c is not None else None
-            for c in self.conv_caches
-        ]
+        new_cache.conv_caches = [c.clone() if c is not None else None for c in self.conv_caches]
 
-        new_cache.ssm_caches = [
-            c.clone() if c is not None else None
-            for c in self.ssm_caches
-        ]
+        new_cache.ssm_caches = [c.clone() if c is not None else None for c in self.ssm_caches]
 
-        new_cache._key_cache = {
-            k: v.clone() if v is not None else None
-            for k, v in self._key_cache.items()
-        }
+        new_cache._key_cache = {k: v.clone() if v is not None else None for k, v in self._key_cache.items()}
 
-        new_cache._value_cache = {
-            k: v.clone() if v is not None else None
-            for k, v in self._value_cache.items()
-        }
+        new_cache._value_cache = {k: v.clone() if v is not None else None for k, v in self._value_cache.items()}
 
         new_cache.past_length = self.past_length.copy()
 
         return new_cache
+
 
 # =========================
 # Rotary
@@ -206,10 +197,7 @@ class KairosRotaryEmbedding(nn.Module):
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
-    return torch.cat([
-        x1 * cos + x2 * sin,
-        x1 * (-sin) + x2 * cos
-    ], dim=-1).type_as(x)
+    return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], dim=-1).type_as(x)
 
 
 # =========================
@@ -253,12 +241,13 @@ def eager_attention(q, k, v, window):
     # --- compute ---
     q = q.unsqueeze(3)
 
-    scores = (q * k_windows).sum(-1) * (D ** -0.5)
+    scores = (q * k_windows).sum(-1) * (D**-0.5)
     attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
 
     out = (attn.unsqueeze(-1) * v_windows).sum(3)
 
     return out.contiguous()
+
 
 # =========================
 # Flex mask builder (bidir)
@@ -267,13 +256,8 @@ def build_flex_mask(max_len, window):
     def bidir_window(b, h, q_idx, kv_idx):
         return (kv_idx >= q_idx - window) & (kv_idx <= q_idx + window)
 
-    return create_block_mask(
-        bidir_window,
-        B=None,
-        H=None,
-        Q_LEN=max_len,
-        KV_LEN=max_len
-    )
+    return create_block_mask(bidir_window, B=None, H=None, Q_LEN=max_len, KV_LEN=max_len)
+
 
 # =========================
 # Kairos Attention (SWA bidirectional)
@@ -301,16 +285,11 @@ class KairosAttention(nn.Module):
         self.out = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
         if ATTN_IMPL == "flex":
-            self.block_mask = build_flex_mask(
-                config.max_position_embeddings,
-                self.window
-            )
-        
+            self.block_mask = build_flex_mask(config.max_position_embeddings, self.window)
+
         # RoRE
         self.rope = KairosRotaryEmbedding(config, self.head_dim)
 
-
-    
     def forward(self, x, position_embeddings=None, cache_params=None):
         B, L, _ = x.shape
 
@@ -348,7 +327,7 @@ class KairosAttention(nn.Module):
                 k.transpose(1, 2),
                 v.transpose(1, 2),
                 block_mask=self.block_mask._adjust(q.size(1), k.size(1)),
-                scale=self.head_dim ** -0.5,
+                scale=self.head_dim**-0.5,
             ).transpose(1, 2)
 
         else:
@@ -395,16 +374,11 @@ class KairosGatedDeltaNet(nn.Module):
         self.g_proj = nn.Linear(self.hidden_size, 2 * self.head_dim * self.n_heads, bias=False)
 
         # conv expend
-        self.v_expand = nn.Linear(
-            self.n_heads * self.head_dim,
-            self.n_heads * 2 * self.head_dim,
-            bias=False
-        )
+        self.v_expand = nn.Linear(self.n_heads * self.head_dim, self.n_heads * 2 * self.head_dim, bias=False)
 
         # ---- dt init ----
         dt = torch.exp(
-            torch.rand(self.n_heads_local) *
-            (math.log(config.time_step_max) - math.log(config.time_step_min))
+            torch.rand(self.n_heads_local) * (math.log(config.time_step_max) - math.log(config.time_step_min))
             + math.log(config.time_step_min)
         )
         dt = torch.clamp(dt, min=config.time_step_floor)
@@ -423,7 +397,7 @@ class KairosGatedDeltaNet(nn.Module):
             bias=False,
             kernel_size=self.conv_size,
             groups=self.conv_dim,
-            padding=self.conv_size - 1
+            padding=self.conv_size - 1,
         )
 
         # ---- kernels ----
@@ -442,12 +416,11 @@ class KairosGatedDeltaNet(nn.Module):
             if fused_recurrent_gated_delta_rule is not None
             else torch_recurrent_gated_delta_rule
         )
-        
+
         # ---- bidirectionnal output merging ----
         self.merge_norm = KairosNorm(2 * self.value_dim)
-        self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False) # intermediate state
-        self.out_proj = nn.Linear(self.hidden_size, config.hidden_size, bias=False) # shareable with swa
-
+        self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False)  # intermediate state
+        self.out_proj = nn.Linear(self.hidden_size, config.hidden_size, bias=False)  # shareable with swa
 
     def process(self, hidden_states, cache_params=None):
         B, L, _ = hidden_states.shape
@@ -458,8 +431,8 @@ class KairosGatedDeltaNet(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        b = self.b_proj(hidden_states).view(B, L, self.n_heads)   # beta
-        a = self.a_proj(hidden_states).view(B, L, self.n_heads)   # pre-g
+        b = self.b_proj(hidden_states).view(B, L, self.n_heads)  # beta
+        a = self.a_proj(hidden_states).view(B, L, self.n_heads)  # pre-g
         g_out = self.g_proj(hidden_states).view(B, L, self.n_heads, 2 * self.head_dim)
 
         # ---- reshape ----
@@ -476,8 +449,8 @@ class KairosGatedDeltaNet(nn.Module):
         kf = rearrange(k, "b l h d -> b l (h d)")
         vf = rearrange(v, "b l h d -> b l (h d)")
 
-        # ---- V expansion (DeltaNet) 
-        vf = self.v_expand(vf) # dv = 2d --> move before conv for expressivity
+        # ---- V expansion (DeltaNet)
+        vf = self.v_expand(vf)  # dv = 2d --> move before conv for expressivity
 
         # ---- MIX
         mixed_qkv = torch.cat([qf, kf, vf], dim=-1).transpose(1, 2)
@@ -522,7 +495,11 @@ class KairosGatedDeltaNet(nn.Module):
         prev_state = cache_params.ssm_caches[self.layer_idx] if use_precomputed_states else None
         if not use_precomputed_states:
             o, ssm_cache = self.chunk_gated_delta_rule(
-                q, k, v, g, beta,
+                q,
+                k,
+                v,
+                g,
+                beta,
                 scale=None,
                 initial_state=prev_state,
                 output_final_state=False,
@@ -530,12 +507,16 @@ class KairosGatedDeltaNet(nn.Module):
             )
         else:
             o, ssm_cache = self.recurrent_gated_delta_rule(
-                q, k, v, g, beta,
+                q,
+                k,
+                v,
+                g,
+                beta,
                 initial_state=prev_state,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
             )
-        
+
         if use_precomputed_states:
             cache_params.ssm_caches[self.layer_idx] = ssm_cache
 
@@ -544,7 +525,7 @@ class KairosGatedDeltaNet(nn.Module):
 
         return o
 
-    def forward(self, hidden_states, cache_params=None):        
+    def forward(self, hidden_states, cache_params=None):
         # ---- forward (with cache for past memory)----
         out_f = self.process(hidden_states, cache_params)
 
@@ -562,10 +543,9 @@ class KairosGatedDeltaNet(nn.Module):
         out = out.reshape(B, L, -1)  # (B, L, 2 * value_dim)
         out = self.merge_norm(out)
         # linear
-        out = self.out_left_right(out) # concat to swa value dim
+        out = self.out_left_right(out)  # concat to swa value dim
         out = self.out_proj(out)  # (B, L, hidden_size) -> shareable
         return out
-
 
 
 # =========================
@@ -573,15 +553,14 @@ class KairosGatedDeltaNet(nn.Module):
 # =========================
 class KairosLiZAttention2(nn.Module):
     """
-    TPTT-inspired (arxiv.org/abs/2506.17671) shared QKV/O projections couple SWA and DeltaNet, 
+    TPTT-inspired (arxiv.org/abs/2506.17671) shared QKV/O projections couple SWA and DeltaNet,
     enforcing aligned representations while enabling bidirectional (non-causal) modeling.
-    Note: Alpha and beta in DeltaNet are not shared as they control directional mixing 
+    Note: Alpha and beta in DeltaNet are not shared as they control directional mixing
     independently from the shared representation space defined by QKVO.
     Adding : LiZAttention2:
     - Outputs are concatenated (not summed)
     - Then projected back to hidden_size (mixer)
     """
-
 
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -599,29 +578,18 @@ class KairosLiZAttention2(nn.Module):
         self.delta.k_proj = self.swa.k_proj
         self.delta.v_proj = self.swa.v_proj
         self.delta.out_proj = self.swa.out
-        
+
         # Final mixer
         self.norm = KairosNorm(2 * self.hidden_size)
-        self.out_proj = nn.Linear(
-            2 * self.hidden_size,
-            self.hidden_size,
-            bias=False
-        )
+        self.out_proj = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
 
     def forward(self, x, position_embeddings=None, cache_params=None):
 
         # ---- SWA ----
-        swa_out = self.swa(
-            x,
-            position_embeddings,
-             cache_params
-        )  # (B, L, D)
+        swa_out = self.swa(x, position_embeddings, cache_params)  # (B, L, D)
 
         # ---- Delta (with cache) ----
-        delta_out = self.delta(
-            x,
-            cache_params=cache_params
-        )  # (B, L, D)
+        delta_out = self.delta(x, cache_params=cache_params)  # (B, L, D)
 
         # ---- concat & norm ----
         out = torch.cat([swa_out, delta_out], dim=-1)

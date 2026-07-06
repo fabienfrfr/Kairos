@@ -8,10 +8,13 @@ from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
-from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationMixin
+from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
+    DiffusionGemmaGenerationMixin,
+)
 
 
 from .attentions import KairosLiZAttention2, KairosNorm
+
 
 # =========================
 # PretrainedConfig
@@ -27,8 +30,8 @@ class KairosConfig(PretrainedConfig):
         vocab_size=259,
         intermediate_size=2048,
         window_size=128,
-        stride = 5, # need to find for multimodality
-        **kwargs
+        stride=5,  # need to find for multimodality
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -61,10 +64,10 @@ class KairosConfig(PretrainedConfig):
         self.linear_num_key_heads = kwargs.get("linear_num_key_heads", n_heads)
         self.linear_key_head_dim = kwargs.get("linear_key_head_dim", self.head_dim)
         self.linear_value_head_dim = kwargs.get("linear_value_head_dim", self.head_dim)
-        self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4) # Qwen3_5
+        self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4)  # Qwen3_5
         self.hidden_act = kwargs.get("hidden_act", "silu")
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
-        
+
         self.time_step_min = 0.001
         self.time_step_max = 0.1
         self.time_step_floor = 1e-4
@@ -88,7 +91,7 @@ class KairosConfig(PretrainedConfig):
         # Layers config (required by KairosCache)
         self.layers_config = kwargs.get(
             "layers_config",
-            ["ld"] * n_layers  # default: DeltaNet+SWA layers
+            ["ld"] * n_layers,  # default: DeltaNet+SWA layers
         )
         self.slw_wsize = kwargs.get("slw_wsize", -1)
 
@@ -101,11 +104,13 @@ class KairosConfig(PretrainedConfig):
 # =========================
 class KairosFFN(Qwen2MoeMLP):
     """dense KairosFFN (SwiGLU + HF optimisations)."""
+
     pass
 
 
 class KairosMoE(DeepseekV3MoE):
     """MoE (routing + scaling + grouping)."""
+
     pass
 
 
@@ -121,11 +126,7 @@ class DiffusionBlock(nn.Module):
 
         self.attn = KairosLiZAttention2(config, layer_idx)
 
-        self.ffn = (
-            KairosMoE(config)
-            if num_experts is not None
-            else KairosFFN(config)
-        )
+        self.ffn = KairosMoE(config) if num_experts is not None else KairosFFN(config)
 
     def forward(self, x, position_embeddings=None, cache_params=None):
         x = x + self.attn(self.norm1(x), position_embeddings=position_embeddings, cache_params=cache_params)
@@ -144,29 +145,28 @@ class KairosCastingNorm(nn.RMSNorm):
         w = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
         return F.rms_norm(x, self.normalized_shape, w, self.eps)
 
+
 class KairosAttnRes(nn.Module):
     """Softmax attention over a list of prior sublayer outputs (arXiv 2603.15031)"""
+
     def __init__(self, n_embd):
         super().__init__()
         self.w = nn.Parameter(torch.zeros(n_embd))
         self.key_norm = KairosCastingNorm(n_embd)
 
     def forward(self, prior_values):
-        V = torch.stack(prior_values, dim=0)             # [L, B, T, d]
-        K = self.key_norm(V)                             # [L, B, T, d]
+        V = torch.stack(prior_values, dim=0)  # [L, B, T, d]
+        K = self.key_norm(V)  # [L, B, T, d]
         logits = torch.einsum("d,lbtd->lbt", self.w, K)  # [L, B, T]
-        weights = F.softmax(logits, dim=0)               # over the L source dim
-        return (weights.unsqueeze(-1) * V).sum(dim=0)    # [B, T, d]
+        weights = F.softmax(logits, dim=0)  # over the L source dim
+        return (weights.unsqueeze(-1) * V).sum(dim=0)  # [B, T, d]
 
 
 class KairosDiffusionBackbone(nn.Module):
     def __init__(self, config, num_experts=None):
         super().__init__()
 
-        self.layers = nn.ModuleList([
-            DiffusionBlock(config, i, num_experts)
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList([DiffusionBlock(config, i, num_experts) for i in range(config.num_hidden_layers)])
 
         self.norm = KairosNorm(config.hidden_size)
         self.aggregator = KairosAttnRes(config.hidden_size)
@@ -179,7 +179,6 @@ class KairosDiffusionBackbone(nn.Module):
             x = layer(h, position_embeddings=position_embeddings, cache_params=cache_params)
             states.append(x)
         return self.norm(x)
-
 
 
 # =========================
@@ -215,6 +214,7 @@ class KairosEmbedding(nn.Module):
 
 class OutputHead(nn.Module):
     """Token + modality prediction heads."""
+
     def __init__(
         self,
         embedding: KairosEmbedding,
@@ -273,7 +273,6 @@ class KairosScaleRouter(nn.Module):
         start = None
 
         for i, active in enumerate(mask.tolist()):
-
             if active and start is None:
                 start = i
 
@@ -294,13 +293,11 @@ class KairosScaleRouter(nn.Module):
         routing = []
 
         for scale_idx, scale in enumerate(scales):
-
             scale_len = scale.shape[1]
 
             scale_segments = []
 
             for b in range(modality_ids.shape[0]):
-
                 active = torch.zeros(
                     modality_ids.shape[1],
                     dtype=torch.bool,
@@ -308,20 +305,17 @@ class KairosScaleRouter(nn.Module):
                 )
 
                 for modality, allowed_scales in self.modality_scales.items():
-
                     if scale_idx not in allowed_scales:
                         continue
 
-                    active |= (modality_ids[b] == modality)
+                    active |= modality_ids[b] == modality
 
                 pooled = F.adaptive_max_pool1d(
                     active.float().view(1, 1, -1),
                     scale_len,
                 ).view(-1)
 
-                segments = self._find_segments(
-                    pooled.bool().cpu()
-                )
+                segments = self._find_segments(pooled.bool().cpu())
 
                 scale_segments.append(segments)
 
@@ -332,6 +326,7 @@ class KairosScaleRouter(nn.Module):
 
 class PyramidalConvCodec(nn.Module):
     """Parallel multi-scale convolutional codec with modality routing."""
+
     def __init__(
         self,
         d_model,
@@ -347,11 +342,10 @@ class PyramidalConvCodec(nn.Module):
         self.decoders = nn.ModuleList()
 
         for level in range(num_scales):
-
             scale_stride = stride ** (level + 1)
 
             kernel_size = scale_stride // 2
-            kernel_size += (kernel_size % 2 == 0)
+            kernel_size += kernel_size % 2 == 0
 
             padding = kernel_size // 2
 
@@ -381,9 +375,7 @@ class PyramidalConvCodec(nn.Module):
                 )
             )
 
-        self.norm = KairosNorm(
-            d_model * num_scales
-        )
+        self.norm = KairosNorm(d_model * num_scales)
 
         self.fusion = nn.Linear(
             d_model * num_scales,
@@ -397,10 +389,7 @@ class PyramidalConvCodec(nn.Module):
         scales = []
 
         for encoder in self.encoders:
-
-            scales.append(
-                encoder(h).transpose(1, 2)
-            )
+            scales.append(encoder(h).transpose(1, 2))
 
         return scales
 
@@ -412,24 +401,13 @@ class PyramidalConvCodec(nn.Module):
             scales,
             self.decoders,
         ):
+            h = decoder(scale.transpose(1, 2))
 
-            h = decoder(
-                scale.transpose(1, 2)
-            )
+            reconstructed.append(h.transpose(1, 2))
 
-            reconstructed.append(
-                h.transpose(1, 2)
-            )
+        min_len = min(x.shape[1] for x in reconstructed)
 
-        min_len = min(
-            x.shape[1]
-            for x in reconstructed
-        )
-
-        reconstructed = [
-            x[:, :min_len]
-            for x in reconstructed
-        ]
+        reconstructed = [x[:, :min_len] for x in reconstructed]
 
         h = torch.cat(
             reconstructed,
@@ -454,7 +432,6 @@ class KairosDiffusionLLM(
     PreTrainedModel,
     DiffusionGemmaGenerationMixin,
 ):
-
     def __init__(
         self,
         config,
@@ -469,9 +446,7 @@ class KairosDiffusionLLM(
             num_scales=4,
         )
 
-        self.router = KairosScaleRouter(
-            config.modality_scales
-        )
+        self.router = KairosScaleRouter(config.modality_scales)
 
         if vocab_size is None:
             vocab_size = config.vocab_size
@@ -482,23 +457,19 @@ class KairosDiffusionLLM(
             d_model=config.hidden_size,
         )
 
-        self.backbones = nn.ModuleList([
-            KairosDiffusionBackbone(
-                config=config,
-                num_experts=num_experts,
-            )
-            for _ in range(
-                self.codec.num_scales
-            )
-        ])
-
-        self.norm = KairosNorm(
-            config.hidden_size
+        self.backbones = nn.ModuleList(
+            [
+                KairosDiffusionBackbone(
+                    config=config,
+                    num_experts=num_experts,
+                )
+                for _ in range(self.codec.num_scales)
+            ]
         )
 
-        self.lm_head = OutputHead(
-            self.embedding
-        )
+        self.norm = KairosNorm(config.hidden_size)
+
+        self.lm_head = OutputHead(self.embedding)
 
     def forward(
         self,
@@ -510,11 +481,7 @@ class KairosDiffusionLLM(
         **kwargs,
     ):
 
-        x = (
-            decoder_input_ids
-            if decoder_input_ids is not None
-            else input_ids
-        )
+        x = decoder_input_ids if decoder_input_ids is not None else input_ids
 
         if x is None:
             raise ValueError()
@@ -531,16 +498,12 @@ class KairosDiffusionLLM(
         )
 
         if self_conditioning_logits is not None:
-
             probs = torch.softmax(
                 self_conditioning_logits,
                 dim=-1,
             )
 
-            h = h + (
-                probs
-                @ self.embedding.token_embed.weight
-            )
+            h = h + (probs @ self.embedding.token_embed.weight)
 
         # --------------------------------------------------
         # Encode
@@ -568,17 +531,12 @@ class KairosDiffusionLLM(
                 self.backbones,
             )
         ):
-
             output = scale.clone()
 
-            for batch_idx, segments in enumerate(
-                routing[scale_idx]
-            ):
-
+            for batch_idx, segments in enumerate(routing[scale_idx]):
                 for start, end in segments:
-
                     chunk = scale[
-                        batch_idx:batch_idx + 1,
+                        batch_idx : batch_idx + 1,
                         start:end,
                     ]
 
@@ -591,7 +549,7 @@ class KairosDiffusionLLM(
                     )
 
                     output[
-                        batch_idx:batch_idx + 1,
+                        batch_idx : batch_idx + 1,
                         start:end,
                     ] = chunk
 
@@ -601,15 +559,11 @@ class KairosDiffusionLLM(
         # Decode
         # --------------------------------------------------
 
-        h = self.codec.decode(
-            features
-        )
+        h = self.codec.decode(features)
 
         h = self.norm(h)
 
-        token_logits, modality_logits = (
-            self.lm_head(h)
-        )
+        token_logits, modality_logits = self.lm_head(h)
 
         return KairosOutput(
             logits=token_logits,

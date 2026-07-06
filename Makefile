@@ -16,6 +16,9 @@ jupyter: ## If you want to use Kaggle T4x2
 mapper: ## Export project structure to JSON
 	uv run python3 mapper.py --to-json
 
+format:
+	uv run ruff format .
+
 ##@ Maintenance
 clean: ## Remove python caches and temporary files
 	find . -type d -name "__pycache__" -exec rm -rf {} +
