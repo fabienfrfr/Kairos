@@ -42,6 +42,7 @@ class KairosConfig(PretrainedConfig):
         self.modality_scales = {
             0: [0, 1],  # text
             1: [1, 2],  # image
+            2: [2, 3],  # video
         }
 
         # Convolutionnal Byte-Codec
@@ -182,9 +183,8 @@ class KairosDiffusionBackbone(nn.Module):
 
 
 # =========================
-# Embeddings, Codec & Head
+# Embedding & Head
 # =========================
-
 class KairosEmbedding(nn.Module):
     """Token + modality embeddings."""
 
@@ -248,14 +248,95 @@ class OutputHead(nn.Module):
         return token_logits, modality_logits
 
 
-class PyramidalConvCodec(nn.Module):
-    """ Parallel multi-scale convolutional codec. """
+# =========================
+# Codec & Router Scaling
+# =========================
+class KairosScaleRouter(nn.Module):
+    """
+    Build routing segments for each scale.
 
+    modality_scales = {
+        0: [0, 1],  # text
+        1: [1, 2],  # image
+        2: [2, 3],  # video
+    }
+    """
+
+    def __init__(self, modality_scales):
+        super().__init__()
+        self.modality_scales = modality_scales
+
+    def _find_segments(self, mask):
+
+        segments = []
+
+        start = None
+
+        for i, active in enumerate(mask.tolist()):
+
+            if active and start is None:
+                start = i
+
+            elif not active and start is not None:
+                segments.append((start, i))
+                start = None
+
+        if start is not None:
+            segments.append((start, len(mask)))
+
+        return segments
+
+    def build(
+        self,
+        modality_ids,
+        scales,
+    ):
+        routing = []
+
+        for scale_idx, scale in enumerate(scales):
+
+            scale_len = scale.shape[1]
+
+            scale_segments = []
+
+            for b in range(modality_ids.shape[0]):
+
+                active = torch.zeros(
+                    modality_ids.shape[1],
+                    dtype=torch.bool,
+                    device=modality_ids.device,
+                )
+
+                for modality, allowed_scales in self.modality_scales.items():
+
+                    if scale_idx not in allowed_scales:
+                        continue
+
+                    active |= (modality_ids[b] == modality)
+
+                pooled = F.adaptive_max_pool1d(
+                    active.float().view(1, 1, -1),
+                    scale_len,
+                ).view(-1)
+
+                segments = self._find_segments(
+                    pooled.bool().cpu()
+                )
+
+                scale_segments.append(segments)
+
+            routing.append(scale_segments)
+
+        return routing
+
+
+class PyramidalConvCodec(nn.Module):
+    """Parallel multi-scale convolutional codec with modality routing."""
     def __init__(
         self,
-        d_model: int,
-        stride: int = 5,
-        num_scales: int = 3,
+        d_model,
+        stride=5,
+        num_scales=4,
     ):
         super().__init__()
 
@@ -268,9 +349,9 @@ class PyramidalConvCodec(nn.Module):
         for level in range(num_scales):
 
             scale_stride = stride ** (level + 1)
+
             kernel_size = scale_stride // 2
-            if kernel_size % 2 == 0:
-                kernel_size += 1
+            kernel_size += (kernel_size % 2 == 0)
 
             padding = kernel_size // 2
 
@@ -292,21 +373,31 @@ class PyramidalConvCodec(nn.Module):
                     kernel_size=kernel_size,
                     stride=scale_stride,
                     padding=padding,
-                    output_padding=max(scale_stride - 1, 0),
+                    output_padding=max(
+                        scale_stride - 1,
+                        0,
+                    ),
                     groups=d_model,
                 )
             )
-        
 
-        self.norm = KairosNorm(num_scales * d_model)
-        self.fusion = nn.Linear(num_scales * d_model,  d_model)
+        self.norm = KairosNorm(
+            d_model * num_scales
+        )
 
+        self.fusion = nn.Linear(
+            d_model * num_scales,
+            d_model,
+        )
 
     def encode(self, x):
-        h = x.transpose(1, 2)  # [B, D, T]
+
+        h = x.transpose(1, 2)
+
         scales = []
 
         for encoder in self.encoders:
+
             scales.append(
                 encoder(h).transpose(1, 2)
             )
@@ -314,6 +405,7 @@ class PyramidalConvCodec(nn.Module):
         return scales
 
     def decode(self, scales):
+
         reconstructed = []
 
         for scale, decoder in zip(
@@ -321,24 +413,32 @@ class PyramidalConvCodec(nn.Module):
             self.decoders,
         ):
 
-            h = scale.transpose(1, 2)
-            h = decoder(h)
-            h = h.transpose(1, 2)
+            h = decoder(
+                scale.transpose(1, 2)
+            )
 
-            reconstructed.append(h)
+            reconstructed.append(
+                h.transpose(1, 2)
+            )
 
-        h = torch.cat(reconstructed, dim=-1)
+        min_len = min(
+            x.shape[1]
+            for x in reconstructed
+        )
+
+        reconstructed = [
+            x[:, :min_len]
+            for x in reconstructed
+        ]
+
+        h = torch.cat(
+            reconstructed,
+            dim=-1,
+        )
+
         h = self.norm(h)
+
         return self.fusion(h)
-
-    def forward(self,  x, mode="encode"):
-        if mode == "encode":
-            return self.encode(x)
-
-        if mode == "decode":
-            return self.decode(x)
-
-        raise ValueError("mode must be 'encode' or 'decode'")
 
 
 # =========================
@@ -354,6 +454,7 @@ class KairosDiffusionLLM(
     PreTrainedModel,
     DiffusionGemmaGenerationMixin,
 ):
+
     def __init__(
         self,
         config,
@@ -363,30 +464,41 @@ class KairosDiffusionLLM(
         super().__init__(config)
 
         self.codec = PyramidalConvCodec(
-            config.hidden_size, stride=config.stride,
+            d_model=config.hidden_size,
+            stride=config.stride,
+            num_scales=4,
+        )
+
+        self.router = KairosScaleRouter(
+            config.modality_scales
         )
 
         if vocab_size is None:
             vocab_size = config.vocab_size
 
-        # Embedding
         self.embedding = KairosEmbedding(
             vocab_size=vocab_size,
             num_modalities=config.num_modalities,
             d_model=config.hidden_size,
         )
 
-        # One backbone per pyramid scale
         self.backbones = nn.ModuleList([
             KairosDiffusionBackbone(
                 config=config,
                 num_experts=num_experts,
             )
-            for _ in range(self.codec.num_scales)
+            for _ in range(
+                self.codec.num_scales
+            )
         ])
 
-        self.norm = KairosNorm(config.hidden_size)
-        self.lm_head = OutputHead(self.embedding)
+        self.norm = KairosNorm(
+            config.hidden_size
+        )
+
+        self.lm_head = OutputHead(
+            self.embedding
+        )
 
     def forward(
         self,
@@ -394,55 +506,110 @@ class KairosDiffusionLLM(
         decoder_input_ids=None,
         modality_ids=None,
         self_conditioning_logits=None,
-        past_key_values=None,
         cache_params=None,
         **kwargs,
     ):
-        # Input selection
-        if decoder_input_ids is not None:
-            x = decoder_input_ids
-        elif input_ids is not None:
-            x = input_ids
-        else:
-            raise ValueError("You must provide input_ids or decoder_input_ids")
 
-        # Default modality
+        x = (
+            decoder_input_ids
+            if decoder_input_ids is not None
+            else input_ids
+        )
+
+        if x is None:
+            raise ValueError()
+
         if modality_ids is None:
-            modality_ids = torch.full_like(x, self.config.text_modality_id)
+            modality_ids = torch.full_like(
+                x,
+                self.config.text_modality_id,
+            )
 
-        # Embedding  h : [B,T,D]
-        h = self.embedding(token_ids=x, modality_ids=modality_ids)
+        h = self.embedding(
+            token_ids=x,
+            modality_ids=modality_ids,
+        )
 
-        # Diffusion self-conditioning
         if self_conditioning_logits is not None:
 
-            probs = torch.softmax(self_conditioning_logits,dim=-1)
-            soft_emb = (probs@ self.embedding.token_embed.weight)
-            h = h + soft_emb
+            probs = torch.softmax(
+                self_conditioning_logits,
+                dim=-1,
+            )
 
-        # Pyramid encoding
-        scales = self.codec(h, mode="encode")
+            h = h + (
+                probs
+                @ self.embedding.token_embed.weight
+            )
 
-        # Parallel backbones
+        # --------------------------------------------------
+        # Encode
+        # --------------------------------------------------
+
+        scales = self.codec.encode(h)
+
+        routing = self.router.build(
+            modality_ids,
+            scales,
+        )
+
         features = []
 
-        for backbone, scale in zip(
-            self.backbones,
-            scales,
-        ):
-            feat = backbone(
-                scale, cache_params=cache_params,
+        # --------------------------------------------------
+        # Gather -> Backbone -> Scatter
+        # --------------------------------------------------
+
+        for scale_idx, (
+            scale,
+            backbone,
+        ) in enumerate(
+            zip(
+                scales,
+                self.backbones,
             )
-            features.append(feat)
+        ):
 
-        # Pyramid decoding / fusion
-        h = self.codec(features, mode="decode")
+            output = scale.clone()
 
-        # Final norm
+            for batch_idx, segments in enumerate(
+                routing[scale_idx]
+            ):
+
+                for start, end in segments:
+
+                    chunk = scale[
+                        batch_idx:batch_idx + 1,
+                        start:end,
+                    ]
+
+                    if chunk.shape[1] == 0:
+                        continue
+
+                    chunk = backbone(
+                        chunk,
+                        cache_params=cache_params,
+                    )
+
+                    output[
+                        batch_idx:batch_idx + 1,
+                        start:end,
+                    ] = chunk
+
+            features.append(output)
+
+        # --------------------------------------------------
+        # Decode
+        # --------------------------------------------------
+
+        h = self.codec.decode(
+            features
+        )
+
         h = self.norm(h)
 
-        # Heads
-        token_logits, modality_logits = self.lm_head(h)
+        token_logits, modality_logits = (
+            self.lm_head(h)
+        )
 
         return KairosOutput(
             logits=token_logits,
