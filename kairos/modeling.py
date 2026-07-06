@@ -300,36 +300,57 @@ class PyramidalConvCodec(nn.Module):
             for _ in range(depth)
         ])
 
+
+        # 1D, 2D, 3D modality bases
+        self.modality_scales = {
+            0: (0, 1),  # 3, 9
+            1: (1, 2),  # 9, 27
+            2: (2, 3),  # 27, 81
+        }
+
+        self.orig_len = None
         self.lengths = []
 
-    def forward(self, x, mode="encode"):
+    def forward(self, x, mode="encode", modality_id=0):
+        a, b = self.modality_scales[modality_id]
+
         if mode == "encode":
-            self.lengths = []
+            self.orig_len = x.shape[1]
 
             h = x.transpose(1, 2)
 
-            for enc in self.encoders:
-                self.lengths.append(h.shape[-1])
-                h = enc(h)
+            enc_a = self.encoders[a]
+            enc_b = self.encoders[b]
 
-            return h.transpose(1, 2)
+            ha = enc_a(h).transpose(1, 2)
+            hb = enc_b(h).transpose(1, 2)
+
+            L = min(ha.shape[1], hb.shape[1])
+
+            # not ok !! one compression = one backbone transformer ! (here its dummy : you lost info !)
+            # we want like a parallele transformer backbone "squared" sized by stride
+            ha = ha[:, :L]
+            hb = hb[:, :L]
+
+            return torch.cat([ha, hb], dim=-1)
 
         elif mode == "decode":
-            h = x.transpose(1, 2)
+            ha, hb = torch.chunk(x, 2, dim=-1)
 
-            for dec, length in zip(
-                reversed(self.decoders),
-                reversed(self.lengths),
-            ):
-                h = dec(h)
-                h = h[..., :length]
+            dec_a = self.decoders[a]
+            dec_b = self.decoders[b]
 
-            return h.transpose(1, 2)
+            ha = dec_a(ha.transpose(1, 2)).transpose(1, 2)
+            hb = dec_b(hb.transpose(1, 2)).transpose(1, 2)
 
-        raise ValueError(
-            "mode must be 'encode' or 'decode'"
-        )
+            h = 0.5 * (
+                ha[:, :self.orig_len]
+                + hb[:, :self.orig_len]
+            )
 
+            return h
+
+        raise ValueError("mode must be 'encode' or 'decode'")
 
 # =========================
 # Full Model (standard HF-like)
