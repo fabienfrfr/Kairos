@@ -203,6 +203,12 @@ class KairosCache(DynamicCache):
 
 
 class KairosMultiCache(DynamicCache):
+    """
+    One KairosCache per backbone scale.
+
+    Scales are isolated from each other.
+    Segments within the same scale share the same cache/state.
+    """    
     def __init__(self, config):
         super().__init__()
 

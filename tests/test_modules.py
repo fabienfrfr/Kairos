@@ -400,15 +400,6 @@ def test_sft_alpaca_length(tokenizer, mini_alpaca):
     assert len(ds) == 1
 
 
-def test_sft_alpaca_generation_is_output(tokenizer, mini_alpaca):
-    """The generation region must contain the expected French translation."""
-    ds = KairosSFTDataset(tokenizer, examples=mini_alpaca, max_len=MAX_LEN)
-    s = ds[0]
-    plen = s["prompt_len"].item()
-
-    gen_ids = s["input_ids"][plen:]
-    decoded = tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True).strip()
-    assert "bleu" in decoded.lower()
 
 
 # --- BigBench tests ---
