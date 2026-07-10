@@ -12,6 +12,7 @@ from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
     DiffusionGemmaGenerationMixin,
 )
 
+from transformers.cache_utils import DynamicCache
 
 from .attentions import KairosLiZAttention2, KairosNorm
 
@@ -47,6 +48,7 @@ class KairosConfig(PretrainedConfig):
             1: [1, 2],  # image
             2: [2, 3],  # video
         }
+        self.num_scales = kwargs.get("num_scales", 4)
 
         # Convolutionnal Byte-Codec
         self.stride = stride
@@ -97,6 +99,127 @@ class KairosConfig(PretrainedConfig):
 
         # warning
         assert d_model % n_heads == 0, "hidden_size must be divisible by n_heads"
+
+
+# =========================
+# Cache Diffusion
+# =========================
+class KairosCache(DynamicCache):
+    """
+    KairosCache: unified cache for bidirectional DeltaNet + attention with diffusion-style usage.
+    ---- DESIGN PRINCIPLES ----
+    Latent cache = state(N) reused for diffusion on M.
+    Must clone() each use (no mutation, no accumulation).
+    Contains: KV (attention), conv + SSM (DeltaNet).
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.conv_caches = []
+        self.ssm_caches = []
+
+        self._key_cache = {}
+        self._value_cache = {}
+
+        for idx, layer_type in enumerate(config.layers_config):
+            if "l" in layer_type or "d" in layer_type:  # attention layers
+                self._key_cache[idx] = None
+                self._value_cache[idx] = None
+
+            self.conv_caches.append(None)
+            self.ssm_caches.append(None)
+
+        self.window_size = config.sliding_window_size
+        self.layers_config = config.layers_config
+        self.past_length = [0 for _ in range(len(config.layers_config))]
+
+    # =========================
+    # Attention KV update
+    # =========================
+    def update(self, k, v, layer_idx):
+        """
+        Append K/V to attention cache.
+        """
+        added_len = k.size(1)
+
+        k_cache = self._key_cache[layer_idx]
+        v_cache = self._value_cache[layer_idx]
+
+        if k_cache is None:
+            k_cache = k
+            v_cache = v
+        else:
+            k_cache = torch.cat([k_cache, k], dim=1)
+            v_cache = torch.cat([v_cache, v], dim=1)
+
+        self._key_cache[layer_idx] = k_cache
+        self._value_cache[layer_idx] = v_cache
+        self.past_length[layer_idx] += added_len
+
+        return k_cache, v_cache
+
+    # =========================
+    # Sliding window trim
+    # =========================
+    def trim(self, layer_idx):
+        if "l" not in self.layers_config[layer_idx]:  # trim SWA only
+            return
+
+        window = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
+
+        k = self._key_cache[layer_idx]
+        v = self._value_cache[layer_idx]
+
+        if k is not None and k.size(1) > window:
+            self._key_cache[layer_idx] = k[:, -window:, ...].contiguous()
+            self._value_cache[layer_idx] = v[:, -window:, ...].contiguous()
+
+    # =========================
+    # DeltaNet state access
+    # =========================
+    def get_ssm_cache(self, layer_idx):
+        return (self.conv_caches[layer_idx], self.ssm_caches[layer_idx])
+
+    def get_total_seen(self, layer_idx):
+        return self.past_length[layer_idx]
+
+    # =========================
+    # CRITICAL: Clone
+    # =========================
+    def clone(self):
+        """
+        Deep clone of the cache. REQUIRED for diffusion / iterative inference
+        """
+        new_cache = KairosCache(self.config)
+        new_cache.conv_caches = [c.clone() if c is not None else None for c in self.conv_caches]
+        new_cache.ssm_caches = [c.clone() if c is not None else None for c in self.ssm_caches]
+        new_cache._key_cache = {k: v.clone() if v is not None else None for k, v in self._key_cache.items()}
+        new_cache._value_cache = {k: v.clone() if v is not None else None for k, v in self._value_cache.items()}
+        new_cache.past_length = self.past_length.copy()
+
+        return new_cache
+
+
+class KairosMultiCache(DynamicCache):
+    def __init__(self, config):
+        super().__init__()
+
+        self.config = config
+        self.caches = [
+            KairosCache(config)
+            for _ in range(config.num_scales)  # num_backbone
+        ]
+
+    def get(self, idx):
+        return self.caches[idx]
+
+    def clone(self):
+        out = KairosMultiCache.__new__(KairosMultiCache)
+        out.config = self.config
+        out.caches = [c.clone() for c in self.caches]
+        return out
 
 
 # =========================
@@ -252,7 +375,7 @@ class OutputHead(nn.Module):
 # Codec & Router Scaling
 # =========================
 class KairosScaleRouter(nn.Module):
-    """ Build routing segments for each scale. """
+    """Build routing segments for each scale."""
 
     def __init__(self, modality_scales):
         super().__init__()
@@ -314,6 +437,12 @@ class KairosScaleRouter(nn.Module):
             routing.append(scale_segments)
 
         return routing
+
+
+@dataclass
+class CodecOutput:
+    scales: list[torch.Tensor]
+    length: int
 
 
 class PyramidalConvCodec(nn.Module):
@@ -381,9 +510,11 @@ class PyramidalConvCodec(nn.Module):
         for encoder in self.encoders:
             scales.append(encoder(h).transpose(1, 2))
 
-        return scales
+        return CodecOutput(scales=scales, length=x.shape[1])
 
-    def decode(self, scales):
+    def decode(self, encoded):
+        scales = encoded.scales
+        length = encoded.length
 
         reconstructed = []
 
@@ -396,13 +527,10 @@ class PyramidalConvCodec(nn.Module):
 
         min_len = min(x.shape[1] for x in reconstructed)
         reconstructed = [x[:, :min_len] for x in reconstructed]
-        h = torch.cat(
-            reconstructed,
-            dim=-1,
-        )
+        h = torch.cat(reconstructed, dim=-1)
 
         h = self.norm(h)
-        return self.fusion(h)
+        return self.fusion(h)[:, :length]
 
 
 # =========================
@@ -429,7 +557,7 @@ class KairosDiffusionLLM(
         self.codec = PyramidalConvCodec(
             d_model=config.hidden_size,
             stride=config.stride,
-            num_scales=4,
+            num_scales=config.num_scales,
         )
 
         self.router = KairosScaleRouter(config.modality_scales)
@@ -492,51 +620,34 @@ class KairosDiffusionLLM(
             h = h + (probs @ self.embedding.token_embed.weight)
 
         # Encode
-        scales = self.codec.encode(h)
-        routing = self.router.build(
-            modality_ids,
-            scales,
-        )
+        encoded = self.codec.encode(h)
+        routing = self.router.build(modality_ids, encoded.scales)
 
         features = []
 
         # Gather -> Backbone -> Scatter
-        for scale_idx, (
-            scale,
-            backbone,
-        ) in enumerate(
-            zip(
-                scales,
-                self.backbones,
-            )
-        ):
+        for scale_idx, (scale, backbone) in enumerate(zip(encoded.scales, self.backbones)):
             output = scale.clone()
 
             for batch_idx, segments in enumerate(routing[scale_idx]):
                 for start, end in segments:
-                    chunk = scale[
-                        batch_idx : batch_idx + 1,
-                        start:end,
-                    ]
+                    chunk = scale[batch_idx : batch_idx + 1, start:end]
 
                     if chunk.shape[1] == 0:
                         continue
 
-                    chunk = backbone(
-                        chunk,
-                        cache_params=cache_params,
-                    )
+                    local_cache = cache_params.get(scale_idx) if cache_params is not None else None
 
-                    output[
-                        batch_idx : batch_idx + 1,
-                        start:end,
-                    ] = chunk
+                    chunk = backbone(chunk, cache_params=local_cache)
+                    output[batch_idx : batch_idx + 1, start:end] = chunk
 
             features.append(output)
 
-        # Decode
+        # reconstruct
+        decoded = CodecOutput(scales=features, length=encoded.length)
 
-        h = self.codec.decode(features)
+        # Decode
+        h = self.codec.decode(decoded)
         h = self.norm(h)
         token_logits, modality_logits = self.lm_head(h)
 

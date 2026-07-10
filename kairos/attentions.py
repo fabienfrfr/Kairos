@@ -5,7 +5,6 @@ from einops import rearrange
 import math
 
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from transformers.cache_utils import DynamicCache
 
 # =========================
 # Backend
@@ -57,112 +56,6 @@ class KairosNorm(LlamaRMSNorm):
     """RMS Norm for stabilization"""
 
     pass
-
-
-# =========================
-# Cache Diffusion
-# =========================
-class KairosCache(DynamicCache):
-    """
-    KairosCache: unified cache for bidirectional DeltaNet + attention with diffusion-style usage.
-    ---- DESIGN PRINCIPLES ----
-    Latent cache = state(N) reused for diffusion on M.
-    Must clone() each use (no mutation, no accumulation).
-    Contains: KV (attention), conv + SSM (DeltaNet).
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        self.conv_caches = []
-        self.ssm_caches = []
-
-        self._key_cache = {}
-        self._value_cache = {}
-
-        for idx, layer_type in enumerate(config.layers_config):
-            if "l" in layer_type or "d" in layer_type:  # attention layers
-                self._key_cache[idx] = None
-                self._value_cache[idx] = None
-
-            self.conv_caches.append(None)
-            self.ssm_caches.append(None)
-
-        self.window_size = config.sliding_window_size
-        self.layers_config = config.layers_config
-        self.past_length = [0 for _ in range(len(config.layers_config))]
-
-    # =========================
-    # Attention KV update
-    # =========================
-    def update(self, k, v, layer_idx):
-        """
-        Append K/V to attention cache.
-        """
-        added_len = k.size(1)
-
-        k_cache = self._key_cache[layer_idx]
-        v_cache = self._value_cache[layer_idx]
-
-        if k_cache is None:
-            k_cache = k
-            v_cache = v
-        else:
-            k_cache = torch.cat([k_cache, k], dim=1)
-            v_cache = torch.cat([v_cache, v], dim=1)
-
-        self._key_cache[layer_idx] = k_cache
-        self._value_cache[layer_idx] = v_cache
-        self.past_length[layer_idx] += added_len
-
-        return k_cache, v_cache
-
-    # =========================
-    # Sliding window trim
-    # =========================
-    def trim(self, layer_idx):
-        if "l" not in self.layers_config[layer_idx]:  # trim SWA only
-            return
-
-        window = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
-
-        k = self._key_cache[layer_idx]
-        v = self._value_cache[layer_idx]
-
-        if k is not None and k.size(1) > window:
-            self._key_cache[layer_idx] = k[:, -window:, ...].contiguous()
-            self._value_cache[layer_idx] = v[:, -window:, ...].contiguous()
-
-    # =========================
-    # DeltaNet state access
-    # =========================
-    def get_ssm_cache(self, layer_idx):
-        return (self.conv_caches[layer_idx], self.ssm_caches[layer_idx])
-
-    def get_total_seen(self, layer_idx):
-        return self.past_length[layer_idx]
-
-    # =========================
-    # CRITICAL: Clone
-    # =========================
-    def clone(self):
-        """
-        Deep clone of the cache. REQUIRED for diffusion / iterative inference
-        """
-        new_cache = KairosCache(self.config)
-
-        new_cache.conv_caches = [c.clone() if c is not None else None for c in self.conv_caches]
-
-        new_cache.ssm_caches = [c.clone() if c is not None else None for c in self.ssm_caches]
-
-        new_cache._key_cache = {k: v.clone() if v is not None else None for k, v in self._key_cache.items()}
-
-        new_cache._value_cache = {k: v.clone() if v is not None else None for k, v in self._value_cache.items()}
-
-        new_cache.past_length = self.past_length.copy()
-
-        return new_cache
 
 
 # =========================
@@ -424,7 +317,9 @@ class KairosGatedDeltaNet(nn.Module):
 
     def process(self, hidden_states, cache_params=None):
         B, L, _ = hidden_states.shape
-        use_precomputed_states = cache_params is not None
+
+        # Previous states exist only if a cache was already populated.
+        has_previous_state = cache_params is not None and cache_params.conv_caches[self.layer_idx] is not None
 
         # ---- projections ----
         q = self.q_proj(hidden_states)
@@ -450,36 +345,73 @@ class KairosGatedDeltaNet(nn.Module):
         vf = rearrange(v, "b l h d -> b l (h d)")
 
         # ---- V expansion (DeltaNet)
-        vf = self.v_expand(vf)  # dv = 2d --> move before conv for expressivity
+        vf = self.v_expand(vf)
 
-        # ---- MIX
+        # ---- MIX ----
         mixed_qkv = torch.cat([qf, kf, vf], dim=-1).transpose(1, 2)
 
-        # ---- conv ----
-        if use_precomputed_states:
-            conv_cache = cache_params.conv_caches[self.layer_idx]
-            if conv_cache is None:
-                conv_cache = mixed_qkv.new_zeros(B, self.conv_dim, self.conv_size - 1)
+        # ============================================================
+        # Convolution state
+        #
+        # Qwen3Next uses:
+        # - recurrent update only for single-token decoding
+        # - normal convolution for chunked sequences
+        # ============================================================
+
+        if has_previous_state and L == 1:
+            conv_state = cache_params.conv_caches[self.layer_idx]
+
             mixed_qkv = self.causal_conv1d_update(
                 mixed_qkv,
-                conv_cache,
+                conv_state,
                 self.qkv_conv1d.weight.squeeze(1),
                 self.qkv_conv1d.bias,
                 "silu",
             )
-            cache_params.conv_caches[self.layer_idx] = mixed_qkv.squeeze(-1)
+
         else:
-            mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv)[:, :, :L])
+            conv_state = None
+
+            if has_previous_state:
+                conv_state = cache_params.conv_caches[self.layer_idx]
+
+            elif cache_params is not None:
+                conv_state = mixed_qkv.new_zeros(
+                    B,
+                    self.conv_dim,
+                    self.conv_size - 1,
+                )
+
+            # prepend cached context
+            if conv_state is not None:
+                mixed_qkv = torch.cat(
+                    [conv_state, mixed_qkv],
+                    dim=-1,
+                )
+
+            # update cache with last kernel-1 tokens
+            if cache_params is not None:
+                cache_params.conv_caches[self.layer_idx] = mixed_qkv[:, :, -(self.conv_size - 1) :].clone()
+
+            mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv))
+
+            # keep only current sequence
+            mixed_qkv = mixed_qkv[:, :, -L:]
 
         # ---- split ----
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         d = self.head_dim
+
         q_dim = self.n_heads * d
         k_dim = self.n_heads * d
         v_dim = 2 * self.n_heads * d
 
-        q, k, v = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+        q, k, v = torch.split(
+            mixed_qkv,
+            [q_dim, k_dim, v_dim],
+            dim=-1,
+        )
 
         # ---- reshape ----
         q = rearrange(q, "b l (h d) -> b l h d", h=self.n_heads)
@@ -491,9 +423,24 @@ class KairosGatedDeltaNet(nn.Module):
 
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        # ---- DeltaNet ----
-        prev_state = cache_params.ssm_caches[self.layer_idx] if use_precomputed_states else None
-        if not use_precomputed_states:
+        # ============================================================
+        # DeltaNet state
+        # ============================================================
+
+        prev_state = cache_params.ssm_caches[self.layer_idx] if has_previous_state else None
+
+        if has_previous_state and L == 1:
+            o, ssm_cache = self.recurrent_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state=prev_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
             o, ssm_cache = self.chunk_gated_delta_rule(
                 q,
                 k,
@@ -502,25 +449,14 @@ class KairosGatedDeltaNet(nn.Module):
                 beta,
                 scale=None,
                 initial_state=prev_state,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
-            o, ssm_cache = self.recurrent_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state=prev_state,
-                output_final_state=False,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
 
-        if use_precomputed_states:
+        if cache_params is not None:
             cache_params.ssm_caches[self.layer_idx] = ssm_cache
 
-        # ---- output gating
+        # ---- output gating ----
         o = o * F.silu(g_out)
 
         return o

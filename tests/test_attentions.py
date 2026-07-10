@@ -1,8 +1,9 @@
 import torch
 import time
 
+from kairos.modeling import KairosCache
+
 from kairos.attentions import ATTN_IMPL
-from kairos.attentions import KairosCache
 from kairos.attentions import KairosAttention, KairosRotaryEmbedding
 from kairos.attentions import KairosGatedDeltaNet
 from kairos.attentions import KairosLiZAttention2
