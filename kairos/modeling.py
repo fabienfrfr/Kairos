@@ -113,12 +113,63 @@ class KairosConfig(PretrainedConfig):
 # =========================
 class KairosCache(DynamicCache):
     """
-    Unified cache for bidirectional DeltaNet + attention with diffusion-style usage.
-    KV/conv/ssm tensors are stored with their full batch dimension intact — the
-    caller is responsible for calling `update()`/`process()` once per scale for
-    the *whole batch at once* (see KairosDiffusionLLM.forward), not once per
-    example. That is what actually fixes the batch-corruption bug: this cache
-    was never the problem, calling it once per example was.
+    Unified cache for bidirectional DeltaNet + attention, built specifically
+    for **block diffusion** — read this before touching `clone()`, `update()`,
+    or `trim()`, since the intent isn't obvious from the method bodies alone.
+
+    THE MENTAL MODEL
+    -----------------
+    At inference time the sequence is split in two roles:
+      - context N  : already-known tokens (a prompt, or previously finalized
+                     blocks). Encoded ONCE, then FROZEN.
+      - block M    : the (fixed-size) span currently being denoised, iterated
+                     over several diffusion steps.
+
+    A cache instance represents "the state produced by having seen N". It is
+    built with exactly one forward pass over N, and from then on is treated as
+    read-only ground truth:
+      1. cache = KairosCache(config); model(N, cache_params=cache)
+      2. for each denoising step on M:
+             step_cache = cache.clone()          # <- MUST clone, never reuse
+             out = model(xt_M, cache_params=step_cache)
+      3. step_cache is discarded after each step; `cache` itself is never
+         mutated by a call that passes `xt_M` — only by the call that encoded N.
+
+    WHY `clone()` MUST DEEP-COPY (not share tensors)
+    -------------------------------------------------
+    Every denoising step re-reads the *same* frozen context N, conditioned on
+    a *different* noisy guess for M (`x_{t}`, `x_{t-1}`, ...). If steps shared
+    the underlying KV/conv/ssm tensors, `update()`/`trim()` calls from one
+    step (appending M's keys, advancing conv state, etc.) would leak into the
+    next step's starting point — silently turning "N steps of independent
+    denoising against fixed N" into "one long, accidentally-causal sequence
+    where each guess of M contaminates the next". `clone()` exists precisely
+    to cut that leakage: each step starts from an *identical*, independent
+    copy of "having seen N", and whatever it appends while processing M is
+    thrown away with it.
+
+    WHY THIS ALSO WORKS FOR (SOME) INFILLING
+    ------------------------------------------
+    Because SWA and DeltaNet here are bidirectional (see attentions.py), "M"
+    doesn't have to sit after N in raw sequence order — a masked gap between
+    two already-known spans can be denoised the same way, as long as the
+    router feeds the right positions into M and the rest into the frozen
+    context. The cache itself is agnostic to *where* M sits; it only cares
+    about "what was frozen" vs "what gets re-denoised this step".
+
+    NOTE — this is DIFFERENT from pretraining
+    ------------------------------------------
+    During pretraining there is no frozen N at all: the *entire* sequence is
+    noised and denoised in one shot (see KairosDiffusionTrainer), so a
+    KairosCache typically isn't part of that path. This class only encodes
+    the block-diffusion *inference* pattern above.
+
+    IMPLEMENTATION NOTE: KV/conv/ssm tensors are stored with their full batch
+    dimension intact — the caller must call `update()` (via the model's
+    forward) once per scale for the *whole batch at once*, never once per
+    example. Calling it per-example silently concatenates different examples'
+    K/V into the same tensor — that was the original multi-batch corruption
+    bug, and it's a caller contract this class can't enforce by itself.
     """
 
     def __init__(self, config):
@@ -176,6 +227,12 @@ class KairosCache(DynamicCache):
         return self.past_length[layer_idx]
 
     def clone(self):
+        # Deep-copy every tensor (not just the dict/list structure) — this is
+        # what isolates one denoising step of block M from the next. See the
+        # class docstring ("WHY clone() MUST DEEP-COPY") for the failure mode
+        # this prevents: without it, `update()`/conv-state advances made while
+        # denoising one guess of M would bleed into the next step's supposedly
+        # fresh copy of "having seen frozen context N".
         new_cache = KairosCache(self.config)
         new_cache.conv_caches = [c.clone() if c is not None else None for c in self.conv_caches]
         new_cache.ssm_caches = [c.clone() if c is not None else None for c in self.ssm_caches]
@@ -186,7 +243,13 @@ class KairosCache(DynamicCache):
 
 
 class KairosMultiCache(DynamicCache):
-    """One KairosCache per backbone scale."""
+    """
+    One KairosCache per backbone scale (context N is encoded once per scale in
+    KairosDiffusionLLM.forward, so each scale needs its own frozen state).
+    Same block-diffusion contract as KairosCache: build once against N, then
+    `.clone()` before every denoising step on M — never reuse the same
+    instance across steps. See KairosCache's docstring for the full rationale.
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -199,7 +262,7 @@ class KairosMultiCache(DynamicCache):
     def clone(self):
         out = KairosMultiCache.__new__(KairosMultiCache)
         out.config = self.config
-        out.caches = [c.clone() for c in self.caches]
+        out.caches = [c.clone() for c in self.caches]  # deep-copy per scale, see KairosCache.clone()
         return out
 
 
@@ -365,40 +428,61 @@ class KairosScaleRouter(nn.Module):
 
     @staticmethod
     def gather_active(x, active_mask):
-        """x: (B, T, D), active_mask: (B, T) bool -> gathered (B, max_len, D), pad_mask (B, max_len), positions (B, max_len)"""
+        """
+        x: (B, T, D), active_mask: (B, T) bool
+        -> gathered (B, max_len, D), pad_mask (B, max_len), positions (B, max_len)
+
+        FIX (vs previous pass): removed the Python loop over the batch entirely.
+        Trick: stable-sort each row so active positions come first (in their
+        original relative order), keep only the first `max_len` columns, and
+        derive `pad_mask` from the per-row active counts with a single
+        broadcasted comparison. Everything here is a single vectorized op —
+        no `.item()` sync except the one unavoidable `lengths.max()` needed to
+        size the output tensor.
+        """
         B, T, D = x.shape
-        lengths = active_mask.sum(dim=1)
+        lengths = active_mask.sum(dim=1)  # (B,)
         max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
 
         if max_len == 0:
             return None, None, None
 
-        gathered = x.new_zeros(B, max_len, D)
-        pad_mask = torch.zeros(B, max_len, dtype=torch.bool, device=x.device)
-        positions = torch.zeros(B, max_len, dtype=torch.long, device=x.device)
+        # Stable sort puts False (0) before True... we want actives first, so
+        # sort by (~active_mask): active rows get key 0 and land first.
+        order = torch.argsort((~active_mask).long(), dim=1, stable=True)  # (B, T)
+        positions = order[:, :max_len]  # (B, max_len): absolute index in [0, T)
 
-        # Loop bound is batch size (small), not sequence length — the expensive
-        # per-timestep loop from the original implementation is gone.
-        for b in range(B):
-            idx = active_mask[b].nonzero(as_tuple=True)[0]
-            n = idx.numel()
-            if n == 0:
-                continue
-            gathered[b, :n] = x[b, idx]
-            pad_mask[b, :n] = True
-            positions[b, :n] = idx
+        gathered = torch.gather(x, 1, positions.unsqueeze(-1).expand(-1, -1, D))
+
+        arange = torch.arange(max_len, device=x.device).unsqueeze(0)  # (1, max_len)
+        pad_mask = arange < lengths.unsqueeze(1)  # (B, max_len), vectorized
 
         return gathered, pad_mask, positions
 
     @staticmethod
     def scatter_active(output, chunk, pad_mask, positions):
-        B = output.shape[0]
-        for b in range(B):
-            idx = positions[b][pad_mask[b]]
-            n = idx.numel()
-            if n == 0:
-                continue
-            output[b, idx] = chunk[b, :n]
+        """
+        FIX (vs previous pass): vectorized scatter, no Python loop over B.
+        For padded slots (pad_mask == False), `positions` still points at a
+        real — just inactive — index in the sequence (since gather_active's
+        sort keeps *every* index, active ones first). Writing the chunk value
+        there unconditionally would corrupt an untouched position, so we
+        substitute the output's own current value at that index for padded
+        slots (a no-op write) via `torch.where` before the scatter.
+
+        FIX (this pass): uses the *out-of-place* `scatter` (returns a new
+        tensor) instead of `scatter_`. The in-place version mutated `output`
+        after `torch.gather(output, ...)` had already saved it for its own
+        backward, which autograd flags as "modified by an inplace operation"
+        (version mismatch) — `gather`'s saved reference and the later mutation
+        pointed at the same tensor object. Returning a fresh tensor avoids the
+        aliasing entirely; the caller must reassign (`output = scatter_active(...)`).
+        """
+        D = output.shape[-1]
+        idx = positions.unsqueeze(-1).expand(-1, -1, D)
+        current = torch.gather(output, 1, idx)
+        values = torch.where(pad_mask.unsqueeze(-1), chunk, current)
+        return output.scatter(1, idx, values)
 
 
 @dataclass
@@ -565,7 +649,7 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
                     attention_mask=pad_mask,
                     position_ids=position_ids,
                 )
-                self.router.scatter_active(output, chunk, pad_mask, positions)
+                output = self.router.scatter_active(output, chunk, pad_mask, positions)
 
             features.append(output)
 

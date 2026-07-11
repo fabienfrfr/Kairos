@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 import math
+import inspect
 
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
@@ -46,6 +47,21 @@ except ImportError:
     )
 
     causal_conv1d_update = torch_causal_conv1d_update
+
+
+def _supports_cu_seqlens(fn):
+    """
+    Detect whether a delta-rule kernel accepts `cu_seqlens` (variable-length
+    packing). The real `fla` triton kernels support it; the pure-PyTorch
+    reference fallbacks from `transformers.models.qwen3_next` generally don't.
+    Used to pick between a true varlen path and the beta/g masking fallback.
+    """
+    if fn is None:
+        return False
+    try:
+        return "cu_seqlens" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 # =========================
@@ -396,6 +412,10 @@ class KairosGatedDeltaNet(nn.Module):
             if fused_recurrent_gated_delta_rule is not None
             else torch_recurrent_gated_delta_rule
         )
+        # True only for the real fla triton kernel — used to pick between an
+        # actual variable-length (packed, no-padding-wasted) path and the
+        # beta/g masking fallback for the torch reference implementation.
+        self._chunk_supports_varlen = _supports_cu_seqlens(self.chunk_gated_delta_rule)
 
         self.merge_norm = KairosNorm(2 * self.value_dim)
         self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False)
@@ -404,11 +424,11 @@ class KairosGatedDeltaNet(nn.Module):
     def process(self, hidden_states, cache_params=None, attention_mask=None):
         """
         FIX (vs original): accepts `attention_mask` (B, L) bool, True=valid.
-        Padded positions are zeroed out of k/v/beta/g *before* the conv and the
-        delta-rule scan so they can't leak state into valid positions. This is
-        an approximation (a true fix would use variable-length/cu_seqlens
-        kernels) but is safe: a zeroed, non-decaying-in dummy step contributes
-        nothing to the running state.
+        When the real `fla` kernel is available (supports `cu_seqlens`), padded
+        positions are packed out entirely and the delta-rule scan runs only
+        over active steps — no wasted compute, no approximation. When only the
+        torch reference kernel is available (no `cu_seqlens`), we fall back to
+        zeroing beta/g at padded steps, which is correct but not optimal.
         """
         B, L, _ = hidden_states.shape
 
@@ -490,33 +510,72 @@ class KairosGatedDeltaNet(nn.Module):
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        if attention_mask is not None:
-            # neutralize padded steps: no forget (g=0 contribution handled by beta=0)
-            # and beta=0 means "don't write this step into the state".
-            # NOTE: beta/g are (B, L, n_heads) but attention_mask is (B, L) — the
-            # trailing head dim must be added explicitly, or PyTorch broadcasts
-            # against the wrong axis (n_heads vs L) and raises a shape error.
-            m = attention_mask.to(beta.dtype).unsqueeze(-1)  # (B, L, 1)
-            beta = beta * m
-            g = g * m
-
         prev_state = cache_params.ssm_caches[self.layer_idx] if has_previous_state else None
+        has_padding = attention_mask is not None and not bool(attention_mask.all())
 
-        if has_previous_state and L == 1:
-            o, ssm_cache = self.recurrent_gated_delta_rule(
-                q, k, v, g, beta,
-                initial_state=prev_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
-            o, ssm_cache = self.chunk_gated_delta_rule(
-                q, k, v, g, beta,
+        use_varlen = (
+            has_padding
+            and not (has_previous_state and L == 1)
+            and self._chunk_supports_varlen
+        )
+
+        if use_varlen:
+            # FIX (vs previous pass): real variable-length path instead of
+            # zeroing beta/g at padded steps. Packs every *active* position
+            # across the whole batch into one flat sequence (B=1) with
+            # `cu_seqlens` marking the boundary of each original row, so the
+            # kernel does exactly the work needed — no wasted compute on
+            # padded slots, no zeroed dummy steps in the scan.
+            flat_idx = attention_mask.nonzero(as_tuple=False)  # (N, 2) -> (batch_idx, seq_idx)
+            bi, li = flat_idx[:, 0], flat_idx[:, 1]
+            lengths = attention_mask.sum(dim=1)
+            cu_seqlens = F.pad(lengths.cumsum(0), (1, 0)).to(torch.int32)
+
+            q_p = q[bi, li].unsqueeze(0)
+            k_p = k[bi, li].unsqueeze(0)
+            v_p = v[bi, li].unsqueeze(0)
+            g_p = g[bi, li].unsqueeze(0)
+            beta_p = beta[bi, li].unsqueeze(0)
+
+            o_p, ssm_cache = self.chunk_gated_delta_rule(
+                q_p, k_p, v_p, g_p, beta_p,
                 scale=None,
                 initial_state=prev_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
             )
+
+            o = v.new_zeros(v.shape)
+            o[bi, li] = o_p.squeeze(0)
+        else:
+            if has_padding:
+                # Fallback for kernels without cu_seqlens support (e.g. the
+                # torch reference implementation): neutralize padded steps so
+                # they can't leak state into valid positions. Correct, but
+                # wastes compute on the padded slots and can't skip them.
+                # NOTE: beta/g are (B, L, n_heads) but attention_mask is
+                # (B, L) — the trailing head dim must be added explicitly, or
+                # PyTorch broadcasts against the wrong axis (n_heads vs L).
+                m = attention_mask.to(beta.dtype).unsqueeze(-1)  # (B, L, 1)
+                beta = beta * m
+                g = g * m
+
+            if has_previous_state and L == 1:
+                o, ssm_cache = self.recurrent_gated_delta_rule(
+                    q, k, v, g, beta,
+                    initial_state=prev_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            else:
+                o, ssm_cache = self.chunk_gated_delta_rule(
+                    q, k, v, g, beta,
+                    scale=None,
+                    initial_state=prev_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
 
         if cache_params is not None:
             cache_params.ssm_caches[self.layer_idx] = ssm_cache
