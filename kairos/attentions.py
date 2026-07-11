@@ -183,10 +183,39 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
 # Flex mask builder (bidir)
 # =========================
 def build_flex_mask(max_len, window):
+    """Static mask, shared across the batch — no padding info. Built once per
+    module in __init__ and reused (via ._adjust) for the common, unpadded case."""
+
     def bidir_window(b, h, q_idx, kv_idx):
         return (kv_idx >= q_idx - window) & (kv_idx <= q_idx + window)
 
     return create_block_mask(bidir_window, B=None, H=None, Q_LEN=max_len, KV_LEN=max_len)
+
+
+def build_flex_mask_padded(window, attention_mask):
+    """
+    Per-call mask incorporating padding, so flex attention stays usable even
+    when a batch has padded/inactive positions (e.g. gathered scale segments
+    of unequal length). `attention_mask` is (B, Lk) bool, True = valid.
+
+    NOTE (same assumption as eager_attention's key_padding_mask): this masks
+    keys within the *current* chunk range only. If padded positions were ever
+    written into the KV cache from an earlier call, they are not retroactively
+    masked here — the router is expected to only push real (non-padding)
+    content into long-lived cache state. This is a pre-existing simplification,
+    not something introduced by re-enabling flex here.
+
+    Rebuilding a BlockMask per call has a real cost (it's not free like a plain
+    tensor op), so this path is only taken when padding is actually present;
+    the fully-valid case keeps using the cheap precomputed `self.block_mask`.
+    """
+    B, Lk = attention_mask.shape
+
+    def bidir_window_padded(b, h, q_idx, kv_idx):
+        valid = (kv_idx >= q_idx - window) & (kv_idx <= q_idx + window)
+        return valid & attention_mask[b, kv_idx]
+
+    return create_block_mask(bidir_window_padded, B=B, H=None, Q_LEN=Lk, KV_LEN=Lk)
 
 
 # =========================
@@ -227,10 +256,12 @@ class KairosAttention(nn.Module):
           the token's true position even when only a sparse, routed segment of
           the sequence is passed in. Falls back to the old `offset + arange(L)`
           behaviour if not given.
-        - `attention_mask` (B, Lk_total_after_cache) bool, True = valid, threads
-          through to eager attention for padding support. The flex path does not
-          support padding masks yet, so we fall back to eager when a mask with
-          any False entries is supplied (documented limitation).
+        - `attention_mask` (B, Lk) bool, True = valid. Threads through to both
+          backends: eager applies it as a masked_fill on the windowed scores,
+          flex folds it into a dynamically-rebuilt BlockMask (see
+          `build_flex_mask_padded`). Flex only pays the mask-rebuild cost when
+          padding is actually present; the common unpadded case still reuses
+          the mask precomputed once in __init__.
         """
         B, L, _ = x.shape
 
@@ -262,14 +293,26 @@ class KairosAttention(nn.Module):
             k, v = cache_params.update(k, v, self.layer_idx)
             cache_params.trim(self.layer_idx)
 
-        use_flex = ATTN_IMPL == "flex" and (attention_mask is None or bool(attention_mask.all()))
+        has_padding = attention_mask is not None and not bool(attention_mask.all())
 
-        if use_flex:
+        if ATTN_IMPL == "flex":
+            if has_padding:
+                # Padding present: build a per-call block mask that folds the
+                # key-padding info into the sliding-window predicate. Costs a
+                # rebuild, but keeps us on the fused flex kernel instead of
+                # dropping all the way to eager just because some positions
+                # in this batch are inactive.
+                block_mask = build_flex_mask_padded(self.window, attention_mask)
+            else:
+                # Common case: no padding, reuse the mask precomputed once in
+                # __init__ (just resized to the current q/k lengths).
+                block_mask = self.block_mask._adjust(q.size(1), k.size(1))
+
             out = flex_attention(
                 q.transpose(1, 2),
                 k.transpose(1, 2),
                 v.transpose(1, 2),
-                block_mask=self.block_mask._adjust(q.size(1), k.size(1)),
+                block_mask=block_mask,
                 scale=self.head_dim**-0.5,
             ).transpose(1, 2)
         else:
