@@ -9,7 +9,6 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 # =========================
 # Backend
 # =========================
-# Attention (Flex or eager)
 if torch.cuda.is_available():
     try:
         from torch.nn.attention.flex_attention import flex_attention, create_block_mask
@@ -62,9 +61,24 @@ class KairosNorm(LlamaRMSNorm):
 # Rotary
 # =========================
 class KairosRotaryEmbedding(nn.Module):
+    """
+    FIX (vs original):
+    - The cache used to be built exactly once from `config.max_position_embeddings`
+      and never grew again, while the caller's position offset keeps increasing
+      forever (even though the *cached KV* is trimmed by the sliding window).
+      That caused an out-of-bounds index the moment a generation ran longer than
+      `max_position_embeddings`. We now grow the cache on demand (amortized
+      doubling), and the caller passes the exact max position needed as a plain
+      Python int so no GPU->CPU sync is introduced on the hot path.
+    - cos/sin used to be hardcoded to bfloat16 regardless of the model's actual
+      dtype. We now cache in the dtype of `x` and rebuild if it changes (e.g.
+      switching from fp32 training to bf16 inference).
+    """
+
     def __init__(self, config, head_dim):
         super().__init__()
         self.config = config
+        self.head_dim = head_dim
 
         inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -72,15 +86,31 @@ class KairosRotaryEmbedding(nn.Module):
         self.seq_len_cached = 0
         self.cos_cached = None
         self.sin_cached = None
+        self.cached_dtype = None
 
-    def forward(self, x, position_ids):
-        max_pos = self.config.max_position_embeddings
-        if max_pos > self.seq_len_cached:
-            self.seq_len_cached = max(2 * max_pos, 16)
-            t = torch.arange(self.seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().to(torch.bfloat16)
-            self.sin_cached = freqs.sin().to(torch.bfloat16)
+    def _build_cache(self, seq_len, device, dtype):
+        self.seq_len_cached = seq_len
+        self.cached_dtype = dtype
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=torch.float32))
+        self.cos_cached = freqs.cos().to(dtype)
+        self.sin_cached = freqs.sin().to(dtype)
+
+    def forward(self, x, position_ids, max_position=None):
+        """
+        position_ids: LongTensor, any shape, values in [0, max_position].
+        max_position: optional python int giving the exact max value contained in
+            `position_ids`. Pass this whenever the caller already knows it (it
+            almost always does, since positions are built as `arange(offset, offset+L)`)
+            to avoid a `.item()` sync on the hot path.
+        """
+        if max_position is None:
+            max_position = int(position_ids.max().item()) if position_ids.numel() > 0 else 0
+
+        needed = max_position + 1
+        if needed > self.seq_len_cached or self.cos_cached is None or self.cached_dtype != x.dtype:
+            new_len = max(needed, self.config.max_position_embeddings, 16, self.seq_len_cached * 2)
+            self._build_cache(new_len, x.device, x.dtype)
 
         cos = self.cos_cached[position_ids][..., None, :]
         sin = self.sin_cached[position_ids][..., None, :]
@@ -96,49 +126,56 @@ def apply_rotary_emb(x, cos, sin):
 # =========================
 # Eager attention (CPU / fallback)
 # =========================
-def eager_attention(q, k, v, window):
+def eager_attention(q, k, v, window, key_padding_mask=None):
     """
     Sliding window attention compatible KV cache.
     q: (B, Lq, H, D)
     k,v: (B, Lk, H_kv, D)
+    key_padding_mask: optional (B, Lk) bool, True = valid / False = padding.
+
+    FIX (vs original): raises a clear error on non-divisible GQA ratios instead
+    of silently truncating via integer division, and supports masking out
+    padded keys (needed once batched/segmented routing shares a single call).
     """
 
     B, Lq, H, D = q.shape
     Lk = k.shape[1]
     W = 2 * window + 1
 
-    # --- Handle GQA ---
-    k = k.repeat_interleave(H // k.size(2), dim=2)
-    v = v.repeat_interleave(H // v.size(2), dim=2)
+    n_kv = k.size(2)
+    assert H % n_kv == 0, f"n_heads ({H}) must be divisible by n_kv_heads ({n_kv}) for GQA repeat"
+    k = k.repeat_interleave(H // n_kv, dim=2)
+    v = v.repeat_interleave(H // n_kv, dim=2)
 
-    # --- align K/V to sliding windows ---
-    # select relevant KV range per query
     kv_start = max(0, Lk - (Lq + window))
     kv_end = Lk
     k = k[:, kv_start:kv_end]
     v = v[:, kv_start:kv_end]
+    mask = key_padding_mask[:, kv_start:kv_end] if key_padding_mask is not None else None
 
-    # pad if needed
     pad = window
     k_pad = F.pad(k, (0, 0, 0, 0, pad, pad))
     v_pad = F.pad(v, (0, 0, 0, 0, pad, pad))
+    mask_pad = F.pad(mask, (pad, pad), value=False) if mask is not None else None
 
-    # sliding windows
     k_windows = k_pad.unfold(1, W, 1).permute(0, 1, 2, 4, 3)
     v_windows = v_pad.unfold(1, W, 1).permute(0, 1, 2, 4, 3)
-
-    # match Lq
     k_windows = k_windows[:, -Lq:]
     v_windows = v_windows[:, -Lq:]
 
-    # --- compute ---
     q = q.unsqueeze(3)
-
     scores = (q * k_windows).sum(-1) * (D**-0.5)
+
+    if mask_pad is not None:
+        mask_windows = mask_pad.unfold(1, W, 1)  # (B, Lk_pad_windows, W)
+        mask_windows = mask_windows[:, -Lq:]  # (B, Lq, W)
+        mask_windows = mask_windows.unsqueeze(2).expand(-1, -1, H, -1)  # (B, Lq, H, W)
+        scores = scores.masked_fill(~mask_windows, float("-inf"))
+
     attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    attn = torch.nan_to_num(attn)  # rows fully masked (all-pad window) -> avoid NaN propagation
 
     out = (attn.unsqueeze(-1) * v_windows).sum(3)
-
     return out.contiguous()
 
 
@@ -180,41 +217,54 @@ class KairosAttention(nn.Module):
         if ATTN_IMPL == "flex":
             self.block_mask = build_flex_mask(config.max_position_embeddings, self.window)
 
-        # RoRE
         self.rope = KairosRotaryEmbedding(config, self.head_dim)
 
-    def forward(self, x, position_embeddings=None, cache_params=None):
+    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+        """
+        FIX (vs original):
+        - `position_ids` can now be supplied explicitly (absolute position within
+          the *scale* timeline, not just the local chunk index) so RoPE reflects
+          the token's true position even when only a sparse, routed segment of
+          the sequence is passed in. Falls back to the old `offset + arange(L)`
+          behaviour if not given.
+        - `attention_mask` (B, Lk_total_after_cache) bool, True = valid, threads
+          through to eager attention for padding support. The flex path does not
+          support padding masks yet, so we fall back to eager when a mask with
+          any False entries is supplied (documented limitation).
+        """
         B, L, _ = x.shape
 
-        # ---- POSITION IDS
         if cache_params is not None and self.layer_idx is not None:
             offset = cache_params.get_total_seen(self.layer_idx)
         else:
             offset = 0
 
-        pos = torch.arange(offset, offset + L, device=x.device).unsqueeze(0)
+        if position_ids is None:
+            pos = torch.arange(offset, offset + L, device=x.device).unsqueeze(0).expand(B, -1)
+            max_position = offset + L - 1
+        else:
+            pos = position_ids
+            max_position = None  # unknown ahead of time; rope will sync once
 
-        # ---- projection
         q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(B, L, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, L, self.n_kv_heads, self.head_dim)
 
-        # ---- ROTARY (external vs internal)
         if isinstance(position_embeddings, tuple):
             cos, sin = position_embeddings
         else:
-            cos, sin = self.rope(x, pos)
+            cos, sin = self.rope(x, pos, max_position=max_position)
 
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # KV CACHE
         if cache_params is not None:
             k, v = cache_params.update(k, v, self.layer_idx)
             cache_params.trim(self.layer_idx)
 
-        # attention
-        if ATTN_IMPL == "flex":
+        use_flex = ATTN_IMPL == "flex" and (attention_mask is None or bool(attention_mask.all()))
+
+        if use_flex:
             out = flex_attention(
                 q.transpose(1, 2),
                 k.transpose(1, 2),
@@ -222,13 +272,10 @@ class KairosAttention(nn.Module):
                 block_mask=self.block_mask._adjust(q.size(1), k.size(1)),
                 scale=self.head_dim**-0.5,
             ).transpose(1, 2)
-
         else:
-            out = eager_attention(q, k, v, self.window)
+            out = eager_attention(q, k, v, self.window, key_padding_mask=attention_mask)
 
-        B, L = x.shape[:2]
         out = out.reshape(B, L, self.n_heads * self.head_dim)
-
         return self.out(out)
 
 
@@ -244,46 +291,41 @@ class KairosGatedDeltaNet(nn.Module):
         if layer_idx is None:
             print("Warning: layer_idx should be set for caching")
 
-        # config param
         self.hidden_size = config.hidden_size
         self.n_kv_heads = config.num_key_value_heads
         self.n_heads = config.num_attention_heads
         self.conv_size = config.linear_conv_kernel_dim
 
-        # calculated param
         self.head_dim = self.hidden_size // self.n_heads
         self.value_dim = 2 * self.head_dim * self.n_heads
         self.n_heads_local = self.n_heads
         self.conv_dim = 4 * self.n_heads * self.head_dim
 
-        # shared param
+        assert self.n_heads % self.n_kv_heads == 0, (
+            f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads}) for GQA repeat"
+        )
+
         self.q_proj = nn.Linear(self.hidden_size, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
 
-        # gating
         self.b_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.a_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.g_proj = nn.Linear(self.hidden_size, 2 * self.head_dim * self.n_heads, bias=False)
 
-        # conv expend
         self.v_expand = nn.Linear(self.n_heads * self.head_dim, self.n_heads * 2 * self.head_dim, bias=False)
 
-        # ---- dt init ----
         dt = torch.exp(
             torch.rand(self.n_heads_local) * (math.log(config.time_step_max) - math.log(config.time_step_min))
             + math.log(config.time_step_min)
         )
         dt = torch.clamp(dt, min=config.time_step_floor)
-
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         self.dt_bias = nn.Parameter(inv_dt)
 
-        # ---- A init ----
         A = torch.empty(self.n_heads_local).uniform_(*config.A_init_range)
         self.A_log = nn.Parameter(torch.log(A))
 
-        # ---- conv ----
         self.qkv_conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -293,9 +335,12 @@ class KairosGatedDeltaNet(nn.Module):
             padding=self.conv_size - 1,
         )
 
-        # ---- kernels ----
+        # FIX (vs original): `causal_conv1d_fn` (the fused prefill kernel) was
+        # imported but never called; only the incremental `causal_conv1d_update`
+        # was used, and the chunked/prefill path always fell back to a plain
+        # `nn.Conv1d` + silu. We now use the fused kernel for the chunked path
+        # whenever it's available, matching upstream Qwen3-Next behaviour.
         self.causal_conv1d_fn = causal_conv1d_fn
-
         self.causal_conv1d_update = (
             causal_conv1d_update if causal_conv1d_update is not None else torch_causal_conv1d_update
         )
@@ -303,64 +348,58 @@ class KairosGatedDeltaNet(nn.Module):
         self.chunk_gated_delta_rule = (
             chunk_gated_delta_rule if chunk_gated_delta_rule is not None else torch_chunk_gated_delta_rule
         )
-
         self.recurrent_gated_delta_rule = (
             fused_recurrent_gated_delta_rule
             if fused_recurrent_gated_delta_rule is not None
             else torch_recurrent_gated_delta_rule
         )
 
-        # ---- bidirectionnal output merging ----
         self.merge_norm = KairosNorm(2 * self.value_dim)
-        self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False)  # intermediate state
-        self.out_proj = nn.Linear(self.hidden_size, config.hidden_size, bias=False)  # shareable with swa
+        self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = nn.Linear(self.hidden_size, config.hidden_size, bias=False)
 
-    def process(self, hidden_states, cache_params=None):
+    def process(self, hidden_states, cache_params=None, attention_mask=None):
+        """
+        FIX (vs original): accepts `attention_mask` (B, L) bool, True=valid.
+        Padded positions are zeroed out of k/v/beta/g *before* the conv and the
+        delta-rule scan so they can't leak state into valid positions. This is
+        an approximation (a true fix would use variable-length/cu_seqlens
+        kernels) but is safe: a zeroed, non-decaying-in dummy step contributes
+        nothing to the running state.
+        """
         B, L, _ = hidden_states.shape
 
-        # Previous states exist only if a cache was already populated.
         has_previous_state = cache_params is not None and cache_params.conv_caches[self.layer_idx] is not None
 
-        # ---- projections ----
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        b = self.b_proj(hidden_states).view(B, L, self.n_heads)  # beta
-        a = self.a_proj(hidden_states).view(B, L, self.n_heads)  # pre-g
+        b = self.b_proj(hidden_states).view(B, L, self.n_heads)
+        a = self.a_proj(hidden_states).view(B, L, self.n_heads)
         g_out = self.g_proj(hidden_states).view(B, L, self.n_heads, 2 * self.head_dim)
 
-        # ---- reshape ----
         q = rearrange(q, "b l (h d) -> b l h d", h=self.n_heads)
         k = rearrange(k, "b l (h d) -> b l h d", h=self.n_kv_heads)
         v = rearrange(v, "b l (h d) -> b l h d", h=self.n_kv_heads)
 
-        # ---- GQA expand ----
         k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
         v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
 
-        # ---- flatten ----
         qf = rearrange(q, "b l h d -> b l (h d)")
         kf = rearrange(k, "b l h d -> b l (h d)")
         vf = rearrange(v, "b l h d -> b l (h d)")
-
-        # ---- V expansion (DeltaNet)
         vf = self.v_expand(vf)
 
-        # ---- MIX ----
-        mixed_qkv = torch.cat([qf, kf, vf], dim=-1).transpose(1, 2)
+        mixed_qkv = torch.cat([qf, kf, vf], dim=-1)
 
-        # ============================================================
-        # Convolution state
-        #
-        # Qwen3Next uses:
-        # - recurrent update only for single-token decoding
-        # - normal convolution for chunked sequences
-        # ============================================================
+        if attention_mask is not None:
+            mixed_qkv = mixed_qkv * attention_mask[..., None].to(mixed_qkv.dtype)
+
+        mixed_qkv = mixed_qkv.transpose(1, 2)
 
         if has_previous_state and L == 1:
             conv_state = cache_params.conv_caches[self.layer_idx]
-
             mixed_qkv = self.causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -368,85 +407,68 @@ class KairosGatedDeltaNet(nn.Module):
                 self.qkv_conv1d.bias,
                 "silu",
             )
-
         else:
             conv_state = None
-
             if has_previous_state:
                 conv_state = cache_params.conv_caches[self.layer_idx]
-
             elif cache_params is not None:
-                conv_state = mixed_qkv.new_zeros(
-                    B,
-                    self.conv_dim,
-                    self.conv_size - 1,
-                )
+                conv_state = mixed_qkv.new_zeros(B, self.conv_dim, self.conv_size - 1)
 
-            # prepend cached context
             if conv_state is not None:
-                mixed_qkv = torch.cat(
-                    [conv_state, mixed_qkv],
-                    dim=-1,
-                )
+                mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
 
-            # update cache with last kernel-1 tokens
             if cache_params is not None:
                 cache_params.conv_caches[self.layer_idx] = mixed_qkv[:, :, -(self.conv_size - 1) :].clone()
 
-            mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv))
+            if self.causal_conv1d_fn is not None:
+                mixed_qkv = self.causal_conv1d_fn(
+                    mixed_qkv,
+                    self.qkv_conv1d.weight.squeeze(1),
+                    self.qkv_conv1d.bias,
+                    activation="silu",
+                )
+            else:
+                mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv))
 
-            # keep only current sequence
             mixed_qkv = mixed_qkv[:, :, -L:]
 
-        # ---- split ----
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         d = self.head_dim
-
         q_dim = self.n_heads * d
         k_dim = self.n_heads * d
         v_dim = 2 * self.n_heads * d
+        q, k, v = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
 
-        q, k, v = torch.split(
-            mixed_qkv,
-            [q_dim, k_dim, v_dim],
-            dim=-1,
-        )
-
-        # ---- reshape ----
         q = rearrange(q, "b l (h d) -> b l h d", h=self.n_heads)
         k = rearrange(k, "b l (h d) -> b l h d", h=self.n_heads)
         v = rearrange(v, "b l (h d) -> b l h d", h=self.n_heads)
 
-        # ---- gating ----
         beta = b.sigmoid()
-
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        # ============================================================
-        # DeltaNet state
-        # ============================================================
+        if attention_mask is not None:
+            # neutralize padded steps: no forget (g=0 contribution handled by beta=0)
+            # and beta=0 means "don't write this step into the state".
+            # NOTE: beta/g are (B, L, n_heads) but attention_mask is (B, L) — the
+            # trailing head dim must be added explicitly, or PyTorch broadcasts
+            # against the wrong axis (n_heads vs L) and raises a shape error.
+            m = attention_mask.to(beta.dtype).unsqueeze(-1)  # (B, L, 1)
+            beta = beta * m
+            g = g * m
 
         prev_state = cache_params.ssm_caches[self.layer_idx] if has_previous_state else None
 
         if has_previous_state and L == 1:
             o, ssm_cache = self.recurrent_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta,
+                q, k, v, g, beta,
                 initial_state=prev_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
         else:
             o, ssm_cache = self.chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta,
+                q, k, v, g, beta,
                 scale=None,
                 initial_state=prev_state,
                 output_final_state=True,
@@ -456,31 +478,23 @@ class KairosGatedDeltaNet(nn.Module):
         if cache_params is not None:
             cache_params.ssm_caches[self.layer_idx] = ssm_cache
 
-        # ---- output gating ----
         o = o * F.silu(g_out)
-
         return o
 
-    def forward(self, hidden_states, cache_params=None):
-        # ---- forward (with cache for past memory)----
-        out_f = self.process(hidden_states, cache_params)
+    def forward(self, hidden_states, cache_params=None, attention_mask=None):
+        out_f = self.process(hidden_states, cache_params, attention_mask=attention_mask)
 
-        # ---- backward pass (intentionally stateless)
-        # no cache: future information is unavailable in generation
         x_rev = torch.flip(hidden_states, dims=[1])
-        out_b = self.process(x_rev, cache_params=None)
+        mask_rev = torch.flip(attention_mask, dims=[1]) if attention_mask is not None else None
+        out_b = self.process(x_rev, cache_params=None, attention_mask=mask_rev)
         out_b = torch.flip(out_b, dims=[1])
 
-        # ---- merge and projection ----
         B, L = out_f.shape[:2]
-        # concat bidir
-        out = torch.cat([out_f, out_b], dim=-1)  # (B, L, H, 2*dv)
-        # flatten heads and reshape
-        out = out.reshape(B, L, -1)  # (B, L, 2 * value_dim)
+        out = torch.cat([out_f, out_b], dim=-1)
+        out = out.reshape(B, L, -1)
         out = self.merge_norm(out)
-        # linear
-        out = self.out_left_right(out)  # concat to swa value dim
-        out = self.out_proj(out)  # (B, L, hidden_size) -> shareable
+        out = self.out_left_right(out)
+        out = self.out_proj(out)
         return out
 
 
@@ -489,49 +503,38 @@ class KairosGatedDeltaNet(nn.Module):
 # =========================
 class KairosLiZAttention2(nn.Module):
     """
-    TPTT-inspired (arxiv.org/abs/2506.17671) shared QKV/O projections couple SWA and DeltaNet,
-    enforcing aligned representations while enabling bidirectional (non-causal) modeling.
-    Note: Alpha and beta in DeltaNet are not shared as they control directional mixing
-    independently from the shared representation space defined by QKVO.
-    Adding : LiZAttention2:
-    - Outputs are concatenated (not summed)
-    - Then projected back to hidden_size (mixer)
+    TPTT-inspired (arxiv.org/abs/2506.17671) shared QKV/O projections couple SWA and DeltaNet.
     """
 
     def __init__(self, config, layer_idx):
         super().__init__()
-
         self.hidden_size = config.hidden_size
 
-        # SWA
         self.swa = KairosAttention(config, layer_idx)
-
-        # DeltaNet
         self.delta = KairosGatedDeltaNet(config, layer_idx)
 
-        # Shared projection (force alignment & fast convergence)
+        # Drop the DeltaNet's own q/k/v/out projections (never used) and alias
+        # the SWA ones instead, so we don't allocate dead parameters.
+        del self.delta.q_proj, self.delta.k_proj, self.delta.v_proj, self.delta.out_proj
         self.delta.q_proj = self.swa.q_proj
         self.delta.k_proj = self.swa.k_proj
         self.delta.v_proj = self.swa.v_proj
         self.delta.out_proj = self.swa.out
 
-        # Final mixer
         self.norm = KairosNorm(2 * self.hidden_size)
         self.out_proj = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
 
-    def forward(self, x, position_embeddings=None, cache_params=None):
+    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+        swa_out = self.swa(
+            x,
+            position_embeddings=position_embeddings,
+            cache_params=cache_params,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        delta_out = self.delta(x, cache_params=cache_params, attention_mask=attention_mask)
 
-        # ---- SWA ----
-        swa_out = self.swa(x, position_embeddings, cache_params)  # (B, L, D)
-
-        # ---- Delta (with cache) ----
-        delta_out = self.delta(x, cache_params=cache_params)  # (B, L, D)
-
-        # ---- concat & norm ----
         out = torch.cat([swa_out, delta_out], dim=-1)
         out = self.norm(out)
-
-        # ---- final projection ----
         out = self.out_proj(out)
-
         return out
