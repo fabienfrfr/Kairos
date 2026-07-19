@@ -1,37 +1,8 @@
 """
-kairos/tokenizer.py
-
-Byte-level multimodal tokenizer for Kairos, built on top of ByT5Tokenizer.
-
-DESIGN (resolves the redundancy flagged during review of the previous version):
-- The token stream stays byte-level (vocab 0-255) for every modality. Each
-  modality's raw bytes are wrapped in structural delimiter tokens
-  (<IMG> ... </IMG>, <AUDIO> ... </AUDIO>, etc.) so a sequence can be
-  losslessly parsed back into its modality segments (see `decode_multimodal`).
-- `modality_ids` (same length as `input_ids`) is produced alongside the token
-  stream and is what actually drives `KairosEmbedding.modality_embed` /
-  `KairosScaleRouter`. The delimiter tokens are *structural* (they mark where
-  a segment starts/stops for parsing) — they are NOT a duplicate encoding of
-  the modality; the backbone never has to infer modality from a text token,
-  it is only ever given the modality_ids stream directly.
-
-KNOWN BREAKING CHANGE vs the previous stub:
-- `ByT5Tokenizer` defaults to `extra_ids=125` (T5 sentinel tokens), which
-  makes `len(tokenizer) == 384`, not 259 as assumed by `KairosConfig` and the
-  test suite. This class now forces `extra_ids=0` and registers the modality/
-  channel delimiters as additional special tokens, giving a total vocab of
-  259 (base) + 28 (8 modality pairs + 5 channel pairs + <SEP>/<MASK>,
-  see ALL_SPECIAL_TOKENS) = 287.
-  ==> `KairosConfig(vocab_size=...)` and anywhere `vocab_size=259` is
-  hardcoded (tests, notebook, `KairosDiffusionLLM(vocab_size=259)`) must be
-  updated to `len(KairosTokenizer())` instead of the literal 259.
-- `ByT5Tokenizer` has no native `<BOS>` token (`bos_token_id` is `None`).
-  The old reserved-token table in this file listed one at id 257 — that was
-  never true for a stock ByT5Tokenizer and has been removed below.
-
-Byte <-> id mapping is calibrated empirically at __init__ time (via
-`convert_tokens_to_ids(chr(0))`) rather than relying on private internals of
-ByT5Tokenizer, so it stays correct across transformers versions.
+kairos/tokenizer.py — byte-level multimodal tokenizer built on ByT5Tokenizer.
+i
+Structure is expressed with periodic LOCAL markers (PixelBytes approach,
+Furfaro 2024, arxiv.org/html/2410.01820v2) 
 """
 
 from __future__ import annotations
@@ -44,11 +15,8 @@ import torch
 from transformers.models.byt5.tokenization_byt5 import ByT5Tokenizer
 
 
-# ==========================================================
-# Modality enum — MUST match KairosConfig.text_modality_id /
-# KairosConfig.modality_scales ordering (0 = text).
-# ==========================================================
 class Modality(enum.IntEnum):
+    """Must match KairosConfig.text_modality_id / modality_scales ordering."""
     TEXT = 0
     IMAGE = 1
     VIDEO = 2
@@ -70,157 +38,222 @@ _MODALITY_TAGS: dict[Modality, tuple[str, str]] = {
     Modality.META: ("<META>", "</META>"),
 }
 
-# Optional sub-channel tags (e.g. splitting an image into R/G/B planes, or
-# audio into LEFT/RIGHT). Only used if the caller passes `channel=...`.
+# sub-channel tags, e.g. RGB planes or stereo audio
 _CHANNEL_TAGS: dict[str, tuple[str, str]] = {
-    "R": ("<R>", "</R>"),
-    "G": ("<G>", "</G>"),
-    "B": ("<B>", "</B>"),
-    "LEFT": ("<LEFT>", "</LEFT>"),
-    "RIGHT": ("<RIGHT>", "</RIGHT>"),
+    "R": ("<R>", "</R>"), "G": ("<G>", "</G>"), "B": ("<B>", "</B>"),
+    "LEFT": ("<LEFT>", "</LEFT>"), "RIGHT": ("<RIGHT>", "</RIGHT>"),
 }
+
+_STRUCTURAL_TOKENS = ["<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"]
 
 ALL_SPECIAL_TOKENS = (
     [t for pair in _MODALITY_TAGS.values() for t in pair]
     + [t for pair in _CHANNEL_TAGS.values() for t in pair]
+    + _STRUCTURAL_TOKENS
     + ["<SEP>", "<MASK>"]
 )
 
 
 @dataclass
 class MultimodalSegment:
-    """One typed chunk of a multimodal sequence.
-
-    `data` is:
-      - raw UTF-8 bytes of a string, for Modality.TEXT
-      - the output of one of the `KairosTokenizer.encode_*` quantizers below,
-        for every other modality.
-    """
-
+    """One typed chunk of a sequence. `data` is UTF-8 bytes for TEXT, or the
+    marker-list returned by `encode_image`/`encode_video`/`encode_audio`/
+    `encode_lidar` for everything else."""
     modality: Modality
-    data: bytes
-    channel: str | None = None  # e.g. "R" / "G" / "B" / "LEFT" / "RIGHT"
+    data: object
+    channel: str | None = None
 
 
 class KairosTokenizer(ByT5Tokenizer):
-    """
-    Byte-level tokenizer, multimodal-aware.
+    """Byte-level tokenizer, multimodal-aware. Text encode/decode is fully
+    backward compatible with ByT5Tokenizer. `encode_multimodal` is the single
+    entry point for mixed sequences, returning aligned input_ids/modality_ids."""
 
-    - Text: standard ByT5 UTF-8 byte encoding (fully backward compatible —
-      `tokenizer.encode(text)` / `tokenizer.decode(ids)` behave exactly as
-      before for pure-text use).
-    - Non-text modalities: raw bytes of a *pre-quantized* representation
-      (see `encode_image` / `encode_audio` / `encode_video` / `encode_lidar`
-      for the default 8-bit quantizers — swap these for a learned codec
-      later without touching the assembly logic).
-    - `encode_multimodal` is the single entry point that returns aligned
-      `input_ids` + `modality_ids`, ready for `KairosEmbedding`.
-    """
+    # pipeline-level constants — not stored per-instance in the stream
+    IMAGE_CHANNELS = 3
+    VIDEO_CHANNELS = 3
+    AUDIO_SAMPLE_RATE = 16_000
+    AUDIO_TICK_SAMPLES = 16_000       # one <TICK> per second of audio
+    LIDAR_POINTS_PER_GROUP = 32       # one <PTSEP> every N points
+    LIDAR_XYZ_RANGE = (-100.0, 100.0)
+    LIDAR_INTENSITY_RANGE = (0.0, 1.0)
 
     def __init__(self, *args, **kwargs):
-        # Force extra_ids=0: Kairos has no use for T5 sentinel tokens and
-        # they would silently inflate len(tokenizer) from 259 to 384+.
         kwargs.setdefault("extra_ids", 0)
         super().__init__(*args, **kwargs)
-
         self.add_special_tokens({"additional_special_tokens": ALL_SPECIAL_TOKENS})
 
-        # Calibrate the byte -> id offset empirically (id = byte + offset).
-        # ByT5 maps byte b to token chr(b); this holds for the full 0-255
-        # range regardless of how many special/added tokens exist, since
-        # added tokens are appended after the byte range, not interleaved.
+        # byte -> id offset, calibrated empirically (id = byte + offset)
         self._byte_offset = self.convert_tokens_to_ids(chr(0))
         assert self.convert_tokens_to_ids(chr(255)) == self._byte_offset + 255, (
-            "byte->id mapping is not contiguous — ByT5Tokenizer internals changed, "
-            "review KairosTokenizer._byte_offset calibration"
+            "byte->id mapping is not contiguous — review _byte_offset calibration"
         )
+        self._endline_id = self.convert_tokens_to_ids("<ENDLINE>")
+        self._endframe_id = self.convert_tokens_to_ids("<ENDFRAME>")
+        self._tick_id = self.convert_tokens_to_ids("<TICK>")
+        self._ptsep_id = self.convert_tokens_to_ids("<PTSEP>")
 
-    # ---------------------------------------------------------------
-    # low-level: raw bytes <-> token ids
-    # ---------------------------------------------------------------
     def _bytes_to_ids(self, raw: bytes) -> list[int]:
         return [b + self._byte_offset for b in raw]
 
     def _ids_to_bytes(self, ids: list[int]) -> bytes:
         return bytes([max(0, i - self._byte_offset) & 0xFF for i in ids])
 
-    # ---------------------------------------------------------------
-    # modality-specific quantizers -> raw bytes
-    # (deliberately simple/lossy 8-bit quantizers; swap for a learned
-    # codec later — the assembly logic below doesn't care how the bytes
-    # were produced)
-    # ---------------------------------------------------------------
-    @staticmethod
-    def encode_image(image: np.ndarray) -> bytes:
-        """image: (H, W, 3) uint8 array -> raw interleaved RGB bytes."""
-        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
-            raise ValueError("encode_image expects a (H, W, 3) uint8 array")
-        return image.tobytes()
+    # ---------------- IMAGE: row-delimited, no header ----------------
+    @classmethod
+    def encode_image(cls, image: np.ndarray) -> list:
+        """(H, W, C) uint8 -> marker-list, one <ENDLINE> per row."""
+        if image.dtype != np.uint8 or image.ndim != 3:
+            raise ValueError("encode_image expects a (H, W, C) uint8 array")
+        return cls._encode_frame_rows(image)
 
     @staticmethod
-    def decode_image(raw: bytes, height: int, width: int) -> np.ndarray:
-        return np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+    def _encode_frame_rows(frame: np.ndarray) -> list:
+        out = []
+        for row in frame:
+            out.append(("bytes", row.tobytes()))
+            out.append(("marker", "<ENDLINE>"))
+        return out
 
-    @staticmethod
-    def encode_audio(waveform: np.ndarray) -> bytes:
-        """waveform: float32 in [-1, 1], mono or (T, C) -> 8-bit PCM bytes."""
+    def _resolve_markers(self, marker_seq: list) -> list[int]:
+        ids: list[int] = []
+        for kind, payload in marker_seq:
+            if kind == "bytes":
+                ids.extend(self._bytes_to_ids(payload))
+            else:
+                ids.append(self.convert_tokens_to_ids(payload))
+        return ids
+
+    def decode_image(self, ids: list[int], channels: int | None = None) -> np.ndarray:
+        """Dimensions recovered by counting <ENDLINE> markers, not a header.
+        Raises on inconsistent row lengths (malformed/truncated generation)."""
+        channels = channels or self.IMAGE_CHANNELS
+        rows, current = [], []
+        for i in ids:
+            if i == self._endline_id:
+                rows.append(current)
+                current = []
+            else:
+                current.append(i)
+        if current:
+            rows.append(current)
+        if not rows:
+            raise ValueError("no <ENDLINE> markers found — not a valid image stream")
+        widths = {len(r) for r in rows}
+        if len(widths) != 1:
+            raise ValueError(f"inconsistent row lengths {sorted(widths)} — malformed/truncated generation")
+        w_bytes = widths.pop()
+        if w_bytes % channels != 0:
+            raise ValueError(f"row byte length {w_bytes} not divisible by channels={channels}")
+        w, h = w_bytes // channels, len(rows)
+        raw = self._ids_to_bytes([i for row in rows for i in row])
+        return np.frombuffer(raw, dtype=np.uint8).reshape(h, w, channels)
+
+    # ---------------- VIDEO: rows + <ENDFRAME> ----------------
+    @classmethod
+    def encode_video(cls, frames: np.ndarray, stride: int = 1) -> list:
+        if frames.dtype != np.uint8 or frames.ndim != 4:
+            raise ValueError("encode_video expects a (T, H, W, C) uint8 array")
+        out = []
+        for frame in frames[::stride]:
+            out.extend(cls._encode_frame_rows(frame))
+            out.append(("marker", "<ENDFRAME>"))
+        return out
+
+    def decode_video(self, ids: list[int], channels: int | None = None, fps: float = 1.0):
+        """Returns (frames, duration_seconds). fps is a pipeline fact
+        supplied at decode time, not stored in the stream."""
+        channels = channels or self.VIDEO_CHANNELS
+        frame_lists, current = [], []
+        for i in ids:
+            if i == self._endframe_id:
+                frame_lists.append(current)
+                current = []
+            else:
+                current.append(i)
+        if current:
+            frame_lists.append(current)
+        if not frame_lists:
+            raise ValueError("no <ENDFRAME> markers found — not a valid video stream")
+        frames = [self.decode_image(f, channels=channels) for f in frame_lists]
+        shapes = {f.shape for f in frames}
+        if len(shapes) != 1:
+            raise ValueError(f"inconsistent frame shapes across video: {shapes}")
+        stacked = np.stack(frames, axis=0)
+        duration = stacked.shape[0] / fps if fps > 0 else float("nan")
+        return stacked, duration
+
+    # ---------------- AUDIO: flat PCM + periodic <TICK> ----------------
+    @classmethod
+    def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None) -> list:
         if waveform.dtype != np.float32:
             raise ValueError("encode_audio expects a float32 waveform in [-1, 1]")
+        tick_samples = tick_samples or cls.AUDIO_TICK_SAMPLES
         pcm = np.clip(waveform * 127.5 + 127.5, 0, 255).astype(np.uint8)
-        return pcm.tobytes()
+        out = []
+        for start in range(0, len(pcm), tick_samples):
+            out.append(("bytes", pcm[start:start + tick_samples].tobytes()))
+            out.append(("marker", "<TICK>"))
+        return out
 
-    @staticmethod
-    def decode_audio(raw: bytes) -> np.ndarray:
-        pcm = np.frombuffer(raw, dtype=np.uint8)
-        return (pcm.astype(np.float32) - 127.5) / 127.5
+    def decode_audio(self, ids: list[int], tick_samples: int | None = None):
+        """Returns (waveform, duration_seconds); duration = len(waveform)/AUDIO_SAMPLE_RATE."""
+        samples, current = [], []
+        for i in ids:
+            if i == self._tick_id:
+                samples.extend(current)
+                current = []
+            else:
+                current.append(i)
+        if current:
+            samples.extend(current)
+        pcm = np.frombuffer(self._ids_to_bytes(samples), dtype=np.uint8)
+        waveform = (pcm.astype(np.float32) - 127.5) / 127.5
+        return waveform, len(waveform) / self.AUDIO_SAMPLE_RATE
 
-    @staticmethod
-    def encode_video(frames: np.ndarray, stride: int = 1) -> bytes:
-        """frames: (T, H, W, 3) uint8 -> concatenated per-frame RGB bytes."""
-        if frames.dtype != np.uint8 or frames.ndim != 4:
-            raise ValueError("encode_video expects a (T, H, W, 3) uint8 array")
-        return frames[::stride].tobytes()
+    # ---------------- LIDAR: point groups + fixed quant bounds ----------------
+    @classmethod
+    def encode_lidar(cls, points: np.ndarray, points_per_group: int | None = None) -> list:
+        if points.dtype != np.float32 or points.ndim != 2 or points.shape[-1] != 4:
+            raise ValueError("encode_lidar expects a (N, 4) float32 array [x,y,z,intensity]")
+        points_per_group = points_per_group or cls.LIDAR_POINTS_PER_GROUP
+        xyz_lo, xyz_hi = cls.LIDAR_XYZ_RANGE
+        int_lo, int_hi = cls.LIDAR_INTENSITY_RANGE
+        lo = np.array([xyz_lo, xyz_lo, xyz_lo, int_lo], dtype=np.float32)
+        hi = np.array([xyz_hi, xyz_hi, xyz_hi, int_hi], dtype=np.float32)
+        q = ((np.clip(points, lo, hi) - lo) / (hi - lo) * 255).astype(np.uint8)
+        out = []
+        for start in range(0, len(q), points_per_group):
+            out.append(("bytes", q[start:start + points_per_group].tobytes()))
+            out.append(("marker", "<PTSEP>"))
+        return out
 
-    @staticmethod
-    def decode_video(raw: bytes, num_frames: int, height: int, width: int) -> np.ndarray:
-        return np.frombuffer(raw, dtype=np.uint8).reshape(num_frames, height, width, 3)
+    def decode_lidar(self, ids: list[int]) -> np.ndarray:
+        """Dequantized via fixed LIDAR_XYZ_RANGE/LIDAR_INTENSITY_RANGE (lossy
+        but header-free)."""
+        point_bytes, current = [], []
+        for i in ids:
+            if i == self._ptsep_id:
+                point_bytes.extend(current)
+                current = []
+            else:
+                current.append(i)
+        if current:
+            point_bytes.extend(current)
+        raw = self._ids_to_bytes(point_bytes)
+        if len(raw) % 4 != 0:
+            raise ValueError(f"lidar payload ({len(raw)} bytes) not a multiple of 4")
+        q = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4).astype(np.float32)
+        xyz_lo, xyz_hi = self.LIDAR_XYZ_RANGE
+        int_lo, int_hi = self.LIDAR_INTENSITY_RANGE
+        lo = np.array([xyz_lo, xyz_lo, xyz_lo, int_lo], dtype=np.float32)
+        hi = np.array([xyz_hi, xyz_hi, xyz_hi, int_hi], dtype=np.float32)
+        return q / 255.0 * (hi - lo) + lo
 
-    @staticmethod
-    def encode_lidar(points: np.ndarray) -> bytes:
-        """points: (N, 4) float32 [x, y, z, intensity] -> per-channel min-max
-        quantized uint8 bytes. NOTE: lossy and NOT self-describing — the
-        caller must keep track of (mins, maxs) separately to dequantize
-        exactly; `decode_lidar` returns normalized [0, 1] values only."""
-        if points.dtype != np.float32 or points.shape[-1] != 4:
-            raise ValueError("encode_lidar expects a (N, 4) float32 array")
-        mins = points.min(axis=0, keepdims=True)
-        maxs = points.max(axis=0, keepdims=True)
-        scale = np.clip(maxs - mins, 1e-6, None)
-        q = ((points - mins) / scale * 255).astype(np.uint8)
-        return q.tobytes()
-
-    @staticmethod
-    def decode_lidar(raw: bytes) -> np.ndarray:
-        q = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4)
-        return q.astype(np.float32) / 255.0
-
-    # ---------------------------------------------------------------
-    # high-level: multimodal sequence assembly
-    # ---------------------------------------------------------------
-    def encode_multimodal(
-        self,
-        segments: list[MultimodalSegment],
-        max_len: int | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """
-        segments: ordered list of MultimodalSegment — mix text and other
-            modalities freely, e.g. [text, image, text] for an image-QA pair.
-
-        Returns {"input_ids": LongTensor[L], "modality_ids": LongTensor[L]},
-        both length L (truncated/padded to max_len if given). Padding uses
-        Modality.TEXT for modality_ids (cheapest routing scale, consistent
-        with KairosPretrainingDataset's existing padding convention).
-        """
+    # ---------------- multimodal sequence assembly ----------------
+    def encode_multimodal(self, segments: list[MultimodalSegment], max_len: int | None = None) -> dict:
+        """Returns {"input_ids", "modality_ids"} aligned tensors. Padding uses
+        Modality.TEXT (cheapest routing scale)."""
         all_ids: list[int] = []
         all_modality: list[int] = []
 
@@ -232,15 +265,11 @@ class KairosTokenizer(ByT5Tokenizer):
             if seg.modality is Modality.TEXT:
                 body_ids = self.encode(seg.data.decode("utf-8"), add_special_tokens=False)
             else:
-                body_ids = self._bytes_to_ids(seg.data)
+                body_ids = self._resolve_markers(seg.data)
 
             if seg.channel is not None:
                 c_open, c_close = _CHANNEL_TAGS[seg.channel]
-                body_ids = (
-                    [self.convert_tokens_to_ids(c_open)]
-                    + body_ids
-                    + [self.convert_tokens_to_ids(c_close)]
-                )
+                body_ids = [self.convert_tokens_to_ids(c_open)] + body_ids + [self.convert_tokens_to_ids(c_close)]
 
             seg_ids = [open_id] + body_ids + [close_id]
             all_ids.extend(seg_ids)
@@ -260,9 +289,8 @@ class KairosTokenizer(ByT5Tokenizer):
         }
 
     def decode_multimodal(self, input_ids: torch.Tensor) -> list[MultimodalSegment]:
-        """Best-effort roundtrip: split on delimiter tokens, return raw bytes
-        per segment (lossless for the bytes themselves; any channel sub-tags
-        are stripped and not reconstructed as separate segments)."""
+        """Splits on modality delimiters. Non-text `.data` is the raw id list
+        (with structural markers) — feed it to the matching decode_* method."""
         ids = input_ids.tolist()
         tokens = self.convert_ids_to_tokens(ids)
         open_to_modality = {tags[0]: m for m, tags in _MODALITY_TAGS.items()}
@@ -279,12 +307,10 @@ class KairosTokenizer(ByT5Tokenizer):
                 while j < len(tokens) and tokens[j] != close_tag:
                     body_ids.append(ids[j])
                     j += 1
-
                 if modality is Modality.TEXT:
                     data = self.decode(body_ids, skip_special_tokens=False).encode("utf-8")
                 else:
-                    data = self._ids_to_bytes(body_ids)
-
+                    data = body_ids
                 segments.append(MultimodalSegment(modality=modality, data=data))
                 i = j + 1
             else:
@@ -292,26 +318,5 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# ==========================================================
-# Reserved Special Tokens — kept as documentation. The actual
-# vocab is registered programmatically in __init__ via
-# ALL_SPECIAL_TOKENS; this table just shows the resulting layout
-# for a freshly constructed KairosTokenizer(extra_ids=0).
-# ==========================================================
-#
-#   0-255 : Raw byte values          (id = byte + 3)
-#   0     : <PAD>
-#   1     : <EOS>
-#   2     : <UNK>
-#           (ByT5 has NO native <BOS> — bos_token_id is None)
-#
-# 259+    : modality / channel delimiters, appended in ALL_SPECIAL_TOKENS
-#           order (exact ids depend on transformers version — always read
-#           them via `tokenizer.convert_tokens_to_ids(...)`, never hardcode):
-#           <TEXT> </TEXT> <IMG> </IMG> <VIDEO> </VIDEO> <AUDIO> </AUDIO>
-#           <LIDAR> </LIDAR> <STATE> </STATE> <ACTION> </ACTION>
-#           <META> </META> <R> </R> <G> </G> <B> </B> <LEFT> </LEFT>
-#           <RIGHT> </RIGHT> <SEP> <MASK>
-#
-# len(KairosTokenizer()) == 287  (259 base + 28 special tokens above)
-# ==========================================================
+# len(KairosTokenizer()) == 291  (259 base bytes/pad/eos/unk + 32 special tokens:
+# 8 modality pairs, 5 channel pairs, 4 structural markers, <SEP>, <MASK>)

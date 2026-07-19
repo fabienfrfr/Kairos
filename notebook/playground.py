@@ -6,16 +6,8 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    # !pip install -q marimo
     import marimo as mo
-
     return (mo,)
-
-
-@app.cell
-def _():
-    # !pip install -q git+https://github.com/fabienfrfr/Kairos@dev
-    return
 
 
 @app.cell
@@ -24,10 +16,7 @@ def _(mo):
     # 🌀 Kairos — Training Notebook
     Build · Inspect · Train · Checkpoint
 
-
-    ⚠️ **Work in Progress (WIP)**
-
-    This notebook is actively under development. Some components (training loop, logging, checkpointing, etc.) may be incomplete, experimental, or subject to change. Use for testing and exploration only.
+    ⚠️ **Work in Progress** — training loop / logging / checkpointing may still change.
     """)
     return
 
@@ -36,24 +25,21 @@ def _(mo):
 def _():
     import os
     import math
-    import time
-    import json
     from pathlib import Path
-    from datetime import datetime
 
     import torch
     from torch.utils.tensorboard import SummaryWriter
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, ConcatDataset
 
     from transformers import TrainingArguments
 
-    from kairos.modeling import KairosConfig, KairosDiffusionLLM, PyramidalConvCodec
-    from kairos.attentions import KairosCache
+    from kairos.modeling import KairosConfig, KairosDiffusionLLM
     from kairos.tokenizer import KairosTokenizer
     from kairos.dataset import KairosPretrainingDataset
     from kairos.trainer import KairosDiffusionTrainer
 
     return (
+        ConcatDataset,
         DataLoader,
         KairosConfig,
         KairosDiffusionLLM,
@@ -71,11 +57,16 @@ def _():
 @app.cell
 def _(mo, torch):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    mo.callout(
-        mo.md(f"**Device:** `{device}`  |  **CUDA:** `{torch.cuda.get_device_name(0) if device == 'cuda' else 'N/A'}`"),
-        kind="info",
-    )
+    mo.callout(mo.md(f"**Device:** `{device}`"), kind="info")
     return (device,)
+
+
+@app.cell
+def _(KairosTokenizer):
+    # Multimodal tokenizer — created once, shared by model config (vocab_size)
+    # and dataset cells below. len(tokenizer) is 291, not the old hardcoded 259.
+    tokenizer = KairosTokenizer()
+    return (tokenizer,)
 
 
 @app.cell(hide_code=True)
@@ -83,43 +74,20 @@ def _(mo):
     mo.md(r"""
     *Estimate pretraining compute time*
 
-    Based on Training Compute-Optimal Large Language Models : https://arxiv.org/abs/2203.15556
-
-    Verify calculus for token/s
+    Based on Training Compute-Optimal Large Language Models: https://arxiv.org/abs/2203.15556
     """)
     return
 
 
 @app.cell
 def _(mo):
-    GPU_FLOPS = {
-        "T4": 65,
-        "RTX_5060Ti": 200,
-        "RTX_5070Ti": 300,
-        "A100": 312,
-        "H100": 1000,
-    }
-
-    GPU_BW = {
-        "T4": 300e9,
-        "RTX_5060Ti": 600e9,
-        "RTX_5070Ti": 800e9,
-        "A100": 1500e9,
-        "H100": 3000e9,
-    }
+    GPU_FLOPS = {"T4": 65, "RTX_5060Ti": 200, "RTX_5070Ti": 300, "A100": 312, "H100": 1000}
+    GPU_BW = {"T4": 300e9, "RTX_5060Ti": 600e9, "RTX_5070Ti": 800e9, "A100": 1500e9, "H100": 3000e9}
 
     gpu = mo.ui.dropdown(list(GPU_FLOPS.keys()), value="T4", label="GPU")
-
     eff = mo.ui.slider(0.05, 0.5, step=0.05, value=0.3, label="GPU efficiency")
-
-    params = mo.ui.slider(1, 50, value=5, label="Active params (millions)")
-
-    tokens = mo.ui.slider(
-        1,
-        50,
-        value=30,  # cosmopedia
-        label="Training tokens (billions)",
-    )
+    params = mo.ui.slider(1, 50, value=14, label="Active params (millions)")
+    tokens = mo.ui.slider(1, 50, value=1, label="Training tokens (billions)")
 
     mo.vstack([gpu, params, tokens, eff])
     return GPU_BW, GPU_FLOPS, eff, gpu, params, tokens
@@ -129,20 +97,13 @@ def _(mo):
 def _(GPU_BW, GPU_FLOPS, eff, gpu, mo, params, tokens):
     flops = GPU_FLOPS[gpu.value] * 1e12
     bw = GPU_BW[gpu.value]
-
     params_total = params.value * 1e6
     tokens_total = tokens.value * 1e9
+    n_ops = 6
 
-    n_ops = 6  # compute cost (qkvo+ffn+1)
-
-    # --- compute bound ---
     tok_s_compute = (flops / (n_ops * params_total)) * eff.value
-
-    # --- memory bound ---
-    bytes_per_token = 4 * params_total  # fp16 rule-of-thumb
+    bytes_per_token = 4 * params_total
     tok_s_memory = bw / bytes_per_token
-
-    # --- real ---
     tok_s_real = min(tok_s_compute, tok_s_memory)
     time_days = tokens_total / tok_s_real / 86400
 
@@ -157,32 +118,35 @@ def _(GPU_BW, GPU_FLOPS, eff, gpu, mo, params, tokens):
 
 @app.cell
 def _(mo):
-    mo.md("""
-    ## ⚙️ Model Configuration
-    """)
+    mo.md("## ⚙️ Model Configuration")
     return
 
 
 @app.cell
 def _(mo):
-    cfg_d_model = mo.ui.slider(32, 768, step=32, value=256, label="d_model (hidden size)")
+    # Target: ~14M total, 7 routed experts + 1 always-on shared expert,
+    # top-1 routing => 2 experts active per token (1 shared + 1 routed).
+    cfg_d_model = mo.ui.slider(32, 768, step=32, value=128, label="d_model (hidden size)")
     cfg_n_heads = mo.ui.slider(2, 16, step=2, value=4, label="n_heads")
-    cfg_n_layers = mo.ui.slider(1, 24, step=1, value=4, label="n_layers")
+    cfg_n_layers = mo.ui.slider(1, 24, step=1, value=6, label="n_layers")
     cfg_window = mo.ui.slider(16, 512, step=16, value=64, label="SWA window size")
     cfg_stride = mo.ui.slider(1, 6, step=1, value=3, label="PyramidalConvCodec stride")
-    cfg_experts = mo.ui.slider(0, 32, step=2, value=3, label="MoE experts (0 = dense FFN)")
+    cfg_local_experts = mo.ui.slider(0, 32, step=1, value=7, label="Routed experts (0 = dense FFN)")
+    cfg_experts_per_tok = mo.ui.slider(1, 8, step=1, value=1, label="Routed experts active per token")
+    cfg_shared_experts = mo.ui.slider(0, 4, step=1, value=1, label="Shared experts (always active)")
 
-    mo.vstack(
-        [
-            mo.hstack([cfg_d_model, cfg_n_heads, cfg_n_layers]),
-            mo.hstack([cfg_window, cfg_stride, cfg_experts]),
-        ]
-    )
+    mo.vstack([
+        mo.hstack([cfg_d_model, cfg_n_heads, cfg_n_layers]),
+        mo.hstack([cfg_window, cfg_stride]),
+        mo.hstack([cfg_local_experts, cfg_experts_per_tok, cfg_shared_experts]),
+    ])
     return (
         cfg_d_model,
-        cfg_experts,
+        cfg_experts_per_tok,
+        cfg_local_experts,
         cfg_n_heads,
         cfg_n_layers,
+        cfg_shared_experts,
         cfg_stride,
         cfg_window,
     )
@@ -193,45 +157,56 @@ def _(
     KairosConfig,
     KairosDiffusionLLM,
     cfg_d_model,
-    cfg_experts,
+    cfg_experts_per_tok,
+    cfg_local_experts,
     cfg_n_heads,
     cfg_n_layers,
+    cfg_shared_experts,
     cfg_stride,
     cfg_window,
     device,
     mo,
+    tokenizer,
 ):
+    use_moe = cfg_local_experts.value > 0
+
     config = KairosConfig(
         d_model=cfg_d_model.value,
         n_heads=cfg_n_heads.value,
         n_layers=cfg_n_layers.value,
         window_size=cfg_window.value,
         stride=cfg_stride.value,
-        num_experts=cfg_experts.value if cfg_experts.value > 0 else 8,
-        num_experts_per_tok=2,
+        vocab_size=len(tokenizer),
+        # NOTE: DeepseekV3MoE (used under the hood) reads config.num_local_experts
+        # for both the router and the expert weight matrices — n_routed_experts
+        # is not read anywhere and has no effect on the actual model. This is
+        # what caused the historical "Class values must be smaller than
+        # num_classes" crash when only n_routed_experts was set.
+        # kept in sync: depending on the installed transformers version, the
+        # DeepseekV3 MoE backend reads n_routed_experts or num_local_experts
+        # for the actual expert weight tensor size — set both or the router's
+        # top-k index space and the experts tensor can disagree.
+        num_local_experts=cfg_local_experts.value if use_moe else 8,
+        n_routed_experts=cfg_local_experts.value if use_moe else 8,
+        num_experts_per_tok=cfg_experts_per_tok.value,
+        n_shared_experts=cfg_shared_experts.value,
+        use_moe=use_moe,
     )
 
-    num_experts_arg = cfg_experts.value if cfg_experts.value > 0 else None
-
-    model = KairosDiffusionLLM(
-        config,
-        vocab_size=259,
-        num_experts=num_experts_arg,
-    ).to(device)
+    model = KairosDiffusionLLM(config, vocab_size=len(tokenizer)).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    active_params = sum(
-        p.numel()
-        for n, p in model.named_parameters()
-        if "experts" not in n or any(f"experts.{i}" in n for i in range(config.num_experts_per_tok))
-    )
+    expert_params = sum(p.numel() for n, p in model.named_parameters() if ".experts." in n)
+    non_expert_params = total_params - expert_params
+    active_ratio = (config.num_experts_per_tok / config.num_local_experts) if use_moe else 1.0
+    active_params = non_expert_params + expert_params * active_ratio
 
     mo.callout(
         mo.md(
             f"**Total params:** `{total_params / 1e6:.2f}M`  \n"
-            f"**Active params (est.):** `{active_params / 1e6:.2f}M`  \n"
-            f"**Layers config:** `{config.layers_config}`  \n"
-            f"**MoE:** `{'Yes — ' + str(cfg_experts.value) + ' experts' if num_experts_arg else 'No — dense FFN'}`"
+            f"**Active params:** `{active_params / 1e6:.2f}M`  \n"
+            f"**MoE:** `{'Yes — ' + str(cfg_local_experts.value) + ' routed + ' + str(cfg_shared_experts.value) + ' shared' if use_moe else 'No — dense FFN'}`  \n"
+            f"**Vocab size:** `{len(tokenizer)}`"
         ),
         kind="success",
     )
@@ -240,46 +215,34 @@ def _(
 
 @app.cell
 def _(mo):
-    mo.md("""
-    ## 🔬 Architecture Inspection
-    """)
+    mo.md("## 🔬 Architecture Inspection")
     return
 
 
 @app.cell
 def _(mo, model):
-    rows = []
-    for name, param in model.named_parameters():
-        rows.append(
-            {
-                "Layer": name,
-                "Shape": str(list(param.shape)),
-                "Params": f"{param.numel():,}",
-                "Trainable": "✅" if param.requires_grad else "❌",
-                "dtype": str(param.dtype).replace("torch.", ""),
-            }
-        )
-
-    mo.ui.table(
-        rows,
-        label="Model parameters",
-        pagination=True,
-        page_size=100,
-    )
+    rows = [
+        {
+            "Layer": name,
+            "Shape": str(list(param.shape)),
+            "Params": f"{param.numel():,}",
+            "Trainable": "✅" if param.requires_grad else "❌",
+        }
+        for name, param in model.named_parameters()
+    ]
+    mo.ui.table(rows, label="Model parameters", pagination=True, page_size=100)
     return
 
 
 @app.cell
-def _(config, device, mo, model, torch):
-    # Dry-run forward to check shapes
-    _x = torch.randint(0, 259, (1, 12)).to(device)
+def _(device, mo, model, tokenizer, torch):
+    _x = torch.randint(0, len(tokenizer), (1, 12)).to(device)
     with torch.no_grad():
         _out = model(input_ids=_x)
 
     mo.callout(
         mo.md(
             f"**Dry-run input:** `(1, 12)` tokens  \n"
-            f"**After codec encode:** `(1, {12 // config.stride}, {config.hidden_size})`  \n"
             f"**Output logits:** `{list(_out.logits.shape)}`  \n"
             f"**No NaN:** `{not torch.isnan(_out.logits).any().item()}`"
         ),
@@ -290,9 +253,7 @@ def _(config, device, mo, model, torch):
 
 @app.cell
 def _(mo):
-    mo.md("""
-    ## 🏋️ Training Configuration
-    """)
+    mo.md("## 🏋️ Training Configuration")
     return
 
 
@@ -301,19 +262,17 @@ def _(mo):
     train_lr = mo.ui.number(1e-4, 1e-2, step=1e-5, value=3e-4, label="Learning rate")
     train_batch = mo.ui.slider(1, 64, step=1, value=8, label="Batch size")
     train_epochs = mo.ui.slider(1, 100, step=1, value=5, label="Epochs")
-    train_max_len = mo.ui.slider(32, 512, step=32, value=128, label="Max sequence length")
+    train_max_len = mo.ui.slider(32, 4096, step=32, value=512, label="Max sequence length")
     train_save_steps = mo.ui.slider(10, 500, step=10, value=50, label="Save every N steps")
     train_log_steps = mo.ui.slider(1, 50, step=1, value=10, label="Log every N steps")
     train_output_dir = mo.ui.text(value="checkpoints/kairos", label="Output directory")
     train_run_name = mo.ui.text(value="run_01", label="Run name (TensorBoard)")
 
-    mo.vstack(
-        [
-            mo.hstack([train_lr, train_batch, train_epochs]),
-            mo.hstack([train_max_len, train_save_steps, train_log_steps]),
-            mo.hstack([train_output_dir, train_run_name]),
-        ]
-    )
+    mo.vstack([
+        mo.hstack([train_lr, train_batch, train_epochs]),
+        mo.hstack([train_max_len, train_save_steps, train_log_steps]),
+        mo.hstack([train_output_dir, train_run_name]),
+    ])
     return (
         train_batch,
         train_epochs,
@@ -328,17 +287,19 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    mo.md("""
-    ## 📦 Dataset
-    """)
+    mo.md("## 📦 Dataset")
     return
 
 
 @app.cell
 def _(mo):
     dataset_source = mo.ui.radio(
-        options=["cosmopedia (HuggingFace)", "custom texts"],
-        value="cosmopedia (HuggingFace)",
+        options=[
+            "keep-it-simple + keep-it-simple-multimodal (recommended)",
+            "keep-it-simple (text only)",
+            "custom texts",
+        ],
+        value="keep-it-simple + keep-it-simple-multimodal (recommended)",
         label="Dataset source",
     )
     dataset_source
@@ -349,55 +310,67 @@ def _(mo):
 def _(dataset_source, mo):
     custom_texts_input = (
         mo.ui.text_area(
-            value="Paris is the capital of France.\nThe Earth orbits the Sun.\nWater boils at 100 degrees Celsius.",
+            value="Paris is the capital of France.\nThe Earth orbits the Sun.",
             label="Custom texts (one per line)",
             rows=6,
         )
         if dataset_source.value == "custom texts"
         else None
     )
-
-    if custom_texts_input:
-        custom_texts_input
+    custom_texts_input if custom_texts_input is not None else mo.md("")
     return (custom_texts_input,)
 
 
 @app.cell
+def _(dataset_source, mo):
+    multimodal_path = mo.ui.text(
+        value="data/keep-it-simple-multimodal.pt",
+        label="keep-it-simple-multimodal .pt path (from build_keep_it_simple_multimodal.py)",
+    ) if dataset_source.value.startswith("keep-it-simple + ") else None
+    multimodal_path if multimodal_path is not None else mo.md("")
+    return (multimodal_path,)
+
+
+@app.cell
 def _(
+    ConcatDataset,
     KairosPretrainingDataset,
-    KairosTokenizer,
     custom_texts_input,
     dataset_source,
     mo,
+    multimodal_path,
+    tokenizer,
     train_max_len,
 ):
-    tokenizer = KairosTokenizer()
-
-    texts = None
-    if dataset_source.value == "custom texts" and custom_texts_input:
-        texts = [t for t in custom_texts_input.value.split("\n") if t.strip()]
-
     with mo.status.spinner(title="Loading dataset..."):
-        dataset = KairosPretrainingDataset(
-            texts=texts,
-            tokenizer=tokenizer,
-            max_len=train_max_len.value,
-        )
+        if dataset_source.value == "custom texts":
+            texts = [t for t in (custom_texts_input.value if custom_texts_input else "").split("\n") if t.strip()]
+            dataset = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=train_max_len.value)
+
+        elif dataset_source.value == "keep-it-simple (text only)":
+            from datasets import load_dataset
+            text_rows = load_dataset("ffurfaro/keep-it-simple", split="train")["text"]
+            dataset = KairosPretrainingDataset(texts=text_rows, tokenizer=tokenizer, max_len=train_max_len.value)
+
+        else:
+            from datasets import load_dataset
+            text_rows = load_dataset("ffurfaro/keep-it-simple", split="train")["text"]
+            text_ds = KairosPretrainingDataset(texts=text_rows, tokenizer=tokenizer, max_len=train_max_len.value)
+            multimodal_ds = KairosPretrainingDataset(
+                multimodal_path=multimodal_path.value, tokenizer=tokenizer, max_len=train_max_len.value
+            )
+            dataset = ConcatDataset([text_ds, multimodal_ds])
 
     mo.callout(
-        mo.md(
-            f"**Samples:** `{len(dataset)}`  |  **Max len:** `{train_max_len.value}`  |  **Source:** `{dataset_source.value}`"
-        ),
+        mo.md(f"**Samples:** `{len(dataset)}`  |  **Max len:** `{train_max_len.value}`  |  **Source:** `{dataset_source.value}`"),
         kind="success",
     )
-    return dataset, tokenizer
+    return (dataset,)
 
 
 @app.cell
 def _(mo):
-    mo.md("""
-    ## 🚀 Train
-    """)
+    mo.md("## 🚀 Train")
     return
 
 
@@ -414,7 +387,6 @@ def _(
     KairosDiffusionTrainer,
     Path,
     SummaryWriter,
-    TrainingArguments,
     config,
     dataset,
     device,
@@ -422,7 +394,6 @@ def _(
     mo,
     model,
     run_button,
-    tokenizer,
     torch,
     train_batch,
     train_epochs,
@@ -435,95 +406,39 @@ def _(
     if not run_button.value:
         mo.stop(True, mo.callout(mo.md("Click **▶ Start Training** to begin."), kind="neutral"))
 
-    # ── dirs ──
     run_dir = Path(train_output_dir.value) / train_run_name.value
     tb_dir = run_dir / "tensorboard"
     ckpt_dir = run_dir / "checkpoints"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    tb_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── save config ──
-    import json as _json
-
-    with open(run_dir / "config.json", "w") as _f:
-        _json.dump(
-            {
-                "d_model": config.hidden_size,
-                "n_heads": config.num_attention_heads,
-                "n_layers": config.num_hidden_layers,
-                "sliding_window_size": config.sliding_window_size,
-                "stride": config.stride,
-                "vocab_size": 259,
-            },
-            _f,
-            indent=2,
-        )
+    for _d in (run_dir, tb_dir, ckpt_dir):
+        _d.mkdir(parents=True, exist_ok=True)
 
     writer = SummaryWriter(log_dir=str(tb_dir))
 
-    training_args = TrainingArguments(
-        output_dir=str(ckpt_dir),
-        num_train_epochs=train_epochs.value,
-        per_device_train_batch_size=train_batch.value,
-        learning_rate=train_lr.value,
-        logging_steps=train_log_steps.value,
-        save_steps=train_save_steps.value,
-        save_total_limit=3,
-        report_to=[],  # on gère TensorBoard manuellement
-        dataloader_pin_memory=(device == "cuda"),
-        remove_unused_columns=False,
-        no_cuda=(device != "cuda"),
-    )
-
-    trainer = KairosDiffusionTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
-    )
-
-    # ── custom loop with marimo progress + TensorBoard ──
-    loader = DataLoader(
-        dataset,
-        batch_size=train_batch.value,
-        shuffle=True,
-        pin_memory=(device == "cuda"),
-    )
-
+    loader = DataLoader(dataset, batch_size=train_batch.value, shuffle=True, pin_memory=(device == "cuda"))
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_lr.value)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=train_epochs.value * len(loader),
-        eta_min=train_lr.value * 0.1,
+        optimizer, T_max=train_epochs.value * len(loader), eta_min=train_lr.value * 0.1,
     )
 
     global_step = 0
     best_loss = float("inf")
     log_rows = []
-
     model.train()
 
-    with mo.status.progress_bar(
-        total=train_epochs.value * len(loader),
-        title="Training Kairos",
-        subtitle="epoch 1",
-    ) as _bar:
+    # batches carry input_ids/modality_ids/mask straight from
+    # KairosPretrainingDataset; compute_loss reads all three from `batch`.
+    trainer = KairosDiffusionTrainer(model=model)
+
+    with mo.status.progress_bar(total=train_epochs.value * len(loader), title="Training Kairos") as _bar:
         for epoch in range(1, train_epochs.value + 1):
             epoch_loss = 0.0
-
             for step, batch in enumerate(loader, 1):
-                # move to device
                 batch = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
 
                 optimizer.zero_grad()
-
                 loss = trainer.compute_loss(model, batch)
                 loss.backward()
-
-                # gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
                 optimizer.step()
                 scheduler.step()
 
@@ -531,73 +446,32 @@ def _(
                 epoch_loss += loss_val
                 global_step += 1
 
-                # ── TensorBoard ──
                 if global_step % train_log_steps.value == 0:
                     lr_now = scheduler.get_last_lr()[0]
                     writer.add_scalar("train/loss", loss_val, global_step)
                     writer.add_scalar("train/lr", lr_now, global_step)
-                    writer.add_scalar("train/epoch", epoch, global_step)
-
-                    # gradient norm
-                    grad_norm = math.sqrt(
-                        sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None)
-                    )
+                    grad_norm = math.sqrt(sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None))
                     writer.add_scalar("train/grad_norm", grad_norm, global_step)
+                    log_rows.append({"step": global_step, "epoch": epoch, "loss": f"{loss_val:.4f}", "lr": f"{lr_now:.2e}"})
 
-                    log_rows.append(
-                        {
-                            "step": global_step,
-                            "epoch": epoch,
-                            "loss": f"{loss_val:.4f}",
-                            "lr": f"{lr_now:.2e}",
-                            "grad_norm": f"{grad_norm:.3f}",
-                        }
-                    )
-
-                # ── Checkpoint ──
                 if global_step % train_save_steps.value == 0:
                     ckpt_path = ckpt_dir / f"step_{global_step:06d}.pt"
                     torch.save(
-                        {
-                            "step": global_step,
-                            "epoch": epoch,
-                            "model_state": model.state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "scheduler_state": scheduler.state_dict(),
-                            "loss": loss_val,
-                            "config": config.to_dict(),
-                        },
+                        {"step": global_step, "epoch": epoch, "model_state": model.state_dict(),
+                         "optimizer_state": optimizer.state_dict(), "loss": loss_val, "config": config.to_dict()},
                         ckpt_path,
-                    )
-                    writer.add_text(
-                        "checkpoints",
-                        f"Saved `{ckpt_path.name}` — loss {loss_val:.4f}",
-                        global_step,
                     )
 
                 _bar.update(subtitle=f"epoch {epoch}/{train_epochs.value} | loss {loss_val:.4f}")
 
             avg_loss = epoch_loss / len(loader)
             writer.add_scalar("train/epoch_avg_loss", avg_loss, epoch)
-
-            # ── Best checkpoint ──
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                best_path = ckpt_dir / "best.pt"
                 torch.save(
-                    {
-                        "step": global_step,
-                        "epoch": epoch,
-                        "model_state": model.state_dict(),
-                        "loss": best_loss,
-                        "config": config.to_dict(),
-                    },
-                    best_path,
-                )
-                writer.add_text(
-                    "checkpoints",
-                    f"🏆 New best at epoch {epoch} — loss {best_loss:.4f}",
-                    global_step,
+                    {"step": global_step, "epoch": epoch, "model_state": model.state_dict(),
+                     "loss": best_loss, "config": config.to_dict()},
+                    ckpt_dir / "best.pt",
                 )
 
     writer.flush()
@@ -612,120 +486,14 @@ def _(
         ),
         kind="success",
     )
-    return log_rows, optimizer, scheduler, tb_dir
+    return log_rows, tb_dir
 
 
 @app.cell
 def _(log_rows, mo, run_button):
     if not run_button.value or not log_rows:
         mo.stop(True)
-
-    mo.vstack(
-        [
-            mo.md("## 📊 Training Logs"),
-            mo.ui.table(log_rows, label="Step logs", pagination=True, page_size=20),
-        ]
-    )
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## 💾 Checkpoint Browser
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    ckpt_browser_dir = mo.ui.text(
-        value="checkpoints/kairos/run_01/checkpoints",
-        label="Checkpoint directory",
-    )
-    ckpt_browser_dir
-    return (ckpt_browser_dir,)
-
-
-@app.cell
-def _(Path, ckpt_browser_dir, mo, torch):
-    _ckpt_path = Path(ckpt_browser_dir.value)
-
-    if not _ckpt_path.exists():
-        mo.callout(mo.md(f"Directory `{_ckpt_path}` not found."), kind="warn")
-    else:
-        _files = sorted(_ckpt_path.glob("*.pt"))
-        if not _files:
-            mo.callout(mo.md("No checkpoints found."), kind="warn")
-        else:
-            _rows = []
-            for _f in _files:
-                try:
-                    _ck = torch.load(_f, map_location="cpu", weights_only=True)
-                    _rows.append(
-                        {
-                            "File": _f.name,
-                            "Step": _ck.get("step", "?"),
-                            "Epoch": _ck.get("epoch", "?"),
-                            "Loss": f"{_ck.get('loss', 0):.4f}",
-                            "Size": f"{_f.stat().st_size / 1e6:.1f} MB",
-                        }
-                    )
-                except Exception as _e:
-                    _rows.append({"File": _f.name, "Step": "error", "Epoch": "?", "Loss": "?", "Size": "?"})
-
-            mo.ui.table(_rows, label="Available checkpoints")
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## ♻️ Resume from Checkpoint
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    resume_path = mo.ui.text(value="", label="Checkpoint path (.pt)")
-    resume_button = mo.ui.run_button(label="Load checkpoint")
-    mo.hstack([resume_path, resume_button])
-    return resume_button, resume_path
-
-
-@app.cell
-def _(
-    Path,
-    mo,
-    model,
-    optimizer,
-    resume_button,
-    resume_path,
-    scheduler,
-    torch,
-):
-    if not resume_button.value or not resume_path.value:
-        mo.stop(True)
-
-    _path = Path(resume_path.value)
-    if not _path.exists():
-        mo.callout(mo.md(f"File not found: `{_path}`"), kind="danger")
-    else:
-        _ck = torch.load(_path, map_location="cpu")
-        model.load_state_dict(_ck["model_state"])
-        if "optimizer_state" in _ck:
-            optimizer.load_state_dict(_ck["optimizer_state"])
-        if "scheduler_state" in _ck:
-            scheduler.load_state_dict(_ck["scheduler_state"])
-
-        mo.callout(
-            mo.md(
-                f"✅ Loaded `{_path.name}`  \n"
-                f"Step: `{_ck.get('step', '?')}` | Epoch: `{_ck.get('epoch', '?')}` | Loss: `{_ck.get('loss', 0):.4f}`"
-            ),
-            kind="success",
-        )
+    mo.vstack([mo.md("## 📊 Training Logs"), mo.ui.table(log_rows, label="Step logs", pagination=True, page_size=20)])
     return
 
 
@@ -733,14 +501,8 @@ def _(
 def _(mo, run_button, tb_dir):
     if not run_button.value:
         mo.stop(True)
-
     mo.callout(
-        mo.md(
-            f"## 📈 TensorBoard\n\n"
-            f"Lance dans un terminal :\n\n"
-            f"```bash\ntensorboard --logdir {tb_dir} --port 6006\n```\n\n"
-            f"Puis ouvre [http://localhost:6006](http://localhost:6006)"
-        ),
+        mo.md(f"## 📈 TensorBoard\n\n```bash\ntensorboard --logdir {tb_dir} --port 6006\n```"),
         kind="info",
     )
     return

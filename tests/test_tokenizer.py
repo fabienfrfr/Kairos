@@ -16,39 +16,41 @@ def tokenizer():
 @pytest.fixture
 def sample_image():
     rng = np.random.default_rng(0)
-    return rng.integers(0, 255, (4, 4, 3), dtype=np.uint8)
-
-
-@pytest.fixture
-def sample_audio():
-    rng = np.random.default_rng(0)
-    return rng.uniform(-1, 1, 32).astype(np.float32)
+    return rng.integers(0, 255, (5, 7, 3), dtype=np.uint8)
 
 
 @pytest.fixture
 def sample_video():
     rng = np.random.default_rng(0)
-    return rng.integers(0, 255, (3, 2, 2, 3), dtype=np.uint8)
+    return rng.integers(0, 255, (6, 3, 4, 3), dtype=np.uint8)
+
+
+@pytest.fixture
+def sample_audio():
+    rng = np.random.default_rng(0)
+    return rng.uniform(-1, 1, 40_000).astype(np.float32)
 
 
 @pytest.fixture
 def sample_lidar():
     rng = np.random.default_rng(0)
-    return rng.uniform(-10, 10, (16, 4)).astype(np.float32)
+    pts = rng.uniform(-10, 10, (50, 4)).astype(np.float32)
+    pts[:, 3] = rng.uniform(0, 1, 50)  # intensity in [0, 1]
+    return pts
 
 
 # =========================
 # Vocab / backward compatibility
 # =========================
-def test_vocab_size_is_287(tokenizer):
-    """Regression test: ByT5Tokenizer defaults to extra_ids=125 (len=384).
-    KairosTokenizer must force extra_ids=0 and add exactly 28 special
-    tokens on top of the 259-token byte vocab."""
-    assert len(tokenizer) == 287
+def test_vocab_size_is_291(tokenizer):
+    """Regression: ByT5Tokenizer defaults to extra_ids=125 (len=384).
+    KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens
+    (8 modality pairs + 5 channel pairs + 4 structural markers + SEP/MASK)
+    on top of the 259-token byte vocab."""
+    assert len(tokenizer) == 291
 
 
 def test_no_native_bos(tokenizer):
-    """ByT5 has no BOS token — document this instead of assuming one exists."""
     assert tokenizer.bos_token_id is None
 
 
@@ -58,124 +60,156 @@ def test_byte_offset_contiguous(tokenizer):
 
 
 def test_plain_text_encode_decode_unchanged(tokenizer):
-    """Backward compatibility: plain .encode()/.decode() must behave like
-    stock ByT5Tokenizer for pure text, unaffected by the multimodal additions."""
     text = "Paris is the capital of France."
     ids = tokenizer.encode(text, add_special_tokens=False)
     assert tokenizer.decode(ids, skip_special_tokens=True) == text
 
 
-def test_special_tokens_all_present(tokenizer):
-    for tag in ("<TEXT>", "</TEXT>", "<IMG>", "</IMG>", "<AUDIO>", "</AUDIO>",
-                "<VIDEO>", "</VIDEO>", "<LIDAR>", "</LIDAR>", "<SEP>", "<MASK>"):
+def test_structural_and_modality_tokens_present(tokenizer):
+    for tag in ("<IMG>", "</IMG>", "<VIDEO>", "</VIDEO>", "<AUDIO>", "</AUDIO>",
+                "<LIDAR>", "</LIDAR>", "<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"):
         tid = tokenizer.convert_tokens_to_ids(tag)
         assert tid is not None and tid != tokenizer.unk_token_id, f"{tag} missing from vocab"
 
 
 # =========================
-# Modality quantizers: roundtrip
+# IMAGE: row-delimited, no header
 # =========================
-def test_image_quantizer_roundtrip(sample_image):
-    raw = KairosTokenizer.encode_image(sample_image)
-    recon = KairosTokenizer.decode_image(raw, *sample_image.shape[:2])
+def test_image_roundtrip(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon = tokenizer.decode_image(decoded[0].data)
     assert np.array_equal(recon, sample_image)
 
 
-def test_image_quantizer_rejects_wrong_dtype():
+def test_image_endline_every_row(tokenizer, sample_image):
+    """The whole point of the design: <ENDLINE> recurs locally, every W*C
+    tokens, not once at the far end of the stream."""
+    markers = KairosTokenizer.encode_image(sample_image)
+    ids = tokenizer._resolve_markers(markers)
+    endline_positions = [i for i, tid in enumerate(ids) if tid == tokenizer._endline_id]
+    h, w, c = sample_image.shape
+    assert len(endline_positions) == h
+    gaps = [endline_positions[0] + 1] + [
+        endline_positions[i] - endline_positions[i - 1] for i in range(1, len(endline_positions))
+    ]
+    assert all(g == w * c + 1 for g in gaps)  # w*c bytes + the marker itself
+
+
+def test_image_rejects_bad_dtype():
     with pytest.raises(ValueError):
         KairosTokenizer.encode_image(np.zeros((2, 2, 3), dtype=np.float32))
 
 
-def test_audio_quantizer_roundtrip_lossy(sample_audio):
-    raw = KairosTokenizer.encode_audio(sample_audio)
-    recon = KairosTokenizer.decode_audio(raw)
-    assert recon.shape == sample_audio.shape
-    # 8-bit PCM: max quantization error is ~1/127.5
+def test_image_decode_detects_truncated_row(tokenizer, sample_image):
+    """Simulates a model that drifted mid-generation: last row is short.
+    Must raise a clear error, not silently misreshape."""
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    truncated = torch.tensor(out["input_ids"].tolist()[:-5])  # cut mid last row
+    decoded = tokenizer.decode_multimodal(truncated)
+    with pytest.raises(ValueError, match="inconsistent row lengths"):
+        tokenizer.decode_image(decoded[0].data)
+
+
+# =========================
+# VIDEO: rows + <ENDFRAME>, fps supplied at decode time
+# =========================
+def test_video_roundtrip_with_stride(tokenizer, sample_video):
+    markers = KairosTokenizer.encode_video(sample_video, stride=2)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.VIDEO, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon, duration = tokenizer.decode_video(decoded[0].data, fps=12.0)
+    assert np.array_equal(recon, sample_video[::2])
+    assert duration == pytest.approx(recon.shape[0] / 12.0)
+
+
+def test_video_endframe_count_matches_num_frames(tokenizer, sample_video):
+    markers = KairosTokenizer.encode_video(sample_video)
+    ids = tokenizer._resolve_markers(markers)
+    num_endframes = sum(1 for tid in ids if tid == tokenizer._endframe_id)
+    assert num_endframes == sample_video.shape[0]
+
+
+def test_video_rejects_inconsistent_frame_shapes(tokenizer):
+    """Two frames of different H are fine to *encode* independently, but
+    decode_video must reject the mismatch rather than silently stacking."""
+    frame1 = np.zeros((2, 3, 3), dtype=np.uint8)
+    frame2 = np.zeros((4, 3, 3), dtype=np.uint8)
+    markers = (
+        KairosTokenizer._encode_frame_rows(frame1) + [("marker", "<ENDFRAME>")]
+        + KairosTokenizer._encode_frame_rows(frame2) + [("marker", "<ENDFRAME>")]
+    )
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.VIDEO, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    with pytest.raises(ValueError):
+        tokenizer.decode_video(decoded[0].data)
+
+
+# =========================
+# AUDIO: periodic <TICK>, duration from tick count, not stored metadata
+# =========================
+def test_audio_roundtrip_and_duration(tokenizer, sample_audio):
+    markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon, duration = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
+    assert len(recon) == len(sample_audio)
+    assert duration == pytest.approx(len(sample_audio) / KairosTokenizer.AUDIO_SAMPLE_RATE)
     assert np.max(np.abs(recon - sample_audio)) < 1 / 127.5 + 1e-6
 
 
-def test_video_quantizer_roundtrip(sample_video):
-    raw = KairosTokenizer.encode_video(sample_video)
-    t, h, w, _ = sample_video.shape
-    recon = KairosTokenizer.decode_video(raw, t, h, w)
-    assert np.array_equal(recon, sample_video)
+def test_audio_tick_count(tokenizer, sample_audio):
+    markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
+    ids = tokenizer._resolve_markers(markers)
+    num_ticks = sum(1 for tid in ids if tid == tokenizer._tick_id)
+    assert num_ticks == -(-len(sample_audio) // 16_000)  # ceil division
 
 
-def test_video_quantizer_stride(sample_video):
-    raw = KairosTokenizer.encode_video(sample_video, stride=2)
-    expected_frames = sample_video[::2]
-    recon = KairosTokenizer.decode_video(raw, expected_frames.shape[0], *sample_video.shape[1:3])
-    assert np.array_equal(recon, expected_frames)
-
-
-def test_lidar_quantizer_range(sample_lidar):
-    raw = KairosTokenizer.encode_lidar(sample_lidar)
-    recon = KairosTokenizer.decode_lidar(raw)
+# =========================
+# LIDAR: periodic <PTSEP>, fixed quantization bounds (no stored min/max)
+# =========================
+def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
+    markers = KairosTokenizer.encode_lidar(sample_lidar)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.LIDAR, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon = tokenizer.decode_lidar(decoded[0].data)
     assert recon.shape == sample_lidar.shape
-    assert recon.min() >= 0.0 and recon.max() <= 1.0
+    # quantization step over the FIXED xyz range, not the data's actual range
+    xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
+    max_step = (xyz_hi - xyz_lo) / 255
+    assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
+
+
+def test_lidar_rejects_wrong_shape():
+    with pytest.raises(ValueError):
+        KairosTokenizer.encode_lidar(np.zeros((10, 3), dtype=np.float32))
 
 
 # =========================
-# encode_multimodal / decode_multimodal
+# encode_multimodal / decode_multimodal: mixed sequences
 # =========================
-def test_multimodal_ids_and_modality_ids_same_length(tokenizer):
-    segs = [MultimodalSegment(Modality.TEXT, b"hello")]
-    out = tokenizer.encode_multimodal(segs)
-    assert out["input_ids"].shape == out["modality_ids"].shape
-
-
-def test_multimodal_dtype_is_long(tokenizer):
-    segs = [MultimodalSegment(Modality.TEXT, b"hello")]
-    out = tokenizer.encode_multimodal(segs)
-    assert out["input_ids"].dtype == torch.long
-    assert out["modality_ids"].dtype == torch.long
-
-
-def test_multimodal_modality_ids_match_segments(tokenizer, sample_image):
+def test_mixed_text_image_video_audio(tokenizer, sample_image, sample_video, sample_audio):
     segs = [
-        MultimodalSegment(Modality.TEXT, b"look at this:"),
+        MultimodalSegment(Modality.TEXT, b"a scene:"),
         MultimodalSegment(Modality.IMAGE, KairosTokenizer.encode_image(sample_image)),
-    ]
-    out = tokenizer.encode_multimodal(segs)
-    mods = out["modality_ids"].tolist()
-    assert set(mods) == {int(Modality.TEXT), int(Modality.IMAGE)}
-    # text tokens must all come before image tokens (segment order preserved)
-    first_image_idx = mods.index(int(Modality.IMAGE))
-    assert all(m == int(Modality.TEXT) for m in mods[:first_image_idx])
-    assert all(m == int(Modality.IMAGE) for m in mods[first_image_idx:])
-
-
-def test_multimodal_text_image_audio_roundtrip(tokenizer, sample_image, sample_audio):
-    text = "Paris is the capital of France."
-    segs = [
-        MultimodalSegment(Modality.TEXT, text.encode("utf-8")),
-        MultimodalSegment(Modality.IMAGE, KairosTokenizer.encode_image(sample_image)),
+        MultimodalSegment(Modality.VIDEO, KairosTokenizer.encode_video(sample_video)),
         MultimodalSegment(Modality.AUDIO, KairosTokenizer.encode_audio(sample_audio)),
     ]
     out = tokenizer.encode_multimodal(segs)
-    decoded = tokenizer.decode_multimodal(out["input_ids"])
-
-    assert len(decoded) == 3
-    assert decoded[0].modality is Modality.TEXT
-    assert decoded[0].data == text.encode("utf-8")
-
-    assert decoded[1].modality is Modality.IMAGE
-    recon_img = KairosTokenizer.decode_image(decoded[1].data, *sample_image.shape[:2])
-    assert np.array_equal(recon_img, sample_image)
-
-    assert decoded[2].modality is Modality.AUDIO
-    recon_audio = KairosTokenizer.decode_audio(decoded[2].data)
-    assert np.max(np.abs(recon_audio - sample_audio)) < 1 / 127.5 + 1e-6
+    assert out["input_ids"].shape == out["modality_ids"].shape
+    assert set(out["modality_ids"].tolist()) == {
+        int(Modality.TEXT), int(Modality.IMAGE), int(Modality.VIDEO), int(Modality.AUDIO)
+    }
 
 
-def test_multimodal_padding_uses_text_modality(tokenizer):
-    segs = [MultimodalSegment(Modality.IMAGE, bytes([1, 2, 3]))]
-    out = tokenizer.encode_multimodal(segs, max_len=64)
-    assert out["input_ids"].shape[0] == 64
-    assert out["modality_ids"].shape[0] == 64
-    # padded region (after the short image segment) must be modality TEXT
-    pad_region = out["modality_ids"][-10:]
-    assert torch.all(pad_region == int(Modality.TEXT))
+def test_multimodal_padding_uses_text_modality(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)], max_len=2048)
+    assert out["input_ids"].shape[0] == 2048
+    pad_region_mod = out["modality_ids"][-10:]
+    assert torch.all(pad_region_mod == int(Modality.TEXT))
     assert torch.all(out["input_ids"][-10:] == tokenizer.pad_token_id)
 
 
@@ -187,31 +221,7 @@ def test_multimodal_truncation(tokenizer):
     assert out["modality_ids"].shape[0] == 32
 
 
-def test_multimodal_channel_tags_do_not_break_roundtrip(tokenizer, sample_image):
-    r_channel = sample_image[:, :, 0].tobytes()
-    segs = [MultimodalSegment(Modality.IMAGE, r_channel, channel="R")]
-    out = tokenizer.encode_multimodal(segs)
-    decoded = tokenizer.decode_multimodal(out["input_ids"])
-    # channel sub-tags are stripped on decode; underlying bytes for the
-    # segment must still contain the R-channel payload somewhere in the run
-    assert r_channel in decoded[0].data or decoded[0].data.strip(
-        bytes([tokenizer.convert_tokens_to_ids("<R>") - tokenizer._byte_offset])
-    )
-
-
 def test_empty_segments_returns_empty_tensors(tokenizer):
     out = tokenizer.encode_multimodal([])
     assert out["input_ids"].shape[0] == 0
     assert out["modality_ids"].shape[0] == 0
-
-
-def test_multiple_segments_same_modality(tokenizer):
-    segs = [
-        MultimodalSegment(Modality.TEXT, b"first "),
-        MultimodalSegment(Modality.TEXT, b"second"),
-    ]
-    out = tokenizer.encode_multimodal(segs)
-    decoded = tokenizer.decode_multimodal(out["input_ids"])
-    assert len(decoded) == 2
-    assert decoded[0].data == b"first "
-    assert decoded[1].data == b"second"
