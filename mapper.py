@@ -6,36 +6,36 @@ Production-ready with strict .gitignore support via pathspec.
 Usage:
 python mapper.py --to-json
 python mapper.py --from-json project_structure.json
+
+Exclude directories:
+python mapper.py --to-json . project_structure.json --exclude scripts
+python mapper.py --to-json . project_structure.json --exclude scripts tests docs
 """
 
-import os
-import json
 import argparse
+import json
+import os
+
 import pathspec
 
-# --- Default Configurations ---
 DEFAULT_OUTPUT = "project_structure.json"
 DEFAULT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
-# --- Utility Functions ---
 def read_file_content(file_path: str) -> str:
-    """Reads the content of a file."""
     with open(file_path, "r", encoding="utf-8") as f:
         return f.read()
 
 
 def write_file(file_path: str, content: str) -> None:
-    """Writes a file, creating parent directories if necessary."""
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"📄 File created: {file_path}")
 
 
-# --- Gitignore Logic ---
 def get_gitignore_spec(root_dir: str) -> pathspec.PathSpec:
-    """Loads .gitignore patterns and returns a PathSpec object for strict matching."""
+    """Strict .gitignore matching, plus always-ignored defaults."""
     patterns = [
         ".git/",
         "__pycache__/",
@@ -45,6 +45,7 @@ def get_gitignore_spec(root_dir: str) -> pathspec.PathSpec:
         "node_modules/",
         "*.svg",  # promote .puml, .tikz or mermaid
     ]
+
     gitignore_path = os.path.join(root_dir, ".gitignore")
 
     if os.path.exists(gitignore_path):
@@ -54,9 +55,7 @@ def get_gitignore_spec(root_dir: str) -> pathspec.PathSpec:
     return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 
 
-# --- JSON → Code ---
 def generate_code_from_json(json_path: str) -> None:
-    """Generates files from a JSON structure."""
     if not os.path.exists(json_path):
         print(f"❌ Error: {json_path} not found.")
         return
@@ -70,53 +69,51 @@ def generate_code_from_json(json_path: str) -> None:
     print("✅ Code generated successfully!")
 
 
-# --- Code → JSON ---
-def generate_json_from_code(root_dir: str, output_json_path: str) -> None:
-    """
-    Generates a JSON describing the structure of a code directory,
-    respecting .gitignore strictly and excluding binary files.
-    """
+def generate_json_from_code(
+    root_dir: str,
+    output_json_path: str,
+    excluded_dirs: list[str] | None = None,
+) -> None:
+    """Serialize a code directory into JSON, respecting .gitignore and skipping binaries."""
     files = []
     spec = get_gitignore_spec(root_dir)
-
-    # Files to always exclude regardless of .gitignore
+    excluded_dirs = set(excluded_dirs or [])
     internal_excludes = {".gitignore", "LICENSE", os.path.basename(output_json_path)}
 
     print(f"🔍 Scanning: {root_dir}")
     print(f"📁 Target: {output_json_path}")
+    if excluded_dirs:
+        print(f"🚫 Excluded dirs: {', '.join(sorted(excluded_dirs))}")
 
     for dirpath, dirnames, filenames in os.walk(root_dir):
         relative_dir = os.path.relpath(dirpath, root_dir)
-
-        # Prune ignored directories to optimize scan speed
-        if relative_dir != ".":
-            if spec.match_file(relative_dir):
-                dirnames[:] = []
-                continue
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if os.path.relpath(os.path.join(dirpath, d), root_dir).split(os.sep)[0] not in excluded_dirs
+        ]
+        if relative_dir != "." and spec.match_file(relative_dir):
+            dirnames[:] = []
+            continue
 
         for filename in filenames:
             if filename in internal_excludes:
                 continue
-
             file_path = os.path.join(dirpath, filename)
             relative_path = os.path.relpath(file_path, root_dir)
-
             if spec.match_file(relative_path):
                 continue
-
             try:
-                # Binary check: try reading as text
                 with open(file_path, "tr", encoding="utf-8") as check_file:
-                    check_file.read(1024)
-
-                content = read_file_content(file_path)
-                files.append({"path": relative_path, "content": content})
+                    check_file.read(1024)  # binary check
+                files.append({"path": relative_path, "content": read_file_content(file_path)})
             except (UnicodeDecodeError, PermissionError):
                 continue
             except OSError as e:
                 print(f"⚠️ Error reading {relative_path}: {e}")
 
     project_data = {"files": files}
+
     os.makedirs(os.path.dirname(os.path.abspath(output_json_path)), exist_ok=True)
 
     with open(output_json_path, "w", encoding="utf-8") as f:
@@ -125,12 +122,11 @@ def generate_json_from_code(root_dir: str, output_json_path: str) -> None:
     print(f"✅ JSON generated successfully with {len(files)} files.")
 
 
-# --- CLI ---
 def main():
     parser = argparse.ArgumentParser(description="Code Mapper: Sync code and JSON.")
     parser.add_argument("--from-json", nargs="?", const=DEFAULT_OUTPUT, help="JSON to Code.")
     parser.add_argument("--to-json", nargs="*", help="Code to JSON [ROOT] [OUTPUT].")
-
+    parser.add_argument("--exclude", nargs="*", default=[], help="Directories to exclude (e.g. scripts tests docs).")
     args = parser.parse_args()
 
     if args.from_json:
@@ -138,7 +134,7 @@ def main():
     elif args.to_json is not None:
         root = args.to_json[0] if len(args.to_json) > 0 else DEFAULT_ROOT
         output = args.to_json[1] if len(args.to_json) > 1 else DEFAULT_OUTPUT
-        generate_json_from_code(root, output)
+        generate_json_from_code(root, output, excluded_dirs=args.exclude)
     else:
         parser.print_help()
 

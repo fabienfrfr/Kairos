@@ -7,6 +7,7 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 
@@ -23,7 +24,6 @@ def _(mo):
 
 @app.cell
 def _():
-    import os
     import math
     from pathlib import Path
 
@@ -135,11 +135,13 @@ def _(mo):
     cfg_experts_per_tok = mo.ui.slider(1, 8, step=1, value=1, label="Routed experts active per token")
     cfg_shared_experts = mo.ui.slider(0, 4, step=1, value=1, label="Shared experts (always active)")
 
-    mo.vstack([
-        mo.hstack([cfg_d_model, cfg_n_heads, cfg_n_layers]),
-        mo.hstack([cfg_window, cfg_stride]),
-        mo.hstack([cfg_local_experts, cfg_experts_per_tok, cfg_shared_experts]),
-    ])
+    mo.vstack(
+        [
+            mo.hstack([cfg_d_model, cfg_n_heads, cfg_n_layers]),
+            mo.hstack([cfg_window, cfg_stride]),
+            mo.hstack([cfg_local_experts, cfg_experts_per_tok, cfg_shared_experts]),
+        ]
+    )
     return (
         cfg_d_model,
         cfg_experts_per_tok,
@@ -268,11 +270,13 @@ def _(mo):
     train_output_dir = mo.ui.text(value="checkpoints/kairos", label="Output directory")
     train_run_name = mo.ui.text(value="run_01", label="Run name (TensorBoard)")
 
-    mo.vstack([
-        mo.hstack([train_lr, train_batch, train_epochs]),
-        mo.hstack([train_max_len, train_save_steps, train_log_steps]),
-        mo.hstack([train_output_dir, train_run_name]),
-    ])
+    mo.vstack(
+        [
+            mo.hstack([train_lr, train_batch, train_epochs]),
+            mo.hstack([train_max_len, train_save_steps, train_log_steps]),
+            mo.hstack([train_output_dir, train_run_name]),
+        ]
+    )
     return (
         train_batch,
         train_epochs,
@@ -323,10 +327,14 @@ def _(dataset_source, mo):
 
 @app.cell
 def _(dataset_source, mo):
-    multimodal_path = mo.ui.text(
-        value="data/keep-it-simple-multimodal.pt",
-        label="keep-it-simple-multimodal .pt path (from build_keep_it_simple_multimodal.py)",
-    ) if dataset_source.value.startswith("keep-it-simple + ") else None
+    multimodal_path = (
+        mo.ui.text(
+            value="data/keep-it-simple-multimodal.pt",
+            label="keep-it-simple-multimodal .pt path (from build_keep_it_simple_multimodal.py)",
+        )
+        if dataset_source.value.startswith("keep-it-simple + ")
+        else None
+    )
     multimodal_path if multimodal_path is not None else mo.md("")
     return (multimodal_path,)
 
@@ -349,11 +357,13 @@ def _(
 
         elif dataset_source.value == "keep-it-simple (text only)":
             from datasets import load_dataset
+
             text_rows = load_dataset("ffurfaro/keep-it-simple", split="train")["text"]
             dataset = KairosPretrainingDataset(texts=text_rows, tokenizer=tokenizer, max_len=train_max_len.value)
 
         else:
             from datasets import load_dataset
+
             text_rows = load_dataset("ffurfaro/keep-it-simple", split="train")["text"]
             text_ds = KairosPretrainingDataset(texts=text_rows, tokenizer=tokenizer, max_len=train_max_len.value)
             multimodal_ds = KairosPretrainingDataset(
@@ -362,7 +372,9 @@ def _(
             dataset = ConcatDataset([text_ds, multimodal_ds])
 
     mo.callout(
-        mo.md(f"**Samples:** `{len(dataset)}`  |  **Max len:** `{train_max_len.value}`  |  **Source:** `{dataset_source.value}`"),
+        mo.md(
+            f"**Samples:** `{len(dataset)}`  |  **Max len:** `{train_max_len.value}`  |  **Source:** `{dataset_source.value}`"
+        ),
         kind="success",
     )
     return (dataset,)
@@ -417,7 +429,9 @@ def _(
     loader = DataLoader(dataset, batch_size=train_batch.value, shuffle=True, pin_memory=(device == "cuda"))
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_lr.value)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=train_epochs.value * len(loader), eta_min=train_lr.value * 0.1,
+        optimizer,
+        T_max=train_epochs.value * len(loader),
+        eta_min=train_lr.value * 0.1,
     )
 
     global_step = 0
@@ -450,15 +464,25 @@ def _(
                     lr_now = scheduler.get_last_lr()[0]
                     writer.add_scalar("train/loss", loss_val, global_step)
                     writer.add_scalar("train/lr", lr_now, global_step)
-                    grad_norm = math.sqrt(sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None))
+                    grad_norm = math.sqrt(
+                        sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None)
+                    )
                     writer.add_scalar("train/grad_norm", grad_norm, global_step)
-                    log_rows.append({"step": global_step, "epoch": epoch, "loss": f"{loss_val:.4f}", "lr": f"{lr_now:.2e}"})
+                    log_rows.append(
+                        {"step": global_step, "epoch": epoch, "loss": f"{loss_val:.4f}", "lr": f"{lr_now:.2e}"}
+                    )
 
                 if global_step % train_save_steps.value == 0:
                     ckpt_path = ckpt_dir / f"step_{global_step:06d}.pt"
                     torch.save(
-                        {"step": global_step, "epoch": epoch, "model_state": model.state_dict(),
-                         "optimizer_state": optimizer.state_dict(), "loss": loss_val, "config": config.to_dict()},
+                        {
+                            "step": global_step,
+                            "epoch": epoch,
+                            "model_state": model.state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "loss": loss_val,
+                            "config": config.to_dict(),
+                        },
                         ckpt_path,
                     )
 
@@ -469,8 +493,13 @@ def _(
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 torch.save(
-                    {"step": global_step, "epoch": epoch, "model_state": model.state_dict(),
-                     "loss": best_loss, "config": config.to_dict()},
+                    {
+                        "step": global_step,
+                        "epoch": epoch,
+                        "model_state": model.state_dict(),
+                        "loss": best_loss,
+                        "config": config.to_dict(),
+                    },
                     ckpt_dir / "best.pt",
                 )
 

@@ -1,22 +1,21 @@
-import pytest
-import torch
 import random
 
+import pytest
+import torch
+
+from kairos.dataset import KairosPretrainingDataset, KairosRLDataset, KairosSFTDataset
 from kairos.modeling import (
-    KairosCache,
-    KairosMultiCache,
-    KairosConfig,
     DiffusionBlock,
-    KairosDiffusionBackbone,
-    KairosEmbedding,
-    KairosDiffusionLLM,
     KairosAttnRes,
+    KairosCache,
+    KairosConfig,
+    KairosDiffusionBackbone,
+    KairosDiffusionLLM,
+    KairosEmbedding,
+    KairosMultiCache,
     PyramidalConvCodec,
 )
-
 from kairos.tokenizer import KairosTokenizer
-from kairos.dataset import KairosPretrainingDataset, KairosRLDataset, KairosSFTDataset
-
 from kairos.trainer import KairosDiffusionTrainer
 
 
@@ -120,6 +119,73 @@ def test_aggregator_weights_sum():
     logits = torch.einsum("d,lbtd->lbt", agg.w, K)
     weights = torch.softmax(logits, dim=0)
     assert torch.allclose(weights.sum(0), torch.ones_like(weights[0]), atol=1e-5)
+
+
+def test_backbone_block_size_default_is_one():
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=4, vocab_size=259, num_modalities=2)
+    assert cfg.attnres_block_size == 1
+
+
+def test_backbone_block_size_one_matches_original_graph():
+    # S=1 must reproduce the pre-blocking AttnRes graph term for term.
+    torch.manual_seed(0)
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=4, vocab_size=259, num_modalities=2, attnres_block_size=1)
+    torch.manual_seed(42)
+    model = KairosDiffusionBackbone(cfg)
+    x = torch.randn(2, 6, 16)
+
+    # Reference: the original states=[x]; h=agg(states); x=layer(h); states.append(x) graph.
+    states = [x]
+    xr = x
+    for layer in model.layers:
+        h = model.aggregator(states)
+        xr = layer(h)
+        states.append(xr)
+    expected = model.norm(xr)
+
+    out = model(x)
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_backbone_block_size_greater_than_one_shape():
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=6, vocab_size=259, num_modalities=2, attnres_block_size=3)
+    model = KairosDiffusionBackbone(cfg)
+    x = torch.randn(2, 8, 32)
+    out = model(x)
+    assert out.shape == x.shape
+    assert not torch.isnan(out).any()
+
+
+def test_backbone_block_size_changes_output():
+    torch.manual_seed(0)
+    cfg1 = KairosConfig(d_model=32, n_heads=4, n_layers=6, vocab_size=259, num_modalities=2, attnres_block_size=1)
+    cfg3 = KairosConfig(d_model=32, n_heads=4, n_layers=6, vocab_size=259, num_modalities=2, attnres_block_size=3)
+    torch.manual_seed(42)
+    model1 = KairosDiffusionBackbone(cfg1)
+    torch.manual_seed(42)
+    model3 = KairosDiffusionBackbone(cfg3)
+    x = torch.randn(2, 8, 32)
+    assert not torch.allclose(model1(x), model3(x), atol=1e-5)
+
+
+def test_backbone_block_size_backward():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=5, vocab_size=259, num_modalities=2, attnres_block_size=2)
+    model = KairosDiffusionBackbone(cfg)
+    x = torch.randn(2, 6, 16, requires_grad=True)
+    out = model(x)
+    out.mean().backward()
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+
+def test_backbone_block_size_uneven_layers_no_nan():
+    # n_layers not a multiple of attnres_block_size => trailing partial block.
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=5, vocab_size=259, num_modalities=2, attnres_block_size=3)
+    model = KairosDiffusionBackbone(cfg)
+    x = torch.randn(1, 4, 16)
+    out = model(x)
+    assert out.shape == x.shape
+    assert not torch.isnan(out).any()
 
 
 def test_token_embedding():
@@ -226,7 +292,7 @@ def test_dataset_with_wikitext(tokenizer):
 
     try:
         ds_raw = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train[:1%]")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any network/HF-hub failure should skip, not fail the suite
         pytest.skip(f"Dataset download failed: {e}")
     texts = ds_raw["text"]
     ds = KairosPretrainingDataset(texts, tokenizer, max_len=32)

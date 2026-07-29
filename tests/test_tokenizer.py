@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from kairos.tokenizer import KairosTokenizer, MultimodalSegment, Modality
+from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 
 # =========================
@@ -66,8 +66,20 @@ def test_plain_text_encode_decode_unchanged(tokenizer):
 
 
 def test_structural_and_modality_tokens_present(tokenizer):
-    for tag in ("<IMG>", "</IMG>", "<VIDEO>", "</VIDEO>", "<AUDIO>", "</AUDIO>",
-                "<LIDAR>", "</LIDAR>", "<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"):
+    for tag in (
+        "<IMG>",
+        "</IMG>",
+        "<VIDEO>",
+        "</VIDEO>",
+        "<AUDIO>",
+        "</AUDIO>",
+        "<LIDAR>",
+        "</LIDAR>",
+        "<ENDLINE>",
+        "<ENDFRAME>",
+        "<TICK>",
+        "<PTSEP>",
+    ):
         tid = tokenizer.convert_tokens_to_ids(tag)
         assert tid is not None and tid != tokenizer.unk_token_id, f"{tag} missing from vocab"
 
@@ -138,8 +150,10 @@ def test_video_rejects_inconsistent_frame_shapes(tokenizer):
     frame1 = np.zeros((2, 3, 3), dtype=np.uint8)
     frame2 = np.zeros((4, 3, 3), dtype=np.uint8)
     markers = (
-        KairosTokenizer._encode_frame_rows(frame1) + [("marker", "<ENDFRAME>")]
-        + KairosTokenizer._encode_frame_rows(frame2) + [("marker", "<ENDFRAME>")]
+        KairosTokenizer._encode_frame_rows(frame1)
+        + [("marker", "<ENDFRAME>")]
+        + KairosTokenizer._encode_frame_rows(frame2)
+        + [("marker", "<ENDFRAME>")]
     )
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.VIDEO, markers)])
     decoded = tokenizer.decode_multimodal(out["input_ids"])
@@ -200,7 +214,10 @@ def test_mixed_text_image_video_audio(tokenizer, sample_image, sample_video, sam
     out = tokenizer.encode_multimodal(segs)
     assert out["input_ids"].shape == out["modality_ids"].shape
     assert set(out["modality_ids"].tolist()) == {
-        int(Modality.TEXT), int(Modality.IMAGE), int(Modality.VIDEO), int(Modality.AUDIO)
+        int(Modality.TEXT),
+        int(Modality.IMAGE),
+        int(Modality.VIDEO),
+        int(Modality.AUDIO),
     }
 
 
@@ -225,3 +242,75 @@ def test_empty_segments_returns_empty_tensors(tokenizer):
     out = tokenizer.encode_multimodal([])
     assert out["input_ids"].shape[0] == 0
     assert out["modality_ids"].shape[0] == 0
+
+
+def test_image_decode_rejects_stream_with_no_endline(tokenizer):
+    with pytest.raises(ValueError, match="no <ENDLINE> markers"):
+        tokenizer.decode_image([])
+
+
+def test_image_decode_rejects_width_not_divisible_by_channels(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image)
+    ids = tokenizer._resolve_markers(markers)
+    with pytest.raises(ValueError, match="not divisible by channels"):
+        tokenizer.decode_image(ids, channels=5)
+
+
+def test_encode_video_rejects_bad_dtype():
+    frames = np.zeros((2, 4, 4, 3), dtype=np.float32)
+    with pytest.raises(ValueError, match="uint8 array"):
+        KairosTokenizer.encode_video(frames)
+
+
+def test_video_decode_rejects_stream_with_no_endframe(tokenizer):
+    with pytest.raises(ValueError, match="no <ENDFRAME> markers"):
+        tokenizer.decode_video([])
+
+
+def test_video_decode_keeps_trailing_frame_without_final_endframe_marker(tokenizer, sample_video):
+    markers = KairosTokenizer.encode_video(sample_video)
+    ids = tokenizer._resolve_markers(markers)
+    ids_no_trailing_marker = ids[:-1]  # drop the last <ENDFRAME>
+    frames, _ = tokenizer.decode_video(ids_no_trailing_marker)
+    assert frames.shape[0] == sample_video.shape[0]
+
+
+def test_encode_audio_rejects_bad_dtype():
+    waveform = np.zeros(100, dtype=np.float64)
+    with pytest.raises(ValueError, match="float32 waveform"):
+        KairosTokenizer.encode_audio(waveform)
+
+
+def test_audio_decode_keeps_trailing_samples_without_final_tick_marker(tokenizer, sample_audio):
+    markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=4000)
+    ids = tokenizer._resolve_markers(markers)
+    ids_no_trailing_marker = ids[:-1]  # drop the last <TICK>
+    waveform, _ = tokenizer.decode_audio(ids_no_trailing_marker)
+    assert waveform.shape[0] == sample_audio.shape[0]
+
+
+def test_decode_lidar_rejects_payload_not_multiple_of_four(tokenizer):
+    ids = tokenizer._bytes_to_ids(b"\x00\x01\x02")  # 3 bytes, not a multiple of 4
+    with pytest.raises(ValueError, match="not a multiple of 4"):
+        tokenizer.decode_lidar(ids)
+
+
+def test_encode_multimodal_wraps_segment_in_channel_tags(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image)
+    seg = MultimodalSegment(Modality.IMAGE, markers, channel="R")
+    out = tokenizer.encode_multimodal([seg])
+    tokens = tokenizer.convert_ids_to_tokens(out["input_ids"].tolist())
+    assert tokens[0] == "<IMG>"
+    assert tokens[1] == "<R>"
+    assert "</R>" in tokens
+    assert tokens[-1] == "</IMG>"
+
+
+def test_decode_multimodal_skips_unrecognized_leading_tokens(tokenizer):
+    stray_id = tokenizer.convert_tokens_to_ids("<SEP>")
+    text_out = tokenizer.encode_multimodal([MultimodalSegment(Modality.TEXT, b"hi")])
+    ids = [stray_id, stray_id] + text_out["input_ids"].tolist()
+    segments = tokenizer.decode_multimodal(torch.tensor(ids))
+    assert len(segments) == 1
+    assert segments[0].modality is Modality.TEXT
+    assert segments[0].data == b"hi"

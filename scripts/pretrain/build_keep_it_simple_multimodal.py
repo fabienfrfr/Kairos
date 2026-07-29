@@ -33,7 +33,7 @@ and consistent so KairosPretrainingDataset._segments_for can dispatch on
 import numpy as np
 
 
-N_PER_SOURCE = 60          # ultra-minimal: 6 sources x 60 ~ 360 examples total
+N_PER_SOURCE = 60  # ultra-minimal: 6 sources x 60 ~ 360 examples total
 IMAGE_SIZE = 32
 VIDEO_FRAMES = 6
 VIDEO_SIZE = 16
@@ -75,10 +75,14 @@ def build_audio_caption():
         max_samples = int(AUDIO_SECONDS * AUDIO_SAMPLE_RATE)
         arr = arr[:max_samples]
         arr = np.clip(arr, -1.0, 1.0)
-        out.append({
-            "kind": "audio_caption", "audio": arr,
-            "sample_rate": AUDIO_SAMPLE_RATE, "caption": str(caption),
-        })
+        out.append(
+            {
+                "kind": "audio_caption",
+                "audio": arr,
+                "sample_rate": AUDIO_SAMPLE_RATE,
+                "caption": str(caption),
+            }
+        )
     return out
 
 
@@ -157,13 +161,15 @@ def build_control():
         arr = np.asarray(audio["array"], dtype=np.float32)
         if arr.ndim != 2 or arr.shape[1] < 2:
             continue
-        out.append({
-            "kind": "control",
-            "action": np.clip(arr[:, 0], -1.0, 1.0).astype(np.float32),
-            "state": np.clip(arr[:, 1], -1.0, 1.0).astype(np.float32),
-            "sample_rate": audio["sampling_rate"],
-            "context": str(row.get("text", "")),
-        })
+        out.append(
+            {
+                "kind": "control",
+                "action": np.clip(arr[:, 0], -1.0, 1.0).astype(np.float32),
+                "state": np.clip(arr[:, 1], -1.0, 1.0).astype(np.float32),
+                "sample_rate": audio["sampling_rate"],
+                "context": str(row.get("text", "")),
+            }
+        )
     return out
 
 

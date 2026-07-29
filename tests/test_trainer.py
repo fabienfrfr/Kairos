@@ -2,9 +2,9 @@ import numpy as np
 import pytest
 import torch
 
-from kairos.modeling import KairosConfig, KairosDiffusionLLM
 from kairos.dataset import KairosPretrainingDataset
-from kairos.tokenizer import KairosTokenizer, Modality
+from kairos.modeling import KairosConfig, KairosDiffusionLLM
+from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import KairosDiffusionTrainer
 
 
@@ -16,15 +16,23 @@ def tokenizer():
 @pytest.fixture
 def config(tokenizer):
     return KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=len(tokenizer), num_modalities=8,
-        stride=1, num_scales=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=len(tokenizer),
+        num_modalities=8,
+        stride=1,
+        num_scales=2,
         # kept in sync: some transformers versions' DeepseekV3 MoE backend
         # reads n_routed_experts, others read num_local_experts — set both
         # to the same value or the router's top-k index space and the
         # experts weight tensor size can disagree ("Class values must be
         # smaller than num_classes").
-        num_local_experts=7, n_routed_experts=7,
-        num_experts_per_tok=1, n_shared_experts=1, use_moe=True,
+        num_local_experts=7,
+        n_routed_experts=7,
+        num_experts_per_tok=1,
+        n_shared_experts=1,
+        use_moe=True,
     )
 
 
@@ -36,7 +44,9 @@ def model(config, tokenizer):
 
 @pytest.fixture
 def dense_config(tokenizer):
-    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=len(tokenizer), num_modalities=8, stride=1, num_scales=2)
+    return KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=len(tokenizer), num_modalities=8, stride=1, num_scales=2
+    )
 
 
 @pytest.fixture
@@ -105,7 +115,7 @@ def test_compute_loss_never_noises_padding(model, tokenizer):
         "mask": ds[0]["mask"].unsqueeze(0),
         "prompt_len": torch.zeros(1, dtype=torch.long),
     }
-    pad_positions = (batch["mask"] == 0)
+    pad_positions = batch["mask"] == 0
     assert pad_positions.any(), "fixture must contain padding for this test to be meaningful"
 
     x0_before = batch["input_ids"].clone()
@@ -133,6 +143,41 @@ def test_compute_loss_backward_compatible_without_modality_or_mask(tokenizer):
         "input_ids": torch.tensor([ids], dtype=torch.long),
         "prompt_len": torch.zeros(1, dtype=torch.long),
     }
+    trainer = KairosDiffusionTrainer(model=dense_model)
+    loss = trainer.compute_loss(dense_model, batch)
+    assert torch.is_tensor(loss) and not torch.isnan(loss)
+
+
+def test_compute_loss_forces_one_position_when_noise_mask_is_empty(dense_model, tokenizer, monkeypatch):
+    """When sampled p is so low that no token gets noised, compute_loss must
+    still score exactly one non-padding position per row instead of handing
+    cross_entropy an empty tensor."""
+    ids = tokenizer.encode("hello world", add_special_tokens=False)
+    pad_len = 16 - len(ids)
+    ids = ids + [tokenizer.pad_token_id] * pad_len
+    batch = {
+        "input_ids": torch.tensor([ids], dtype=torch.long),
+        "mask": torch.tensor([[1] * (16 - pad_len) + [0] * pad_len], dtype=torch.long),
+        "prompt_len": torch.zeros(1, dtype=torch.long),
+    }
+
+    monkeypatch.setattr(torch, "rand", lambda *a, **k: torch.ones(*a, **k))
+    trainer = KairosDiffusionTrainer(model=dense_model)
+    loss = trainer.compute_loss(dense_model, batch)
+    assert torch.is_tensor(loss) and not torch.isnan(loss)
+
+
+def test_compute_loss_forces_one_position_without_pad_mask(dense_model, tokenizer, monkeypatch):
+    """Same fallback as above, but for SFT/DPO/RL-style batches with no `mask`
+    key at all — `eligible` must fall back to torch.ones_like(noise_mask)."""
+    ids = tokenizer.encode("hello world", add_special_tokens=False)
+    ids = ids + [tokenizer.pad_token_id] * (16 - len(ids))
+    batch = {
+        "input_ids": torch.tensor([ids], dtype=torch.long),
+        "prompt_len": torch.zeros(1, dtype=torch.long),
+    }
+
+    monkeypatch.setattr(torch, "rand", lambda *a, **k: torch.ones(*a, **k))
     trainer = KairosDiffusionTrainer(model=dense_model)
     loss = trainer.compute_loss(dense_model, batch)
     assert torch.is_tensor(loss) and not torch.isnan(loss)

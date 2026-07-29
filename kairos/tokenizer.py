@@ -2,7 +2,7 @@
 kairos/tokenizer.py — byte-level multimodal tokenizer built on ByT5Tokenizer.
 i
 Structure is expressed with periodic LOCAL markers (PixelBytes approach,
-Furfaro 2024, arxiv.org/html/2410.01820v2) 
+Furfaro 2024, arxiv.org/html/2410.01820v2)
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from transformers.models.byt5.tokenization_byt5 import ByT5Tokenizer
 
 class Modality(enum.IntEnum):
     """Must match KairosConfig.text_modality_id / modality_scales ordering."""
+
     TEXT = 0
     IMAGE = 1
     VIDEO = 2
@@ -40,8 +41,11 @@ _MODALITY_TAGS: dict[Modality, tuple[str, str]] = {
 
 # sub-channel tags, e.g. RGB planes or stereo audio
 _CHANNEL_TAGS: dict[str, tuple[str, str]] = {
-    "R": ("<R>", "</R>"), "G": ("<G>", "</G>"), "B": ("<B>", "</B>"),
-    "LEFT": ("<LEFT>", "</LEFT>"), "RIGHT": ("<RIGHT>", "</RIGHT>"),
+    "R": ("<R>", "</R>"),
+    "G": ("<G>", "</G>"),
+    "B": ("<B>", "</B>"),
+    "LEFT": ("<LEFT>", "</LEFT>"),
+    "RIGHT": ("<RIGHT>", "</RIGHT>"),
 }
 
 _STRUCTURAL_TOKENS = ["<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"]
@@ -59,6 +63,7 @@ class MultimodalSegment:
     """One typed chunk of a sequence. `data` is UTF-8 bytes for TEXT, or the
     marker-list returned by `encode_image`/`encode_video`/`encode_audio`/
     `encode_lidar` for everything else."""
+
     modality: Modality
     data: object
     channel: str | None = None
@@ -73,8 +78,8 @@ class KairosTokenizer(ByT5Tokenizer):
     IMAGE_CHANNELS = 3
     VIDEO_CHANNELS = 3
     AUDIO_SAMPLE_RATE = 16_000
-    AUDIO_TICK_SAMPLES = 16_000       # one <TICK> per second of audio
-    LIDAR_POINTS_PER_GROUP = 32       # one <PTSEP> every N points
+    AUDIO_TICK_SAMPLES = 16_000  # one <TICK> per second of audio
+    LIDAR_POINTS_PER_GROUP = 32  # one <PTSEP> every N points
     LIDAR_XYZ_RANGE = (-100.0, 100.0)
     LIDAR_INTENSITY_RANGE = (0.0, 1.0)
 
@@ -192,7 +197,7 @@ class KairosTokenizer(ByT5Tokenizer):
         pcm = np.clip(waveform * 127.5 + 127.5, 0, 255).astype(np.uint8)
         out = []
         for start in range(0, len(pcm), tick_samples):
-            out.append(("bytes", pcm[start:start + tick_samples].tobytes()))
+            out.append(("bytes", pcm[start : start + tick_samples].tobytes()))
             out.append(("marker", "<TICK>"))
         return out
 
@@ -224,7 +229,7 @@ class KairosTokenizer(ByT5Tokenizer):
         q = ((np.clip(points, lo, hi) - lo) / (hi - lo) * 255).astype(np.uint8)
         out = []
         for start in range(0, len(q), points_per_group):
-            out.append(("bytes", q[start:start + points_per_group].tobytes()))
+            out.append(("bytes", q[start : start + points_per_group].tobytes()))
             out.append(("marker", "<PTSEP>"))
         return out
 

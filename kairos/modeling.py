@@ -1,20 +1,22 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 from dataclasses import dataclass
 
-from transformers import PreTrainedModel, PretrainedConfig
+import torch
+import torch.nn.functional as F
+from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
+from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
+
 try:
     from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
         DiffusionGemmaGenerationMixin,
     )
 except ImportError:
+
     class DiffusionGemmaGenerationMixin:
         pass
+
 
 from transformers.cache_utils import DynamicCache
 
@@ -94,6 +96,12 @@ class KairosConfig(PretrainedConfig):
 
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
+
+        # v3 Block-AttnRes: window prior layer outputs into blocks of S before
+        # they're summed and handed to the aggregator, so the number of AttnRes
+        # sources stays O(N/S) instead of O(N). S=1 (default) reproduces the
+        # original per-layer AttnRes graph exactly (see KairosDiffusionBackbone).
+        self.attnres_block_size = kwargs.get("attnres_block_size", 1)
 
 
 class KairosCache(DynamicCache):
@@ -194,8 +202,11 @@ class DiffusionBlock(nn.Module):
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         x = x + self.attn(
-            self.norm1(x), position_embeddings=position_embeddings, cache_params=cache_params,
-            attention_mask=attention_mask, position_ids=position_ids,
+            self.norm1(x),
+            position_embeddings=position_embeddings,
+            cache_params=cache_params,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
         x = x + self.ffn(self.norm2(x))
         return x
@@ -222,21 +233,47 @@ class KairosAttnRes(nn.Module):
 
 
 class KairosDiffusionBackbone(nn.Module):
+    """v3 Block-AttnRes: instead of feeding the aggregator every single prior
+    layer output (O(N) sources at layer N), prior outputs are windowed into
+    blocks of `attnres_block_size` (summed within a block), so the aggregator
+    only ever sees O(N/S) sources. With attnres_block_size=1 (default) each
+    block contains exactly one layer output, which reduces this to the
+    original per-layer AttnRes graph term for term (see test_backbone /
+    test_backbone_propagates_cache for the S=1 regression coverage)."""
+
     def __init__(self, config, use_moe=False):
         super().__init__()
         self.layers = nn.ModuleList([DiffusionBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
         self.norm = KairosNorm(config.hidden_size)
         self.aggregator = KairosAttnRes(config.hidden_size)
+        self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
-        states = [x]
+        emb = x
+        completed = []  # finalized block-sums of prior layer outputs
+        partial = None  # running sum of the current (unfinished) block
+        in_block = 0
+        S = self.attnres_block_size
+
+        def sources():
+            return [emb] + completed + ([partial] if partial is not None else [])
+
         for layer in self.layers:
-            h = self.aggregator(states)
+            h = self.aggregator(sources())
             x = layer(
-                h, position_embeddings=position_embeddings, cache_params=cache_params,
-                attention_mask=attention_mask, position_ids=position_ids,
+                h,
+                position_embeddings=position_embeddings,
+                cache_params=cache_params,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
             )
-            states.append(x)
+            partial = x if partial is None else partial + x
+            in_block += 1
+            if in_block == S:
+                completed.append(partial)
+                partial = None
+                in_block = 0
+
         return self.norm(x)
 
 
@@ -290,7 +327,7 @@ class KairosScaleRouter(nn.Module):
 
     @staticmethod
     def gather_active(x, active_mask):
-        B, T, D = x.shape
+        _, _, D = x.shape
         lengths = active_mask.sum(dim=1)
         max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
         if max_len == 0:
@@ -332,12 +369,19 @@ class PyramidalConvCodec(nn.Module):
             kernel_size += kernel_size % 2 == 0
             padding = kernel_size // 2
             self.encoders.append(
-                nn.Conv1d(d_model, d_model, kernel_size=kernel_size, stride=scale_stride, padding=padding, groups=d_model)
+                nn.Conv1d(
+                    d_model, d_model, kernel_size=kernel_size, stride=scale_stride, padding=padding, groups=d_model
+                )
             )
             self.decoders.append(
                 nn.ConvTranspose1d(
-                    d_model, d_model, kernel_size=kernel_size, stride=scale_stride, padding=padding,
-                    output_padding=max(scale_stride - 1, 0), groups=d_model,
+                    d_model,
+                    d_model,
+                    kernel_size=kernel_size,
+                    stride=scale_stride,
+                    padding=padding,
+                    output_padding=max(scale_stride - 1, 0),
+                    groups=d_model,
                 )
             )
         self.norm = KairosNorm(d_model * num_scales)
@@ -381,7 +425,9 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:
             vocab_size = config.vocab_size
-        self.embedding = KairosEmbedding(vocab_size=vocab_size, num_modalities=config.num_modalities, d_model=config.hidden_size)
+        self.embedding = KairosEmbedding(
+            vocab_size=vocab_size, num_modalities=config.num_modalities, d_model=config.hidden_size
+        )
         self.backbones = nn.ModuleList(
             [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
         )
@@ -390,8 +436,14 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         self.lm_head = OutputHead(self.embedding)
 
     def forward(
-        self, input_ids=None, decoder_input_ids=None, modality_ids=None, attention_mask=None,
-        self_conditioning_logits=None, cache_params=None, **kwargs,
+        self,
+        input_ids=None,
+        decoder_input_ids=None,
+        modality_ids=None,
+        attention_mask=None,
+        self_conditioning_logits=None,
+        cache_params=None,
+        **kwargs,
     ):
         x = decoder_input_ids if decoder_input_ids is not None else input_ids
         if x is None:
@@ -417,8 +469,11 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
                 position_ids = positions + cache_offset
                 cos, sin = self.rotary(scale, position_ids, max_position=None)
                 chunk = backbone(
-                    gathered, position_embeddings=(cos, sin), cache_params=local_cache,
-                    attention_mask=pad_mask, position_ids=position_ids,
+                    gathered,
+                    position_embeddings=(cos, sin),
+                    cache_params=local_cache,
+                    attention_mask=pad_mask,
+                    position_ids=position_ids,
                 )
                 output = self.router.scatter_active(output, chunk, pad_mask, positions)
             features.append(output)

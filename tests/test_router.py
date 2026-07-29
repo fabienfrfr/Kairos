@@ -1,11 +1,11 @@
-import torch
 import pytest
+import torch
 
 from kairos.modeling import (
-    KairosScaleRouter,
     KairosConfig,
     KairosDiffusionLLM,
     KairosMultiCache,
+    KairosScaleRouter,
 )
 
 
@@ -96,7 +96,7 @@ def test_gather_active_preserves_relative_order(router):
     x = torch.arange(10).float().view(1, 10, 1)
     active_mask = torch.zeros(1, 10, dtype=torch.bool)
     active_mask[0, [2, 5, 7]] = True
-    gathered, pad_mask, positions = router.gather_active(x, active_mask)
+    gathered, _pad_mask, positions = router.gather_active(x, active_mask)
     assert positions[0].tolist() == [2, 5, 7]
     assert gathered[0, :, 0].tolist() == [2.0, 5.0, 7.0]
 
@@ -131,7 +131,7 @@ def test_gather_scatter_batch_independence(router):
     active_mask = torch.zeros(2, 8, dtype=torch.bool)
     active_mask[0, [0, 1, 2, 3]] = True
     active_mask[1, [0]] = True
-    gathered, pad_mask, positions = router.gather_active(x, active_mask)
+    gathered, pad_mask, _positions = router.gather_active(x, active_mask)
     assert torch.allclose(gathered[0][pad_mask[0]], torch.ones_like(gathered[0][pad_mask[0]]))
     assert torch.allclose(gathered[1][pad_mask[1]], 2 * torch.ones_like(gathered[1][pad_mask[1]]))
 

@@ -1,12 +1,16 @@
-import torch
 import time
 
-from kairos.modeling import KairosCache
+import torch
 
-from kairos.attentions import ATTN_IMPL
-from kairos.attentions import KairosAttention, KairosRotaryEmbedding
-from kairos.attentions import KairosGatedDeltaNet
-from kairos.attentions import KairosLiZAttention2
+from kairos.attentions import (
+    ATTN_IMPL,
+    KairosAttention,
+    KairosGatedDeltaNet,
+    KairosLiZAttention2,
+    KairosRotaryEmbedding,
+    _supports_cu_seqlens,
+)
+from kairos.modeling import KairosCache
 
 
 class DummySWAConfig:
@@ -16,7 +20,7 @@ class DummySWAConfig:
     sliding_window_size = 2
     max_position_embeddings = 64
     rope_theta = 10000.0
-    layers_config = ["l"]
+    layers_config = ("l",)
     slw_wsize = -1
 
 
@@ -24,7 +28,6 @@ class DummyDeltaConfig:
     hidden_size = 32
     num_attention_heads = 4
     num_key_value_heads = 2
-    sliding_window_size = 2
     max_position_embeddings = 64
     rope_theta = 10000.0
     expand_factor = 2.0
@@ -34,7 +37,7 @@ class DummyDeltaConfig:
     time_step_floor = 1e-4
     A_init_range = (0.1, 1.0)
     use_uscaling = False
-    layers_config = ["d"]
+    layers_config = ("d",)
     sliding_window_size = 16
     slw_wsize = -1
 
@@ -95,7 +98,7 @@ def test_swa_eager_vs_flex(monkeypatch):
         monkeypatch.setattr("attention.ATTN_IMPL", "flex")
         out_flex = attn(x, rope(x, pos))
         assert torch.allclose(out_eager, out_flex, atol=1e-3)
-    except:
+    except Exception:  # noqa: BLE001, S110 — flex path is optional; any failure just skips this check
         pass
 
 
@@ -461,3 +464,42 @@ def test_liz_determinism():
     out1 = model(x_M, rope(x_M, pos), cache_params=cache.clone())
     out2 = model(x_M, rope(x_M, pos), cache_params=cache.clone())
     assert torch.allclose(out1, out2, atol=1e-5)
+
+
+def test_supports_cu_seqlens_returns_false_for_none():
+    assert _supports_cu_seqlens(None) is False
+
+
+def test_supports_cu_seqlens_returns_false_when_signature_unavailable():
+    # builtins raise ValueError from inspect.signature; must degrade to False
+    assert _supports_cu_seqlens(int) is False
+
+
+def test_supports_cu_seqlens_detects_the_parameter():
+    def with_cu_seqlens(q, k, v, cu_seqlens=None):
+        pass
+
+    def without_cu_seqlens(q, k, v):
+        pass
+
+    assert _supports_cu_seqlens(with_cu_seqlens) is True
+    assert _supports_cu_seqlens(without_cu_seqlens) is False
+
+
+def test_attention_without_layer_idx_warns_but_still_works(capsys):
+    """layer_idx=None disables caching but must not raise — used e.g. by
+    standalone attention tests that don't need KV caching."""
+    cfg = DummySWAConfig()
+    attn = KairosAttention(cfg, layer_idx=None)
+    captured = capsys.readouterr()
+    assert "layer_idx should be set" in captured.out
+    x, pos = get_swa_inputs()
+    rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+    out = attn(x, rope(x, pos))
+    assert out.shape == x.shape
+
+
+def test_current_backend_is_eager_on_cpu():
+    # documents/locks the CPU fallback this test suite actually exercises;
+    # the flex_attention path requires CUDA and is not covered here.
+    assert ATTN_IMPL == "eager"

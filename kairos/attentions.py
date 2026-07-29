@@ -1,18 +1,19 @@
+import inspect
+import math
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-import math
-import inspect
-
+from torch import nn
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 if torch.cuda.is_available():
     try:
-        from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
         flex_attention = torch.compile(flex_attention)
         ATTN_IMPL = "flex"
-    except Exception:
+    except Exception:  # noqa: BLE001 — flex_attention compile can fail for many backend reasons; must not crash import
         ATTN_IMPL = "eager"
 else:
     ATTN_IMPL = "eager"
@@ -38,6 +39,7 @@ except ImportError:
     from transformers.models.qwen3_next.modeling_qwen3_next import (
         torch_causal_conv1d_update,
     )
+
     causal_conv1d_update = torch_causal_conv1d_update
 
 
@@ -95,10 +97,12 @@ def apply_rotary_emb(x, cos, sin):
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], dim=-1).type_as(x)
 
+
 # Eager attention (CPU / fallback)
 
+
 def eager_attention(q, k, v, window, key_padding_mask=None):
-    B, Lq, H, D = q.shape
+    _, Lq, H, D = q.shape
     Lk = k.shape[1]
     W = 2 * window + 1
     n_kv = k.size(2)
@@ -130,22 +134,29 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
     out = (attn.unsqueeze(-1) * v_windows).sum(3)
     return out.contiguous()
 
+
 # Flex mask builder (bidir)
+
 
 def build_flex_mask(max_len, window):
     def bidir_window(b, h, q_idx, kv_idx):
         return (kv_idx >= q_idx - window) & (kv_idx <= q_idx + window)
+
     return create_block_mask(bidir_window, B=None, H=None, Q_LEN=max_len, KV_LEN=max_len)
 
 
 def build_flex_mask_padded(window, attention_mask):
     B, Lk = attention_mask.shape
+
     def bidir_window_padded(b, h, q_idx, kv_idx):
         valid = (kv_idx >= q_idx - window) & (kv_idx <= q_idx + window)
         return valid & attention_mask[b, kv_idx]
+
     return create_block_mask(bidir_window_padded, B=B, H=None, Q_LEN=Lk, KV_LEN=Lk)
 
+
 # Kairos Attention (SWA bidirectional)
+
 
 class KairosAttention(nn.Module):
     def __init__(self, config, layer_idx=None):
@@ -198,8 +209,11 @@ class KairosAttention(nn.Module):
             else:
                 block_mask = self.block_mask._adjust(q.size(1), k.size(1))
             out = flex_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                block_mask=block_mask, scale=self.head_dim**-0.5,
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                block_mask=block_mask,
+                scale=self.head_dim**-0.5,
             ).transpose(1, 2)
         else:
             out = eager_attention(q, k, v, self.window, key_padding_mask=attention_mask)
@@ -242,8 +256,12 @@ class KairosGatedDeltaNet(nn.Module):
         A = torch.empty(self.n_heads_local).uniform_(*config.A_init_range)
         self.A_log = nn.Parameter(torch.log(A))
         self.qkv_conv1d = nn.Conv1d(
-            in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False,
-            kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size - 1,
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_size,
+            groups=self.conv_dim,
+            padding=self.conv_size - 1,
         )
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = (
@@ -253,7 +271,9 @@ class KairosGatedDeltaNet(nn.Module):
             chunk_gated_delta_rule if chunk_gated_delta_rule is not None else torch_chunk_gated_delta_rule
         )
         self.recurrent_gated_delta_rule = (
-            fused_recurrent_gated_delta_rule if fused_recurrent_gated_delta_rule is not None else torch_recurrent_gated_delta_rule
+            fused_recurrent_gated_delta_rule
+            if fused_recurrent_gated_delta_rule is not None
+            else torch_recurrent_gated_delta_rule
         )
         self._chunk_supports_varlen = _supports_cu_seqlens(self.chunk_gated_delta_rule)
         self.merge_norm = KairosNorm(2 * self.value_dim)
@@ -285,7 +305,11 @@ class KairosGatedDeltaNet(nn.Module):
         if has_previous_state and L == 1:
             conv_state = cache_params.conv_caches[self.layer_idx]
             mixed_qkv = self.causal_conv1d_update(
-                mixed_qkv, conv_state, self.qkv_conv1d.weight.squeeze(1), self.qkv_conv1d.bias, "silu",
+                mixed_qkv,
+                conv_state,
+                self.qkv_conv1d.weight.squeeze(1),
+                self.qkv_conv1d.bias,
+                "silu",
             )
         else:
             conv_state = None
@@ -296,10 +320,13 @@ class KairosGatedDeltaNet(nn.Module):
             if conv_state is not None:
                 mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
             if cache_params is not None:
-                cache_params.conv_caches[self.layer_idx] = mixed_qkv[:, :, -(self.conv_size - 1):].clone()
+                cache_params.conv_caches[self.layer_idx] = mixed_qkv[:, :, -(self.conv_size - 1) :].clone()
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
-                    mixed_qkv, self.qkv_conv1d.weight.squeeze(1), self.qkv_conv1d.bias, activation="silu",
+                    mixed_qkv,
+                    self.qkv_conv1d.weight.squeeze(1),
+                    self.qkv_conv1d.bias,
+                    activation="silu",
                 )
             else:
                 mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv))
@@ -321,9 +348,7 @@ class KairosGatedDeltaNet(nn.Module):
         # active position across the batch into one flat sequence instead of
         # wasting compute on padded steps. Falls back to zeroing beta/g at
         # padded steps if only the torch reference kernel is available.
-        use_varlen = (
-            has_padding and not (has_previous_state and L == 1) and self._chunk_supports_varlen
-        )
+        use_varlen = has_padding and not (has_previous_state and L == 1) and self._chunk_supports_varlen
         if use_varlen:
             flat_idx = attention_mask.nonzero(as_tuple=False)
             bi, li = flat_idx[:, 0], flat_idx[:, 1]
@@ -335,8 +360,16 @@ class KairosGatedDeltaNet(nn.Module):
             g_p = g[bi, li].unsqueeze(0)
             beta_p = beta[bi, li].unsqueeze(0)
             o_p, ssm_cache = self.chunk_gated_delta_rule(
-                q_p, k_p, v_p, g_p, beta_p, scale=None, initial_state=prev_state,
-                output_final_state=True, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                q_p,
+                k_p,
+                v_p,
+                g_p,
+                beta_p,
+                scale=None,
+                initial_state=prev_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
             )
             o = v.new_zeros(v.shape)
             o[bi, li] = o_p.squeeze(0)
@@ -347,12 +380,26 @@ class KairosGatedDeltaNet(nn.Module):
                 g = g * m
             if has_previous_state and L == 1:
                 o, ssm_cache = self.recurrent_gated_delta_rule(
-                    q, k, v, g, beta, initial_state=prev_state, output_final_state=True, use_qk_l2norm_in_kernel=True,
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    initial_state=prev_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
                 )
             else:
                 o, ssm_cache = self.chunk_gated_delta_rule(
-                    q, k, v, g, beta, scale=None, initial_state=prev_state,
-                    output_final_state=True, use_qk_l2norm_in_kernel=True,
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    scale=None,
+                    initial_state=prev_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
                 )
         if cache_params is not None:
             cache_params.ssm_caches[self.layer_idx] = ssm_cache
@@ -394,8 +441,11 @@ class KairosLiZAttention2(nn.Module):
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         swa_out = self.swa(
-            x, position_embeddings=position_embeddings, cache_params=cache_params,
-            attention_mask=attention_mask, position_ids=position_ids,
+            x,
+            position_embeddings=position_embeddings,
+            cache_params=cache_params,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
         delta_out = self.delta(x, cache_params=cache_params, attention_mask=attention_mask)
         out = torch.cat([swa_out, delta_out], dim=-1)

@@ -1,11 +1,12 @@
 import random
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset
-from datasets import get_dataset_config_names, load_dataset, concatenate_datasets
 from datasets import Dataset as HFDataset
+from datasets import concatenate_datasets, get_dataset_config_names, load_dataset
+from torch.utils.data import Dataset
 
-from kairos.tokenizer import KairosTokenizer, MultimodalSegment, Modality
+from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 MAX_LEN = 3 * 2048
 
@@ -152,12 +153,14 @@ class KairosPretrainingDataset(Dataset):
                 all_modality_ids.append(mod_chunk)
                 all_masks.append(mask)
 
-        self.ds = HFDataset.from_dict({
-            "input_ids": all_input_ids,
-            "modality_ids": all_modality_ids,
-            "mask": all_masks,
-            "prompt_len": [0] * len(all_input_ids),
-        })
+        self.ds = HFDataset.from_dict(
+            {
+                "input_ids": all_input_ids,
+                "modality_ids": all_modality_ids,
+                "mask": all_masks,
+                "prompt_len": [0] * len(all_input_ids),
+            }
+        )
         self.ds.set_format("torch")
 
     def __getitem__(self, idx):
@@ -285,8 +288,10 @@ class KairosDPODataset(Dataset):
         chosen_ids, chosen_mask, plen = self._encode_pair(prompt_text, chosen_text)
         rejected_ids, rejected_mask, _ = self._encode_pair(prompt_text, rejected_text)
         return {
-            "chosen_ids": chosen_ids, "chosen_mask": chosen_mask,
-            "rejected_ids": rejected_ids, "rejected_mask": rejected_mask,
+            "chosen_ids": chosen_ids,
+            "chosen_mask": chosen_mask,
+            "rejected_ids": rejected_ids,
+            "rejected_mask": rejected_mask,
             "prompt_len": plen,
         }
 
@@ -364,8 +369,13 @@ class KairosRLDataset(Dataset):
         gen_mask = [0] * len(prompt_ids) + [1] * len(gen_ids) + [0] * pad_len
 
         return {
-            "input_ids": ids, "gen_mask": gen_mask, "prompt_len": len(prompt_ids),
-            "mask_ratio": mask_ratio, "choices": list(choices), "scores": list(scores), "level": level,
+            "input_ids": ids,
+            "gen_mask": gen_mask,
+            "prompt_len": len(prompt_ids),
+            "mask_ratio": mask_ratio,
+            "choices": list(choices),
+            "scores": list(scores),
+            "level": level,
         }
 
     def __len__(self):
@@ -378,5 +388,7 @@ class KairosRLDataset(Dataset):
             "gen_mask": torch.tensor(s["gen_mask"], dtype=torch.long),
             "prompt_len": torch.tensor(s["prompt_len"], dtype=torch.long),
             "mask_ratio": torch.tensor(s["mask_ratio"], dtype=torch.float),
-            "choices": s["choices"], "scores": s["scores"], "level": s["level"],
+            "choices": s["choices"],
+            "scores": s["scores"],
+            "level": s["level"],
         }
