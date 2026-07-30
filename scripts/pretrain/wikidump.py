@@ -1,7 +1,11 @@
-import os, re, bz2, requests
-import mwparserfromhell
-from bs4 import BeautifulSoup
+import bz2
+import os
+import re
 from collections import Counter
+
+import mwparserfromhell
+import requests
+from bs4 import BeautifulSoup
 from datasets import Dataset
 from libzim.reader import Archive
 from tqdm import tqdm
@@ -169,7 +173,7 @@ def _html_to_record(title: str, html: str) -> dict | None:
 
     for tag in soup.find_all(["script", "style", "sup", "figure", "nav", "footer", "table"]):
         tag.decompose()
-    for tag in soup.find_all(id=re.compile(r"^(toc|mw-navigation|mw-head|contentSub|catlinks)$", re.I)):
+    for tag in soup.find_all(id=re.compile(r"^(toc|mw-navigation|mw-head|contentSub|catlinks)$", re.IGNORECASE)):
         tag.decompose()
 
     cats = []

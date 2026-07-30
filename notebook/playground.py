@@ -15,9 +15,7 @@ def _():
 def _(mo):
     mo.md("""
     # 🌀 Kairos — Training Notebook
-    Build · Inspect · Train · Checkpoint
-
-    ⚠️ **Work in Progress** — training loop / logging / checkpointing may still change.
+    Build · Inspect · Train · Checkpoint · ⚠️ WIP
     """)
     return
 
@@ -71,11 +69,7 @@ def _(KairosTokenizer):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md(r"""
-    *Estimate pretraining compute time*
-
-    Based on Training Compute-Optimal Large Language Models: https://arxiv.org/abs/2203.15556
-    """)
+    mo.md(r"""*Estimate pretraining compute time* — [Chinchilla](https://arxiv.org/abs/2203.15556)""")
     return
 
 

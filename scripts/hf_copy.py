@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+
 from huggingface_hub import HfApi, snapshot_download, upload_folder
 
 api = HfApi()
@@ -17,7 +18,7 @@ for _, dst in datasets:
     try:
         api.delete_repo(repo_id=dst, repo_type="dataset")
         print(f"Deleted: {dst}")
-    except:
+    except Exception:
         pass
 
 # clean upload

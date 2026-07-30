@@ -17,10 +17,7 @@ def _(mo):
     # 🌀 Kairos — Multimodal Pretraining Notebook
     Text · Image · Video · Audio · Lidar · IMU · Control
 
-    All logic lives in `kairos.pipeline.KairosMultimodalPipeline`
-    (tested in `tests/test_pipeline.py`); this notebook only declares config and
-    calls the pipeline. Every modality shares one byte-level tokenizer
-    (`KairosTokenizer`, PixelBytes approach) — no per-modality VQ-VAE.
+    Config + calls into `kairos.pipeline.KairosMultimodalPipeline`.
     """)
     return
 
@@ -72,11 +69,8 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md("""
-    `build_keep_it_simple_multimodal.py` downloads and serializes a small sample from
-    6 sources (Flickr8k, AudioCaps, MSR-VTT, nuScenes-mini, MotionSense,
-    PixelBytes-OptimalControl) into `list[dict]` with a `kind` field — each source is
-    wrapped in its own `try/except`, so one missing source doesn't block the rest.
-    `keep-it-simple` supplies the text data (not covered by the multimodal set).
+    `build_keep_it_simple_multimodal.py` builds a small `list[dict]` sample from 6
+    sources; `keep-it-simple` supplies the text data.
     """)
     return
 
@@ -170,10 +164,8 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md("""
-    `num_modalities=8` covers the full `Modality` enum; `modality_scales` routes each
-    modality to its best-fit `PyramidalConvCodec` scale; `attnres_block_size` sets the
-    v3 Block-AttnRes window (`1` = classic per-layer softmax residual, `>1` groups
-    layers into blocks before aggregation, cost O(N/S)).
+    `modality_scales` routes each modality to a `PyramidalConvCodec` scale;
+    `attnres_block_size` sets the v3 Block-AttnRes window (`1` = classic AttnRes).
     """)
     return
 
@@ -421,10 +413,7 @@ def _(logs, pd):
 def _(mo):
     mo.md("""
     ## 🔍 6. Per-modality check
-
-    Diffusion loss is masked by `modality_ids` instead of averaged over the whole
-    batch, so a modality the router ignores can't hide behind a healthy-looking
-    global average.
+    Diffusion loss masked per modality so a router-ignored one can't hide behind the global average.
     """)
     return
 

@@ -56,11 +56,7 @@ def dense_model(dense_config, tokenizer):
 
 
 def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
-    """Regression: the trainer used to default every token to Modality.TEXT
-    because it never forwarded modality_ids from the batch. Uses a dense
-    model (not the MoE fixture) so this test isolates the modality_ids/mask
-    plumbing from MoE's separate numerical fragility on tiny random inits
-    (see test_moe_plumbing_does_not_crash below)."""
+    """Regression: the trainer used to default every token to Modality.TEXT, ignoring modality_ids/mask from the batch."""
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     examples = [
@@ -85,13 +81,7 @@ def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
 
 
 def test_moe_plumbing_does_not_crash(model, tokenizer):
-    """Separate, looser check for the MoE path (num_local_experts=7,
-    num_experts_per_tok=1, n_shared_experts=1 — the 14M target architecture):
-    only checks it runs and produces a gradient. Tiny random MoE inits can
-    occasionally produce non-finite logits depending on weight init/test
-    order (a DeepseekV3MoE numerical fragility at very small expert counts,
-    unrelated to the modality_ids/mask fix this file is about) — that case
-    is logged, not failed, here."""
+    """Looser MoE-path check: tiny random inits can occasionally give non-finite logits, so this only logs that case."""
     torch.manual_seed(0)
     ids = tokenizer.encode("hello world", add_special_tokens=False)
     ids = ids + [tokenizer.pad_token_id] * (32 - len(ids))
@@ -129,10 +119,7 @@ def test_compute_loss_never_noises_padding(model, tokenizer):
 
 
 def test_compute_loss_backward_compatible_without_modality_or_mask(tokenizer):
-    """SFT/DPO/RL-style batches (no modality_ids/mask keys) must still work.
-    Uses a dense (non-MoE) model here: MoE routing on a tiny random-init
-    config can occasionally produce very large logits regardless of this
-    trainer fix, which isn't what this test is checking."""
+    """SFT/DPO/RL-style batches (no modality_ids/mask keys) must still work."""
     torch.manual_seed(0)
     dense_config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=len(tokenizer), num_modalities=8)
     dense_model = KairosDiffusionLLM(dense_config, vocab_size=len(tokenizer))
@@ -149,9 +136,7 @@ def test_compute_loss_backward_compatible_without_modality_or_mask(tokenizer):
 
 
 def test_compute_loss_forces_one_position_when_noise_mask_is_empty(dense_model, tokenizer, monkeypatch):
-    """When sampled p is so low that no token gets noised, compute_loss must
-    still score exactly one non-padding position per row instead of handing
-    cross_entropy an empty tensor."""
+    """When no token gets noised, compute_loss must still score exactly one position instead of an empty tensor."""
     ids = tokenizer.encode("hello world", add_special_tokens=False)
     pad_len = 16 - len(ids)
     ids = ids + [tokenizer.pad_token_id] * pad_len
@@ -168,8 +153,7 @@ def test_compute_loss_forces_one_position_when_noise_mask_is_empty(dense_model, 
 
 
 def test_compute_loss_forces_one_position_without_pad_mask(dense_model, tokenizer, monkeypatch):
-    """Same fallback as above, but for SFT/DPO/RL-style batches with no `mask`
-    key at all — `eligible` must fall back to torch.ones_like(noise_mask)."""
+    """Same fallback as above, but with no `mask` key: `eligible` must fall back to torch.ones_like(noise_mask)."""
     ids = tokenizer.encode("hello world", add_special_tokens=False)
     ids = ids + [tokenizer.pad_token_id] * (16 - len(ids))
     batch = {

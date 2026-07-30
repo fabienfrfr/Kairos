@@ -4,12 +4,7 @@ from transformers import Trainer
 
 
 class KairosDiffusionTrainer(Trainer):
-    """Masked-diffusion loss: mask a random fraction of tokens (never the
-    prompt), replace them with random noise, predict the originals back.
-    `modality_ids`/`mask` (real-vs-pad) are read from the batch when present
-    (KairosPretrainingDataset) so multimodal routing and padding actually
-    reach the model — SFT/DPO/RL batches without these keys behave exactly
-    as before."""
+    """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and predict the originals back."""
 
     def compute_loss(self, model, inputs, return_outputs=False):
         x0 = inputs["input_ids"]

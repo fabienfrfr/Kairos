@@ -43,6 +43,11 @@ dev = [
     "mwparserfromhell>=0.7.2",
     "pytest-cov>=7.1.0",
 ]
+# scripts/ (dataset builders): `uv sync --group scripts` to install
+scripts = [
+    "av>=13.1.0",
+    "requests>=2.32.3",
+]
 
 
 [tool.ruff]

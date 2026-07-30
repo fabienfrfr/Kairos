@@ -43,10 +43,7 @@ def sample_lidar():
 # Vocab / backward compatibility
 # =========================
 def test_vocab_size_is_291(tokenizer):
-    """Regression: ByT5Tokenizer defaults to extra_ids=125 (len=384).
-    KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens
-    (8 modality pairs + 5 channel pairs + 4 structural markers + SEP/MASK)
-    on top of the 259-token byte vocab."""
+    """Regression: KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens to the 259-token byte vocab."""
     assert len(tokenizer) == 291
 
 
@@ -96,8 +93,7 @@ def test_image_roundtrip(tokenizer, sample_image):
 
 
 def test_image_endline_every_row(tokenizer, sample_image):
-    """The whole point of the design: <ENDLINE> recurs locally, every W*C
-    tokens, not once at the far end of the stream."""
+    """The whole point of the design: <ENDLINE> recurs locally, every W*C tokens, not once at the end."""
     markers = KairosTokenizer.encode_image(sample_image)
     ids = tokenizer._resolve_markers(markers)
     endline_positions = [i for i, tid in enumerate(ids) if tid == tokenizer._endline_id]
@@ -115,8 +111,7 @@ def test_image_rejects_bad_dtype():
 
 
 def test_image_decode_detects_truncated_row(tokenizer, sample_image):
-    """Simulates a model that drifted mid-generation: last row is short.
-    Must raise a clear error, not silently misreshape."""
+    """Simulates a drifted generation with a short last row; must raise a clear error, not silently misreshape."""
     markers = KairosTokenizer.encode_image(sample_image)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
     truncated = torch.tensor(out["input_ids"].tolist()[:-5])  # cut mid last row
@@ -145,8 +140,7 @@ def test_video_endframe_count_matches_num_frames(tokenizer, sample_video):
 
 
 def test_video_rejects_inconsistent_frame_shapes(tokenizer):
-    """Two frames of different H are fine to *encode* independently, but
-    decode_video must reject the mismatch rather than silently stacking."""
+    """Frames of different H can be *encoded* independently, but decode_video must reject the mismatch."""
     frame1 = np.zeros((2, 3, 3), dtype=np.uint8)
     frame2 = np.zeros((4, 3, 3), dtype=np.uint8)
     markers = (

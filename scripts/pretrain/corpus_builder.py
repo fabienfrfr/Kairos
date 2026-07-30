@@ -1,6 +1,7 @@
 import json
-from tqdm import tqdm
+
 from datasets import load_dataset
+from tqdm import tqdm
 
 
 def process_datasets(output_file: str):

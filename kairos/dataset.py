@@ -11,20 +11,17 @@ from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
 MAX_LEN = 3 * 2048
 
 
-class KairosPretrainingDataset(Dataset):
-    """
-    Full diffusion pretraining dataset: text tokenized and split into
-    fixed-length chunks, all tokens diffused (no prompt/generation split).
-    `mask` marks real (1) vs padding (0) tokens.
+def _pad_and_gen_mask(ids, prompt_len, max_len, pad_token_id):
+    """Pad `ids` to max_len and build a gen_mask that's 0 on the prompt, 1 on the rest, 0 on padding."""
+    pad_len = max_len - len(ids)
+    gen_len = len(ids) - prompt_len
+    ids = ids + [pad_token_id] * pad_len
+    gen_mask = [0] * prompt_len + [1] * gen_len + [0] * pad_len
+    return ids, gen_mask
 
-    Multimodal mode: pass `multimodal_examples` (list[dict] with a "kind"
-    field, see scripts/pretrain/build_keep_it_simple_multimodal.py) or
-    `multimodal_path` (a .pt file) instead of `texts`. Each example becomes a
-    MultimodalSegment list via KairosTokenizer.encode_multimodal, then chunked
-    the same way as text. Both modes share the same output schema:
-    {input_ids, modality_ids, mask, prompt_len} (text chunks: modality_ids
-    all Modality.TEXT).
-    """
+
+class KairosPretrainingDataset(Dataset):
+    """Full diffusion pretraining dataset: text or multimodal, chunked to {input_ids, modality_ids, mask, prompt_len}."""
 
     def __init__(
         self,
@@ -57,8 +54,7 @@ class KairosPretrainingDataset(Dataset):
         self.ds.set_format("torch")
 
     def _chunk(self, token_ids, modality_ids):
-        """Fixed-length windowing shared by text and multimodal: window of
-        self.max_len, padded to self.target_len."""
+        """Fixed-length windowing shared by text and multimodal, padded to self.target_len."""
         for i in range(0, len(token_ids), self.max_len):
             ids_chunk = token_ids[i : i + self.max_len]
             mod_chunk = modality_ids[i : i + self.max_len]
@@ -68,21 +64,28 @@ class KairosPretrainingDataset(Dataset):
             mask = [1] * (len(ids_chunk) - pad_len) + [0] * pad_len
             yield ids_chunk, mod_chunk, mask
 
-    def preprocess(self, examples):
+    def _collect_chunks(self, chunk_sources):
+        """Run each (ids, modality_ids) pair through self._chunk and flatten into three lists."""
         all_input_ids, all_modality_ids, all_masks = [], [], []
-        prompts = examples.get("prompt", [""] * len(examples["text"]))
-        texts = examples.get("text", [""] * len(examples["text"]))
-
-        for prompt, text in zip(prompts, texts):
-            # anti-Reversal Curse: randomize prompt/text order
-            merged = " ".join([prompt, text] if random.random() < 0.5 else [text, prompt]).strip()
-            tokens = self.tokenizer.encode(merged, add_special_tokens=False)
-            modality_ids = [int(Modality.TEXT)] * len(tokens)
-            for ids_chunk, mod_chunk, mask in self._chunk(tokens, modality_ids):
+        for ids, mods in chunk_sources:
+            for ids_chunk, mod_chunk, mask in self._chunk(ids, mods):
                 all_input_ids.append(ids_chunk)
                 all_modality_ids.append(mod_chunk)
                 all_masks.append(mask)
+        return all_input_ids, all_modality_ids, all_masks
 
+    def preprocess(self, examples):
+        prompts = examples.get("prompt", [""] * len(examples["text"]))
+        texts = examples.get("text", [""] * len(examples["text"]))
+
+        def sources():
+            for prompt, text in zip(prompts, texts):
+                # anti-Reversal Curse: randomize prompt/text order
+                merged = " ".join([prompt, text] if random.random() < 0.5 else [text, prompt]).strip()
+                tokens = self.tokenizer.encode(merged, add_special_tokens=False)
+                yield tokens, [int(Modality.TEXT)] * len(tokens)
+
+        all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
         return {
             "input_ids": all_input_ids,
             "modality_ids": all_modality_ids,
@@ -144,15 +147,12 @@ class KairosPretrainingDataset(Dataset):
         if self.tokenizer is None:
             self.tokenizer = KairosTokenizer()
 
-        all_input_ids, all_modality_ids, all_masks = [], [], []
-        for ex in examples:
-            encoded = self.tokenizer.encode_multimodal(self._segments_for(ex))
-            ids, mods = encoded["input_ids"].tolist(), encoded["modality_ids"].tolist()
-            for ids_chunk, mod_chunk, mask in self._chunk(ids, mods):
-                all_input_ids.append(ids_chunk)
-                all_modality_ids.append(mod_chunk)
-                all_masks.append(mask)
+        def sources():
+            for ex in examples:
+                encoded = self.tokenizer.encode_multimodal(self._segments_for(ex))
+                yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist()
 
+        all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
         self.ds = HFDataset.from_dict(
             {
                 "input_ids": all_input_ids,
@@ -171,13 +171,7 @@ class KairosPretrainingDataset(Dataset):
 
 
 class KairosSFTDataset(Dataset):
-    """
-    SFT dataset for instruction following and tool calling.
-    Supports Team-ACE/ToolACE and yahma/alpaca-cleaned, or custom examples.
-    A conversation is flattened to <system>/<user>/<assistant>/<tool_result>
-    tags. Only the last assistant turn is diffused (gen_mask=1); everything
-    before it is a fixed prompt (gen_mask=0).
-    """
+    """SFT dataset: flattens a conversation to tags and diffuses only the last assistant turn (gen_mask=1)."""
 
     def __init__(self, tokenizer, max_len=512, examples=None, source="toolace"):
         self.tokenizer = tokenizer
@@ -218,10 +212,7 @@ class KairosSFTDataset(Dataset):
 
         all_ids = all_ids[: self.max_len]
         prompt_len = min(prompt_len, len(all_ids))
-        pad_len = self.max_len - len(all_ids)
-        gen_len = len(all_ids) - prompt_len
-        all_ids += [self.tokenizer.pad_token_id] * pad_len
-        gen_mask = [0] * prompt_len + [1] * gen_len + [0] * pad_len
+        all_ids, gen_mask = _pad_and_gen_mask(all_ids, prompt_len, self.max_len, self.tokenizer.pad_token_id)
 
         return {"input_ids": all_ids, "gen_mask": gen_mask, "prompt_len": prompt_len}
 
@@ -248,11 +239,7 @@ class KairosSFTDataset(Dataset):
 
 
 class KairosDPODataset(Dataset):
-    """
-    DPO dataset: a fixed prompt (gen_mask=0) plus a chosen/rejected response
-    pair (gen_mask=1), tokenized separately so the trainer can compute the
-    DPO loss from (prompt, chosen, rejected).
-    """
+    """DPO dataset: fixed prompt (gen_mask=0) plus separately-tokenized chosen/rejected responses (gen_mask=1)."""
 
     def __init__(self, tokenizer, max_len=512, examples=None):
         self.tokenizer = tokenizer
@@ -276,9 +263,7 @@ class KairosDPODataset(Dataset):
         response_ids = response_ids[: self.max_len - len(prompt_ids)]
         prompt_ids = prompt_ids[: self.max_len]
         all_ids = prompt_ids + response_ids
-        pad_len = self.max_len - len(all_ids)
-        all_ids += [self.tokenizer.pad_token_id] * pad_len
-        gen_mask = [0] * len(prompt_ids) + [1] * len(response_ids) + [0] * pad_len
+        all_ids, gen_mask = _pad_and_gen_mask(all_ids, len(prompt_ids), self.max_len, self.tokenizer.pad_token_id)
         return all_ids, gen_mask, len(prompt_ids)
 
     def _process(self, ex):
@@ -310,10 +295,7 @@ class KairosDPODataset(Dataset):
 
 
 class KairosRLDataset(Dataset):
-    """
-    RL dataset for reasoning via masked diffusion. Prompt tokens are never
-    noised (gen_mask=0); the reasoning+answer block is (gen_mask=1).
-    """
+    """RL dataset for reasoning via masked diffusion: prompt tokens are never noised (gen_mask=0)."""
 
     def __init__(self, tokenizer, max_len=2048, split="train", max_samples=None, examples=None):
         self.tokenizer = tokenizer
@@ -364,9 +346,7 @@ class KairosRLDataset(Dataset):
         gen_ids = gen_ids[: self.max_len - len(prompt_ids)]
 
         ids = prompt_ids + gen_ids
-        pad_len = self.max_len - len(ids)
-        ids += [self.tokenizer.pad_token_id] * pad_len
-        gen_mask = [0] * len(prompt_ids) + [1] * len(gen_ids) + [0] * pad_len
+        ids, gen_mask = _pad_and_gen_mask(ids, len(prompt_ids), self.max_len, self.tokenizer.pad_token_id)
 
         return {
             "input_ids": ids,

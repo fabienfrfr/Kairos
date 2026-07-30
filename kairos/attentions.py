@@ -57,9 +57,7 @@ class KairosNorm(LlamaRMSNorm):
 
 
 class KairosRotaryEmbedding(nn.Module):
-    """cos/sin cache grows on demand (amortized doubling) instead of being
-    fixed to max_position_embeddings, so generation past that length doesn't
-    index out of bounds. Cached in the dtype actually used by `x`."""
+    """cos/sin cache grows on demand (amortized doubling) so generation past max_position_embeddings never indexes out of bounds."""
 
     def __init__(self, config, head_dim):
         super().__init__()
@@ -422,9 +420,7 @@ class KairosGatedDeltaNet(nn.Module):
 
 
 class KairosLiZAttention2(nn.Module):
-    """
-    TPTT-inspired (arxiv.org/abs/2506.17671) shared QKV/O projections couple SWA and DeltaNet.
-    """
+    """TPTT-inspired (arxiv.org/abs/2506.17671) shared QKV/O projections couple SWA and DeltaNet."""
 
     def __init__(self, config, layer_idx):
         super().__init__()

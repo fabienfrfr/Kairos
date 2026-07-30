@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""
-Code Mapper: A bidirectional synchronization tool between code and JSON.
-Production-ready with strict .gitignore support via pathspec.
-
-Usage:
-python mapper.py --to-json
-python mapper.py --from-json project_structure.json
-
-Exclude directories:
-python mapper.py --to-json . project_structure.json --exclude scripts
-python mapper.py --to-json . project_structure.json --exclude scripts tests docs
-"""
+"""Code Mapper: bidirectional sync between code and JSON, with strict .gitignore support via pathspec."""
 
 import argparse
 import json

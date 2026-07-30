@@ -1,16 +1,4 @@
-"""
-kairos/pipeline.py — a thin, declarative wrapper around the pieces already in
-kairos/{modeling,tokenizer,dataset,trainer}.py: build tokenizer -> dataset ->
-model -> optimizer/scheduler -> train loop -> per-modality sanity check.
-
-Not "AutoML" in the hyperparameter-search sense — no search, no NAS. It's a
-single entry point (`KairosMultimodalPipeline`) driven entirely by three small
-dataclasses (`DataConfig`, `TrainConfig`, + the existing `KairosConfig`), so a
-notebook only has to declare config and call `.build()` / `.train()`. All the
-plumbing that used to be copy-pasted notebook cells (dataset construction,
-checkpointing, TensorBoard, the training loop itself) lives here once, tested
-once, and is reused by every notebook/script instead of re-typed.
-"""
+"""Thin, declarative wrapper: tokenizer -> dataset -> model -> optimizer/scheduler -> train loop -> per-modality check."""
 
 from __future__ import annotations
 
@@ -31,11 +19,7 @@ from .trainer import KairosDiffusionTrainer
 
 @dataclass
 class DataConfig:
-    """Everything needed to build the training dataset. Pass either
-    `multimodal_examples` (already-built list[dict]) or `multimodal_path`
-    (a .pt file, see scripts/pretrain/build_keep_it_simple_multimodal.py).
-    `text_examples` (list[dict] with kind="text") is merged in alongside,
-    since multimodal builds intentionally don't include their own text."""
+    """Everything needed to build the training dataset: multimodal_examples/path plus optional text_examples merged in."""
 
     multimodal_examples: list | None = None
     multimodal_path: str | None = None
@@ -59,12 +43,7 @@ class TrainConfig:
 
 
 class KairosMultimodalPipeline:
-    """Usage:
-    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
-    pipe.build()
-    logs = pipe.train()
-    pipe.check_per_modality_loss()
-    """
+    """Usage: pipe = KairosMultimodalPipeline(model_config, data_config, train_config); pipe.build(); pipe.train()."""
 
     def __init__(
         self,
@@ -210,9 +189,7 @@ class KairosMultimodalPipeline:
 
     # ------------------------------------------------------------- checks
     def check_per_modality_loss(self, n_batches: int = 1) -> dict[str, float]:
-        """Masks the diffusion loss to each modality present in the batch so a
-        modality being silently ignored by the router doesn't hide behind a
-        healthy-looking global average. Returns {modality_name: mean_loss}."""
+        """Masks the diffusion loss per modality so one silently ignored by the router can't hide behind the global average."""
         self._require_built()
         self.model.eval()
         losses_by_modality: dict[str, list[float]] = defaultdict(list)
@@ -231,9 +208,7 @@ class KairosMultimodalPipeline:
         return {name: sum(v) / len(v) for name, v in losses_by_modality.items()}
 
     def _per_modality_loss_for_batch(self, batch: dict) -> dict[str, float]:
-        """Same masked-diffusion recipe as KairosDiffusionTrainer.compute_loss,
-        but the cross-entropy is aggregated separately per modality id instead
-        of averaged over the whole batch."""
+        """Same masked-diffusion recipe as compute_loss, but cross-entropy is aggregated separately per modality id."""
         import torch.nn.functional as F
 
         x0 = batch["input_ids"]

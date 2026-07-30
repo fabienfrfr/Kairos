@@ -487,8 +487,7 @@ def test_supports_cu_seqlens_detects_the_parameter():
 
 
 def test_attention_without_layer_idx_warns_but_still_works(capsys):
-    """layer_idx=None disables caching but must not raise — used e.g. by
-    standalone attention tests that don't need KV caching."""
+    """layer_idx=None disables caching but must not raise."""
     cfg = DummySWAConfig()
     attn = KairosAttention(cfg, layer_idx=None)
     captured = capsys.readouterr()

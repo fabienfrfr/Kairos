@@ -1,9 +1,4 @@
-"""
-kairos/tokenizer.py — byte-level multimodal tokenizer built on ByT5Tokenizer.
-i
-Structure is expressed with periodic LOCAL markers (PixelBytes approach,
-Furfaro 2024, arxiv.org/html/2410.01820v2)
-"""
+"""Byte-level multimodal tokenizer built on ByT5Tokenizer, using periodic LOCAL markers (PixelBytes, arxiv.org/html/2410.01820v2)."""
 
 from __future__ import annotations
 
@@ -60,9 +55,7 @@ ALL_SPECIAL_TOKENS = (
 
 @dataclass
 class MultimodalSegment:
-    """One typed chunk of a sequence. `data` is UTF-8 bytes for TEXT, or the
-    marker-list returned by `encode_image`/`encode_video`/`encode_audio`/
-    `encode_lidar` for everything else."""
+    """One typed chunk of a sequence: UTF-8 bytes for TEXT, or an encode_*'s marker-list otherwise."""
 
     modality: Modality
     data: object
@@ -70,9 +63,7 @@ class MultimodalSegment:
 
 
 class KairosTokenizer(ByT5Tokenizer):
-    """Byte-level tokenizer, multimodal-aware. Text encode/decode is fully
-    backward compatible with ByT5Tokenizer. `encode_multimodal` is the single
-    entry point for mixed sequences, returning aligned input_ids/modality_ids."""
+    """Byte-level multimodal tokenizer, ByT5-compatible for text; `encode_multimodal` is the entry point for mixed sequences."""
 
     # pipeline-level constants — not stored per-instance in the stream
     IMAGE_CHANNELS = 3
@@ -130,8 +121,7 @@ class KairosTokenizer(ByT5Tokenizer):
         return ids
 
     def decode_image(self, ids: list[int], channels: int | None = None) -> np.ndarray:
-        """Dimensions recovered by counting <ENDLINE> markers, not a header.
-        Raises on inconsistent row lengths (malformed/truncated generation)."""
+        """Dimensions recovered by counting <ENDLINE> markers; raises on inconsistent row lengths."""
         channels = channels or self.IMAGE_CHANNELS
         rows, current = [], []
         for i in ids:
@@ -166,8 +156,7 @@ class KairosTokenizer(ByT5Tokenizer):
         return out
 
     def decode_video(self, ids: list[int], channels: int | None = None, fps: float = 1.0):
-        """Returns (frames, duration_seconds). fps is a pipeline fact
-        supplied at decode time, not stored in the stream."""
+        """Returns (frames, duration_seconds); fps is supplied at decode time, not stored in the stream."""
         channels = channels or self.VIDEO_CHANNELS
         frame_lists, current = [], []
         for i in ids:
@@ -234,8 +223,7 @@ class KairosTokenizer(ByT5Tokenizer):
         return out
 
     def decode_lidar(self, ids: list[int]) -> np.ndarray:
-        """Dequantized via fixed LIDAR_XYZ_RANGE/LIDAR_INTENSITY_RANGE (lossy
-        but header-free)."""
+        """Dequantized via fixed LIDAR_XYZ_RANGE/LIDAR_INTENSITY_RANGE (lossy but header-free)."""
         point_bytes, current = [], []
         for i in ids:
             if i == self._ptsep_id:
@@ -257,8 +245,7 @@ class KairosTokenizer(ByT5Tokenizer):
 
     # ---------------- multimodal sequence assembly ----------------
     def encode_multimodal(self, segments: list[MultimodalSegment], max_len: int | None = None) -> dict:
-        """Returns {"input_ids", "modality_ids"} aligned tensors. Padding uses
-        Modality.TEXT (cheapest routing scale)."""
+        """Returns {"input_ids", "modality_ids"} aligned tensors; padding uses Modality.TEXT (cheapest routing scale)."""
         all_ids: list[int] = []
         all_modality: list[int] = []
 
@@ -294,8 +281,7 @@ class KairosTokenizer(ByT5Tokenizer):
         }
 
     def decode_multimodal(self, input_ids: torch.Tensor) -> list[MultimodalSegment]:
-        """Splits on modality delimiters. Non-text `.data` is the raw id list
-        (with structural markers) — feed it to the matching decode_* method."""
+        """Splits on modality delimiters; non-text `.data` is the raw id list, feed it to the matching decode_* method."""
         ids = input_ids.tolist()
         tokens = self.convert_ids_to_tokens(ids)
         open_to_modality = {tags[0]: m for m, tags in _MODALITY_TAGS.items()}

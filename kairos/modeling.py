@@ -24,8 +24,7 @@ from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
 
 
 class KairosConfig(PretrainedConfig):
-    """modality_scales defaults every modality id up to num_modalities to at
-    least scale 0, so no modality silently gets dropped from every backbone."""
+    """modality_scales defaults every modality id up to num_modalities to scale 0 so none get silently dropped."""
 
     model_type = "kairos"
 
@@ -105,11 +104,7 @@ class KairosConfig(PretrainedConfig):
 
 
 class KairosCache(DynamicCache):
-    """Cache for block-diffusion inference: encode a frozen context once,
-    then `.clone()` before every denoising step on the block being iterated
-    on (never reuse the same instance across steps, or state would leak
-    between independent denoising attempts). Not used during pretraining,
-    where the whole sequence is noised/denoised in one shot."""
+    """Cache for block-diffusion inference: `.clone()` before each denoising step to avoid state leaking across steps."""
 
     def __init__(self, config):
         super().__init__()
@@ -233,13 +228,7 @@ class KairosAttnRes(nn.Module):
 
 
 class KairosDiffusionBackbone(nn.Module):
-    """v3 Block-AttnRes: instead of feeding the aggregator every single prior
-    layer output (O(N) sources at layer N), prior outputs are windowed into
-    blocks of `attnres_block_size` (summed within a block), so the aggregator
-    only ever sees O(N/S) sources. With attnres_block_size=1 (default) each
-    block contains exactly one layer output, which reduces this to the
-    original per-layer AttnRes graph term for term (see test_backbone /
-    test_backbone_propagates_cache for the S=1 regression coverage)."""
+    """v3 Block-AttnRes: prior layer outputs are windowed into blocks of `attnres_block_size` before aggregation, cost O(N/S)."""
 
     def __init__(self, config, use_moe=False):
         super().__init__()
@@ -307,9 +296,7 @@ class OutputHead(nn.Module):
 
 
 class KairosScaleRouter(nn.Module):
-    """Gathers active positions per scale into a padded batch, runs the
-    backbone once per scale, scatters back. Vectorized (no Python loop over
-    batch/sequence) so the cache only ever sees one real batch dimension."""
+    """Gathers active positions per scale into a padded batch, runs the backbone once per scale, and scatters back."""
 
     def __init__(self, modality_scales):
         super().__init__()
