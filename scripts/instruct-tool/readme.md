@@ -17,20 +17,19 @@ size_categories:
 
 **SimpleTool-Instruct** is a merged instruction dataset combining:
 
-- **ToolACE** — real multi-turn conversations with function-calling examples  
-- **Alpaca-cleaned** — clean, simple instruction–response pairs  
+- **ToolACE** — real multi-turn conversations with function-calling examples
+- **Alpaca-cleaned** — clean, simple instruction–response pairs
 
 The goal is to provide a unified dataset for training models that can handle both:
 
-- classic instruction-following  
+- classic instruction-following
 - tool-augmented interactions (function calling)
-
 
 ## Intended Use
 
 This dataset is designed for:
 
-- Training instruction-following LLMs  
-- Training models with **function-calling** capabilities  
-- Fine-tuning lightweight models for tool-augmented reasoning  
-- Research on hybrid conversational + tool-use datasets  
+- Training instruction-following LLMs
+- Training models with **function-calling** capabilities
+- Fine-tuning lightweight models for tool-augmented reasoning
+- Research on hybrid conversational + tool-use datasets

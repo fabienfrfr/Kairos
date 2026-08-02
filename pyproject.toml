@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "kairos"
 version = "0.1.0"
@@ -17,6 +21,7 @@ dependencies = [
     "nbformat>=5.10.4",
     "pathspec>=1.1.1",
     "pytest>=8.4.2",
+    "ruff>=0.15.20",
     "tensorboard>=2.19.0",
     "torch>=2.10.0",
     "transformers>=5.12.1", # mandatoy for gemma
@@ -42,3 +47,19 @@ dev = [
     "mwparserfromhell>=0.7.2",
     "pytest-cov>=7.1.0",
 ]
+# scripts/ (dataset builders): `uv sync --group scripts` to install
+scripts = [
+    "av>=13.1.0",
+    "requests>=2.32.3",
+    "tqdm>=4.67.0",
+]
+
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint.per-file-ignores]
+"notebook/*.py" = ["PLR1711", "B018", "I001"]

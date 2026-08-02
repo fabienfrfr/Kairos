@@ -13,8 +13,20 @@ notebook: ## Working test
 jupyter: ## If you want to use Kaggle T4x2
 	uv run marimo export ipynb notebook/playground.py -o notebook.ipynb
 
-mapper: ## Export project structure to JSON
+mapper: ## Export full project structure to JSON
 	uv run python3 mapper.py --to-json
+
+mapper-lean: ## Export project structure to JSON, excluding scripts/tests/docs
+	uv run python3 mapper.py --to-json . project_structure.json --exclude scripts tests docs
+
+build-multimodal: ## Build + push the multimodal dataset (uv sync --group scripts first)
+	uv run --group scripts python3 scripts/pretrain/build_keep_it_simple_multimodal.py
+
+dev: ## Install dev + scripts dependency groups (these are uv groups, not extras: `uv sync --group dev`, not `--extra dev`)
+	uv sync --group dev --group scripts
+
+format:
+	uv run ruff format .
 
 ##@ Maintenance
 clean: ## Remove python caches and temporary files

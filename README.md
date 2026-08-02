@@ -1,4 +1,25 @@
-# Kairos
+<h1 align="center">
+<p>🌀 Kairos</p>
+</h1>
+
+<p align="center">
+<a href="https://github.com/fabienfrfr/kairos">
+<img alt="GitHub" src="https://img.shields.io/badge/github-fabienfrfr%2Fkairos-black?logo=github">
+</a>
+<a href="https://huggingface.co/ffurfaro">
+<img alt="Hugging Face" src="https://img.shields.io/badge/HuggingFace-model-yellow?logo=huggingface">
+</a>
+</p>
+
+<h3 align="center">
+<p>Universal multimodal MoE built from scratch for efficient edge AI</p>
+</h3>
+
+<p align="center">
+<b>200M parameters</b> • <b>25M active</b> • DeltaNet • Sliding Window Attention • MoE • AttnRes • Multimodal Conv-Byte Tokenizer
+</p>
+
+---
 
 **Kairos** is an experimental 0.2B/25M hybrid MoE multimodal model **trained from scratch with low compute constraints**. It explores the combination of linear-attention (**DeltaNet**) and sliding-window attention (**SWA**), stabilized by **Attention Residuals** (**AttnRes**).
 

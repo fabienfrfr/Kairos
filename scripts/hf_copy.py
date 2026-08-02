@@ -1,11 +1,12 @@
 import shutil
 import tempfile
+
 from huggingface_hub import HfApi, snapshot_download, upload_folder
 
 api = HfApi()
 
 datasets = [
-    ("HuggingFaceTB/cosmopedia","ffurfaro/cosmopedia"),
+    ("HuggingFaceTB/cosmopedia", "ffurfaro/cosmopedia"),
     ("tasksource/bigbench", "ffurfaro/bigbench"),
     ("yahma/alpaca-cleaned", "ffurfaro/alpaca-cleaned"),
     ("Team-ACE/ToolACE", "ffurfaro/ToolACE"),
@@ -17,7 +18,7 @@ for _, dst in datasets:
     try:
         api.delete_repo(repo_id=dst, repo_type="dataset")
         print(f"Deleted: {dst}")
-    except:
+    except Exception:
         pass
 
 # clean upload

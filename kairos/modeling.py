@@ -1,21 +1,31 @@
+from dataclasses import dataclass
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
-from transformers import PreTrainedModel, PretrainedConfig
+from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationMixin
+from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
+
+try:
+    from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
+        DiffusionGemmaGenerationMixin,
+    )
+except ImportError:
+
+    class DiffusionGemmaGenerationMixin:
+        pass
 
 
-from .attentions import KairosLiZAttention2
+from transformers.cache_utils import DynamicCache
 
-# =========================
-# PretrainedConfig
-# =========================
+from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
+
+
 class KairosConfig(PretrainedConfig):
+    """modality_scales defaults every modality id up to num_modalities to scale 0 so none get silently dropped."""
+
     model_type = "kairos"
 
     def __init__(
@@ -26,8 +36,8 @@ class KairosConfig(PretrainedConfig):
         vocab_size=259,
         intermediate_size=2048,
         window_size=128,
-        stride = 3,
-        **kwargs
+        stride=5,
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -36,7 +46,19 @@ class KairosConfig(PretrainedConfig):
         self.num_hidden_layers = n_layers
         self.vocab_size = vocab_size
 
-        # SWA full-Attention
+        self.num_modalities = kwargs.get("num_modalities", 8)
+        self.text_modality_id = kwargs.get("text_modality_id", 0)
+        self.num_scales = kwargs.get("num_scales", 4)
+
+        default_scales = {0: [0, 1], 1: [1, 2], 2: [2, 3]}
+        for m in range(self.num_modalities):
+            default_scales.setdefault(m, [0])
+        self.modality_scales = kwargs.get("modality_scales", default_scales)
+
+        assert d_model % n_heads == 0, "hidden_size must be divisible by n_heads"
+
+        self.stride = stride
+
         self.sliding_window_size = window_size
         self.num_key_value_heads = n_heads
         self.head_dim = d_model // n_heads
@@ -44,24 +66,21 @@ class KairosConfig(PretrainedConfig):
         self.rope_theta = 10000.0
         self.max_position_embeddings = 4096
 
-        # Deltanet Attention
         self.linear_num_value_heads = kwargs.get("linear_num_value_heads", n_heads)
         self.linear_num_key_heads = kwargs.get("linear_num_key_heads", n_heads)
         self.linear_key_head_dim = kwargs.get("linear_key_head_dim", self.head_dim)
         self.linear_value_head_dim = kwargs.get("linear_value_head_dim", self.head_dim)
-        self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4) # Qwen3_5
+        self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4)
         self.hidden_act = kwargs.get("hidden_act", "silu")
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
-        
+
         self.time_step_min = 0.001
         self.time_step_max = 0.1
         self.time_step_floor = 1e-4
         self.A_init_range = (1.0, 16.0)
 
-        # FFN / MLP
         self.intermediate_size = intermediate_size
 
-        # MoE
         self.num_local_experts = kwargs.get("num_local_experts", 8)
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 2)
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", intermediate_size)
@@ -72,256 +91,381 @@ class KairosConfig(PretrainedConfig):
         self.topk_group = kwargs.get("topk_group", 1)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", False)
         self.top_k = self.num_experts_per_tok
+        self.use_moe = kwargs.get("use_moe", False)
 
-
-        # Convolutionnal Byte-Codec
-        self.stride = stride
-
-        # Layers config (required by KairosCache)
-        self.layers_config = kwargs.get(
-            "layers_config",
-            ["ld"] * n_layers  # default: DeltaNet+SWA layers
-        )
+        self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
 
-        # warning
-        assert d_model % n_heads == 0, "hidden_size must be divisible by n_heads"
+        # v3 Block-AttnRes: window prior layer outputs into blocks of S before
+        # they're summed and handed to the aggregator, so the number of AttnRes
+        # sources stays O(N/S) instead of O(N). S=1 (default) reproduces the
+        # original per-layer AttnRes graph exactly (see KairosDiffusionBackbone).
+        self.attnres_block_size = kwargs.get("attnres_block_size", 1)
 
 
-# =========================
-# Normalization
-# =========================
-class KairosNorm(LlamaRMSNorm):
-    """RMS Norm for stabilization"""
-    pass
+class KairosCache(DynamicCache):
+    """Cache for block-diffusion inference: `.clone()` before each denoising step to avoid state leaking across steps."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.conv_caches = []
+        self.ssm_caches = []
+        self._key_cache = {}
+        self._value_cache = {}
+        for idx, layer_type in enumerate(config.layers_config):
+            if "l" in layer_type or "d" in layer_type:
+                self._key_cache[idx] = None
+                self._value_cache[idx] = None
+            self.conv_caches.append(None)
+            self.ssm_caches.append(None)
+        self.window_size = config.sliding_window_size
+        self.layers_config = config.layers_config
+        self.past_length = [0 for _ in range(len(config.layers_config))]
+
+    def update(self, k, v, layer_idx):
+        added_len = k.size(1)
+        k_cache = self._key_cache[layer_idx]
+        v_cache = self._value_cache[layer_idx]
+        if k_cache is None:
+            k_cache, v_cache = k, v
+        else:
+            k_cache = torch.cat([k_cache, k], dim=1)
+            v_cache = torch.cat([v_cache, v], dim=1)
+        self._key_cache[layer_idx] = k_cache
+        self._value_cache[layer_idx] = v_cache
+        self.past_length[layer_idx] += added_len
+        return k_cache, v_cache
+
+    def trim(self, layer_idx):
+        if "l" not in self.layers_config[layer_idx]:
+            return
+        window = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
+        k = self._key_cache[layer_idx]
+        v = self._value_cache[layer_idx]
+        if k is not None and k.size(1) > window:
+            self._key_cache[layer_idx] = k[:, -window:, ...].contiguous()
+            self._value_cache[layer_idx] = v[:, -window:, ...].contiguous()
+
+    def get_ssm_cache(self, layer_idx):
+        return (self.conv_caches[layer_idx], self.ssm_caches[layer_idx])
+
+    def get_total_seen(self, layer_idx):
+        return self.past_length[layer_idx]
+
+    def clone(self):
+        new_cache = KairosCache(self.config)
+        new_cache.conv_caches = [c.clone() if c is not None else None for c in self.conv_caches]
+        new_cache.ssm_caches = [c.clone() if c is not None else None for c in self.ssm_caches]
+        new_cache._key_cache = {k: v.clone() if v is not None else None for k, v in self._key_cache.items()}
+        new_cache._value_cache = {k: v.clone() if v is not None else None for k, v in self._value_cache.items()}
+        new_cache.past_length = self.past_length.copy()
+        return new_cache
 
 
-# =========================
-# FeedForward / MoE
-# =========================
+class KairosMultiCache(DynamicCache):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.caches = [KairosCache(config) for _ in range(config.num_scales)]
+
+    def get(self, idx):
+        return self.caches[idx]
+
+    def clone(self):
+        out = KairosMultiCache.__new__(KairosMultiCache)
+        out.config = self.config
+        out.caches = [c.clone() for c in self.caches]
+        return out
+
+
 class KairosFFN(Qwen2MoeMLP):
-    """dense KairosFFN (SwiGLU + HF optimisations)."""
     pass
 
 
 class KairosMoE(DeepseekV3MoE):
-    """MoE (routing + scaling + grouping)."""
     pass
 
 
-# =========================
-# Transformer Block
-# =========================
 class DiffusionBlock(nn.Module):
-    def __init__(self, config, layer_idx, num_experts=None):
+    def __init__(self, config, layer_idx, use_moe=False):
         super().__init__()
-
         self.norm1 = KairosNorm(config.hidden_size)
         self.norm2 = KairosNorm(config.hidden_size)
-
         self.attn = KairosLiZAttention2(config, layer_idx)
+        self.ffn = KairosMoE(config) if use_moe else KairosFFN(config)
 
-        self.ffn = (
-            KairosMoE(config)
-            if num_experts is not None
-            else KairosFFN(config)
+    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+        x = x + self.attn(
+            self.norm1(x),
+            position_embeddings=position_embeddings,
+            cache_params=cache_params,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
-
-    def forward(self, x, position_embeddings=None, cache_params=None):
-        x = x + self.attn(self.norm1(x), position_embeddings=position_embeddings, cache_params=cache_params)
         x = x + self.ffn(self.norm2(x))
-
         return x
 
 
-# =========================
-# Backbone (with Attention Residual)
-# =========================
 class KairosCastingNorm(nn.RMSNorm):
-    """Cast weight to input dtype on the fly so the fused kernel dispatches under autocast."""
-
     def forward(self, x):
         w = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
         return F.rms_norm(x, self.normalized_shape, w, self.eps)
 
+
 class KairosAttnRes(nn.Module):
-    """Softmax attention over a list of prior sublayer outputs (arXiv 2603.15031)"""
     def __init__(self, n_embd):
         super().__init__()
         self.w = nn.Parameter(torch.zeros(n_embd))
         self.key_norm = KairosCastingNorm(n_embd)
 
     def forward(self, prior_values):
-        V = torch.stack(prior_values, dim=0)             # [L, B, T, d]
-        K = self.key_norm(V)                             # [L, B, T, d]
-        logits = torch.einsum("d,lbtd->lbt", self.w, K)  # [L, B, T]
-        weights = F.softmax(logits, dim=0)               # over the L source dim
-        return (weights.unsqueeze(-1) * V).sum(dim=0)    # [B, T, d]
+        V = torch.stack(prior_values, dim=0)
+        K = self.key_norm(V)
+        logits = torch.einsum("d,lbtd->lbt", self.w, K)
+        weights = F.softmax(logits, dim=0)
+        return (weights.unsqueeze(-1) * V).sum(dim=0)
 
 
 class KairosDiffusionBackbone(nn.Module):
-    def __init__(self, config, num_experts=None):
+    """v3 Block-AttnRes: prior layer outputs are windowed into blocks of `attnres_block_size` before aggregation, cost O(N/S)."""
+
+    def __init__(self, config, use_moe=False):
         super().__init__()
-
-        self.layers = nn.ModuleList([
-            DiffusionBlock(config, i, num_experts)
-            for i in range(config.num_hidden_layers)
-        ])
-
+        self.layers = nn.ModuleList([DiffusionBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
         self.norm = KairosNorm(config.hidden_size)
         self.aggregator = KairosAttnRes(config.hidden_size)
+        self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
 
-    def forward(self, x, position_embeddings=None, cache_params=None):
-        states = [x]
+    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+        emb = x
+        completed = []  # finalized block-sums of prior layer outputs
+        partial = None  # running sum of the current (unfinished) block
+        in_block = 0
+        S = self.attnres_block_size
+
+        def sources():
+            return [emb] + completed + ([partial] if partial is not None else [])
 
         for layer in self.layers:
-            h = self.aggregator(states)
-            x = layer(h, position_embeddings=position_embeddings, cache_params=cache_params)
-            states.append(x)
+            h = self.aggregator(sources())
+            x = layer(
+                h,
+                position_embeddings=position_embeddings,
+                cache_params=cache_params,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
+            partial = x if partial is None else partial + x
+            in_block += 1
+            if in_block == S:
+                completed.append(partial)
+                partial = None
+                in_block = 0
+
         return self.norm(x)
 
 
-
-# =========================
-# Embeddings, Codec & Head
-# =========================
 class KairosEmbedding(nn.Module):
-    def __init__(self, vocab_size, d_model, codec):
+    def __init__(self, vocab_size: int, num_modalities: int, d_model: int):
         super().__init__()
+        self.token_embed = nn.Embedding(vocab_size, d_model)
+        self.modality_embed = nn.Embedding(num_modalities, d_model)
+        self.scale = d_model**0.5
 
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.scale = d_model ** 0.5
-        self.codec = codec
-
-    def forward(self, x):
-        h = self.embed(x) * self.scale
-        return self.codec(h, mode="encode")
+    def forward(self, token_ids, modality_ids):
+        h = self.token_embed(token_ids)
+        h = h + self.modality_embed(modality_ids)
+        h = h * self.scale
+        return h
 
 
 class OutputHead(nn.Module):
-    def __init__(self, embedding, codec):
+    def __init__(self, embedding: KairosEmbedding):
         super().__init__()
-
-        d = embedding.embed.embedding_dim
-        self.vocab_size = embedding.embed.num_embeddings
-
-        self.codec = codec
-
-        self.lm_head = nn.Linear(d, self.vocab_size, bias=False)
-        self.lm_head.weight = embedding.embed.weight
+        d_model = embedding.token_embed.embedding_dim
+        self.vocab_size = embedding.token_embed.num_embeddings
+        self.num_modalities = embedding.modality_embed.num_embeddings
+        self.token_head = nn.Linear(d_model, self.vocab_size, bias=False)
+        self.modality_head = nn.Linear(d_model, self.num_modalities, bias=False)
+        self.token_head.weight = embedding.token_embed.weight
+        self.modality_head.weight = embedding.modality_embed.weight
 
     def forward(self, h):
-        h = self.codec(h, mode="decode")
-        return self.lm_head(h)
+        return self.token_head(h), self.modality_head(h)
 
 
-class ConvCodec(nn.Module):
-    def __init__(self, d_model, stride=3):
+class KairosScaleRouter(nn.Module):
+    """Gathers active positions per scale into a padded batch, runs the backbone once per scale, and scatters back."""
+
+    def __init__(self, modality_scales):
         super().__init__()
+        self.modality_scales = modality_scales
 
+    def build_active_mask(self, modality_ids, scale_len, scale_idx):
+        device = modality_ids.device
+        allowed = [m for m, scales in self.modality_scales.items() if scale_idx in scales]
+        if not allowed:
+            return torch.zeros(modality_ids.shape[0], scale_len, dtype=torch.bool, device=device)
+        allowed_t = torch.tensor(allowed, device=device)
+        active_full = torch.isin(modality_ids, allowed_t)
+        pooled = F.adaptive_max_pool1d(active_full.float().unsqueeze(1), scale_len).squeeze(1)
+        return pooled > 0.5
+
+    @staticmethod
+    def gather_active(x, active_mask):
+        _, _, D = x.shape
+        lengths = active_mask.sum(dim=1)
+        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        if max_len == 0:
+            return None, None, None
+        order = torch.argsort((~active_mask).long(), dim=1, stable=True)
+        positions = order[:, :max_len]
+        gathered = torch.gather(x, 1, positions.unsqueeze(-1).expand(-1, -1, D))
+        arange = torch.arange(max_len, device=x.device).unsqueeze(0)
+        pad_mask = arange < lengths.unsqueeze(1)
+        return gathered, pad_mask, positions
+
+    @staticmethod
+    def scatter_active(output, chunk, pad_mask, positions):
+        D = output.shape[-1]
+        idx = positions.unsqueeze(-1).expand(-1, -1, D)
+        current = torch.gather(output, 1, idx)
+        values = torch.where(pad_mask.unsqueeze(-1), chunk, current)
+        return output.scatter(1, idx, values)
+
+
+@dataclass
+class CodecOutput:
+    scales: list
+    length: int
+
+
+class PyramidalConvCodec(nn.Module):
+    """Parallel multi-scale convolutional codec with modality routing."""
+
+    def __init__(self, d_model, stride=5, num_scales=4):
+        super().__init__()
         self.stride = stride
+        self.num_scales = num_scales
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        for level in range(num_scales):
+            scale_stride = stride ** (level + 1)
+            kernel_size = scale_stride // 2
+            kernel_size += kernel_size % 2 == 0
+            padding = kernel_size // 2
+            self.encoders.append(
+                nn.Conv1d(
+                    d_model, d_model, kernel_size=kernel_size, stride=scale_stride, padding=padding, groups=d_model
+                )
+            )
+            self.decoders.append(
+                nn.ConvTranspose1d(
+                    d_model,
+                    d_model,
+                    kernel_size=kernel_size,
+                    stride=scale_stride,
+                    padding=padding,
+                    output_padding=max(scale_stride - 1, 0),
+                    groups=d_model,
+                )
+            )
+        self.norm = KairosNorm(d_model * num_scales)
+        self.fusion = nn.Linear(d_model * num_scales, d_model)
 
-        self.enc = nn.Conv1d(
-            d_model,
-            d_model,
-            kernel_size=5,
-            stride=stride,
-            padding=2,
-            groups=d_model
-        )
+    def encode(self, x):
+        h = x.transpose(1, 2)
+        scales = [encoder(h).transpose(1, 2) for encoder in self.encoders]
+        return CodecOutput(scales=scales, length=x.shape[1])
 
-        self.dec = nn.ConvTranspose1d(
-            d_model,
-            d_model,
-            kernel_size=5,
-            stride=stride,
-            padding=2,
-            output_padding=stride - 1,
-            groups=d_model
-        )
-        # buffer
-        self.orig_len = 0
-
-    def forward(self, x, mode="encode"):
-        # x: (B, T, d)
-        if mode == "encode":
-            self.orig_len = x.shape[1] # to fix : not-thread-safe
-            return self.enc(x.transpose(1, 2)).transpose(1, 2)
-            
-        elif mode == "decode":
-            h = self.dec(x.transpose(1, 2)).transpose(1, 2)
-            return h[:, :self.orig_len, :]
-        else:
-            raise ValueError("mode must be 'encode' or 'decode'")
+    def decode(self, encoded):
+        scales = encoded.scales
+        length = encoded.length
+        reconstructed = []
+        for scale, decoder in zip(scales, self.decoders):
+            h = decoder(scale.transpose(1, 2))
+            reconstructed.append(h.transpose(1, 2))
+        padded = []
+        for r in reconstructed:
+            if r.shape[1] < length:
+                pad_amount = length - r.shape[1]
+                r = F.pad(r.transpose(1, 2), (0, pad_amount), mode="replicate").transpose(1, 2)
+            padded.append(r[:, :length])
+        h = torch.cat(padded, dim=-1)
+        h = self.norm(h)
+        return self.fusion(h)
 
 
-# =========================
-# Full Model (standard HF-like)
-# =========================
-class DiffusionGemmaBlockDiffusionOutputWithPast(CausalLMOutputWithPast):
-    encoder_last_hidden_state: torch.FloatTensor | None = None
+@dataclass
+class KairosOutput(CausalLMOutputWithPast):
+    encoder_last_hidden_state: torch.FloatTensor = None
+    modality_logits: torch.FloatTensor = None
 
 
 class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
-    def __init__(
-        self,
-        config,
-        vocab_size=259,
-        num_experts=None,
-    ):
+    def __init__(self, config, vocab_size=None, use_moe=None):
         super().__init__(config)
-
-        # Codec
-        self.codec = ConvCodec(config.hidden_size, stride=config.stride)
-        # Embedding (learned tokenizer via conv + stride)
-        self.token_embed = KairosEmbedding(vocab_size, config.hidden_size, self.codec)
-
-        # Backbone (SWA / DeltaNet etc.)
-        self.backbone = KairosDiffusionBackbone(
-            config=config,
-            num_experts=num_experts,
+        if use_moe is None:
+            use_moe = config.use_moe
+        self.codec = PyramidalConvCodec(d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales)
+        self.router = KairosScaleRouter(config.modality_scales)
+        if vocab_size is None:
+            vocab_size = config.vocab_size
+        self.embedding = KairosEmbedding(
+            vocab_size=vocab_size, num_modalities=config.num_modalities, d_model=config.hidden_size
         )
-
-        # Output head
+        self.backbones = nn.ModuleList(
+            [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
+        )
+        self.rotary = KairosRotaryEmbedding(config, config.head_dim)
         self.norm = KairosNorm(config.hidden_size)
-        self.lm_head = OutputHead(self.token_embed, self.codec)
-
+        self.lm_head = OutputHead(self.embedding)
 
     def forward(
         self,
         input_ids=None,
         decoder_input_ids=None,
+        modality_ids=None,
+        attention_mask=None,
         self_conditioning_logits=None,
-        past_key_values=None,
         cache_params=None,
-        **kwargs
+        **kwargs,
     ):
-        # canvas
-        if decoder_input_ids is not None:
-            x = decoder_input_ids
-        elif input_ids is not None:
-            x = input_ids
-        else:
-            raise ValueError("You must provide input_ids or decoder_input_ids")
-
-        # embedding
-        h = self.token_embed(x)
-
-        # self-conditioning (diffusion)
+        x = decoder_input_ids if decoder_input_ids is not None else input_ids
+        if x is None:
+            raise ValueError()
+        if modality_ids is None:
+            modality_ids = torch.full_like(x, self.config.text_modality_id)
+        h = self.embedding(token_ids=x, modality_ids=modality_ids)
         if self_conditioning_logits is not None:
             probs = torch.softmax(self_conditioning_logits, dim=-1)
-            soft_emb = probs @ self.token_embed.embed.weight
-            h = h + soft_emb
-
-        # backbone
-        h = self.backbone(h, cache_params=cache_params)
+            h = h + (probs @ self.embedding.token_embed.weight)
+        encoded = self.codec.encode(h)
+        features = []
+        for scale_idx, (scale, backbone) in enumerate(zip(encoded.scales, self.backbones)):
+            output = scale.clone()
+            local_cache = cache_params.get(scale_idx) if cache_params is not None else None
+            active_mask = self.router.build_active_mask(modality_ids, scale.shape[1], scale_idx)
+            if attention_mask is not None:
+                pad_pool = F.adaptive_max_pool1d(attention_mask.float().unsqueeze(1), scale.shape[1]).squeeze(1)
+                active_mask = active_mask & (pad_pool > 0.5)
+            gathered, pad_mask, positions = self.router.gather_active(scale, active_mask)
+            if gathered is not None:
+                cache_offset = local_cache.get_total_seen(0) if local_cache is not None else 0
+                position_ids = positions + cache_offset
+                cos, sin = self.rotary(scale, position_ids, max_position=None)
+                chunk = backbone(
+                    gathered,
+                    position_embeddings=(cos, sin),
+                    cache_params=local_cache,
+                    attention_mask=pad_mask,
+                    position_ids=position_ids,
+                )
+                output = self.router.scatter_active(output, chunk, pad_mask, positions)
+            features.append(output)
+        decoded = CodecOutput(scales=features, length=encoded.length)
+        h = self.codec.decode(decoded)
         h = self.norm(h)
-
-        # projection vocab
-        logits = self.lm_head(h)
-
-        # HF-compatible
-        return DiffusionGemmaBlockDiffusionOutputWithPast(
-            logits=logits,
-            past_key_values=None,  # need or not ?
-        )
+        token_logits, modality_logits = self.lm_head(h)
+        return KairosOutput(logits=token_logits, modality_logits=modality_logits, past_key_values=cache_params)

@@ -305,7 +305,7 @@
        text-anchor="middle"
        dominant-baseline="central"
        style="color:#000000;font-weight:500;font-size:14px;font-family:'Anthropic Sans', '-apple-system', BlinkMacSystemFont, 'Segoe UI', sans-serif;dominant-baseline:central;text-anchor:middle;fill:#085041;stroke:none;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter"
-       id="text24">ConvCodec (stride=3)</text>
+       id="text24">PyramidalConvCodec (stride=3)</text>
     <text
        x="339.84958"
        y="215.41727"
@@ -552,7 +552,7 @@
        text-anchor="middle"
        dominant-baseline="central"
        style="fill:rgb(15, 110, 86);stroke:none;color:rgb(0, 0, 0);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central"
-       id="text41">ConvCodec decode → lm_head</text>
+       id="text41">PyramidalConvCodec decode → lm_head</text>
   </g>
   <line
      x1="340"
