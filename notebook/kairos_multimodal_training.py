@@ -205,6 +205,87 @@ def _(mo, multimodal_examples, pd, text_examples):
 
 @app.cell
 def _(mo):
+    mo.md("""
+    ## 👀 3.6 Preview samples (real decoded content, not just counts)
+    """)
+    return
+
+
+@app.cell
+def _(mo, multimodal_examples):
+    import io as _io
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from kairos.dataset import unpack_multimodal_data
+
+    def _fig_to_image(fig):
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    def _preview_row(ex):
+        modality = ex["modality"]
+        arrays = unpack_multimodal_data(ex["data"])
+        caption = (ex.get("caption") or "")[:80]
+
+        if modality == "image_caption":
+            return mo.vstack([mo.image(arrays["image"], width=120), mo.md(f"`{caption}`")])
+
+        if modality == "audio_caption":
+            audio = arrays["audio"]
+            fig, ax = plt.subplots(figsize=(3, 1))
+            ax.plot(audio, linewidth=0.5)
+            ax.axis("off")
+            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.audio(audio, rate=8000), mo.md(f"`{caption}`")])
+
+        if modality == "video_caption":
+            video = arrays["video"]  # (T, H, W, 3)
+            n = min(4, video.shape[0])
+            fig, axes = plt.subplots(1, n, figsize=(n * 1.2, 1.2))
+            for i, ax in enumerate(axes if n > 1 else [axes]):
+                ax.imshow(video[i])
+                ax.axis("off")
+            return mo.vstack([mo.image(_fig_to_image(fig), width=n * 90), mo.md(f"`{caption}`")])
+
+        if modality == "lidar":
+            points = arrays["points"]  # (N, 4) x,y,z,intensity
+            fig = plt.figure(figsize=(2.5, 2.5))
+            ax = fig.add_subplot(projection="3d")
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, c=points[:, 3], cmap="viridis")
+            ax.set_axis_off()
+            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{ex['source']}`")])
+
+        if modality == "control":
+            state, action = arrays["state"], arrays["action"]
+            fig, ax = plt.subplots(figsize=(3, 1.2))
+            ax.plot(state, label="state", linewidth=0.7)
+            ax.plot(action, label="action", linewidth=0.7)
+            ax.legend(fontsize=6)
+            ax.set_xticks([])
+            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{caption[:60]}`")])
+
+        return mo.md(f"(no preview for `{modality}`)")
+
+    _by_modality: dict[str, list] = {}
+    for _ex in multimodal_examples:
+        _by_modality.setdefault(_ex["modality"], []).append(_ex)
+
+    _sections = []
+    for _mod, _rows in _by_modality.items():
+        _sample = np.random.default_rng(0).choice(len(_rows), size=min(3, len(_rows)), replace=False)
+        _cards = [_preview_row(_rows[i]) for i in _sample]
+        _sections.append(mo.vstack([mo.md(f"### `{_mod}` ({len(_rows)} examples)"), mo.hstack(_cards, wrap=True)]))
+
+    mo.vstack(_sections) if _sections else mo.md("*(no multimodal examples loaded)*")
+    return
+
+
+@app.cell
+def _(mo):
     eval_pct = mo.ui.slider(start=0, stop=50, value=10, step=1, label="% held out for eval")
     eval_pct
     return (eval_pct,)
@@ -465,8 +546,17 @@ def _(
 
 @app.cell
 def _(mo, pipe):
-    with mo.status.spinner(title="Training..."):
-        logs = pipe.train()
+    _resumed = (pipe.ckpt_dir / "last.pt").exists()
+    if _resumed:
+        mo.callout(mo.md(f"↻ Found `last.pt` in `{pipe.ckpt_dir}` — resuming from there."), kind="info")
+
+    _total_steps = pipe.train_config.epochs * len(pipe.loader)
+    with mo.status.progress_bar(total=_total_steps, title="Training", subtitle="step 0") as _bar:
+
+        def _on_step(step, total, loss_val):
+            _bar.update(increment=1, subtitle=f"step {step}/{total} — loss {loss_val:.4f}")
+
+        logs = pipe.train(progress_callback=_on_step, resume=True)
 
     mo.callout(
         mo.md(

@@ -235,12 +235,15 @@ def _find_lidar_tar(repo_id: str) -> str:
 
 
 def _parse_lidar_frame(raw: bytes) -> np.ndarray | None:
-    """Parses one lidar sweep as flat float32 (x, y, z, [extra]); stride inferred (4 or 5)."""
+    """Parses one lidar sweep as flat float32 (x, y, z, [extra]); stride inferred (4 or 5).
+    Rejects frames with NaN/Inf (wrong stride guess produces garbage floats)."""
     n_floats = len(raw) // 4
     for stride in (4, 5):
         if n_floats % stride == 0:
             arr = np.frombuffer(raw, dtype=np.float32, count=(n_floats // stride) * stride)
-            return arr.reshape(-1, stride)[:, :4]
+            arr = arr.reshape(-1, stride)[:, :4]
+            if np.isfinite(arr).all():
+                return arr
     return None
 
 
@@ -298,7 +301,7 @@ def _parse_control_params(text: str) -> dict:
 
 
 def build_control():
-    """Control state + action. Dataset: ffurfaro/PixelBytes-OptimalControl (channel 0 = state, 1 = action)."""
+    """Control state + action. Dataset: ffurfaro/PixelBytes-OptimalControl (channel 0 = action, 1 = state)."""
     from datasets import Audio, load_dataset
 
     ds = load_dataset("ffurfaro/PixelBytes-OptimalControl", split="train", streaming=True)
@@ -314,12 +317,13 @@ def build_control():
             return None
         if arr.shape[0] != 2 or arr.shape[1] < 2:
             return None
+        # stereo layout: channel 0 (left) = action, channel 1 (right) = state
         return make_row(
             "control",
             "pixelbytes-optimalcontrol",
             caption=json.dumps(_parse_control_params(str(row.get("text", "")))),
-            state=np.clip(arr[0], -1.0, 1.0).astype(np.float32),
-            action=np.clip(arr[1], -1.0, 1.0).astype(np.float32),
+            action=np.clip(arr[0], -1.0, 1.0).astype(np.float32),
+            state=np.clip(arr[1], -1.0, 1.0).astype(np.float32),
             sample_rate=sample_rate,
         )
 

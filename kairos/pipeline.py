@@ -125,12 +125,23 @@ class KairosMultimodalPipeline:
         if self.model is None:
             raise RuntimeError("call .build() before .train()/.check_per_modality_loss()")
 
-    def train(self) -> list[dict]:
+    def train(self, progress_callback=None, resume: bool = True) -> list[dict]:
+        """`progress_callback(step, total_steps, loss)` is called after every step, if given —
+        used by the notebook to drive a live progress bar. If `resume` and a `last.pt` exists in
+        the run dir, training picks up from there instead of restarting from step 0."""
         self._require_built()
         tc = self.train_config
         self.model.train()
 
-        for epoch in range(1, tc.epochs + 1):
+        last_ckpt = self.ckpt_dir / "last.pt"
+        start_epoch = 1
+        if resume and last_ckpt.exists():
+            ckpt = self.load_checkpoint(str(last_ckpt))
+            start_epoch = ckpt.get("epoch", 1)
+
+        total_steps = tc.epochs * len(self.loader)
+
+        for epoch in range(start_epoch, tc.epochs + 1):
             epoch_loss = 0.0
             for batch in self.loader:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -150,23 +161,29 @@ class KairosMultimodalPipeline:
                 self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.global_step)
                 self.log_rows.append({"step": self.global_step, "epoch": epoch, "loss": loss_val})
 
+                if progress_callback is not None:
+                    progress_callback(self.global_step, total_steps, loss_val)
+
                 if self.global_step % tc.save_every == 0:
-                    self._save(self.ckpt_dir / f"step_{self.global_step:06d}.pt", loss_val)
+                    self._save(self.ckpt_dir / f"step_{self.global_step:06d}.pt", loss_val, epoch)
+                self._save(last_ckpt, loss_val, epoch)  # cheap, overwritten every step: always resumable
 
             avg_loss = epoch_loss / max(1, len(self.loader))
             self.writer.add_scalar("train/epoch_avg_loss", avg_loss, epoch)
             if avg_loss < self.best_loss:
                 self.best_loss = avg_loss
-                self._save(self.ckpt_dir / "best.pt", avg_loss)
+                self._save(self.ckpt_dir / "best.pt", avg_loss, epoch)
 
+        last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume from anymore
         self.writer.flush()
         self.writer.close()
         return self.log_rows
 
-    def _save(self, path: Path, loss_val: float):
+    def _save(self, path: Path, loss_val: float, epoch: int = 1):
         torch.save(
             {
                 "step": self.global_step,
+                "epoch": epoch,
                 "model_state": self.model.state_dict(),
                 "optimizer_state": self.optimizer.state_dict(),
                 "scheduler_state": self.scheduler.state_dict(),
