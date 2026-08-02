@@ -24,6 +24,7 @@ def _(mo):
 
 @app.cell
 def _():
+    import random
     from pathlib import Path
 
     import torch
@@ -42,6 +43,7 @@ def _():
         Path,
         TrainConfig,
         pd,
+        random,
         torch,
     )
 
@@ -136,37 +138,94 @@ def _(Path, mo, multimodal_source, pd, torch):
 @app.cell
 def _(mo):
     text_source = mo.ui.radio(
-        options=["ffurfaro/keep-it-simple (2%)", "small inline sample"],
-        value="ffurfaro/keep-it-simple (2%)",
+        options=["ffurfaro/keep-it-simple", "small inline sample"],
+        value="ffurfaro/keep-it-simple",
         label="Text source",
     )
-    text_source
-    return (text_source,)
+    text_pct = mo.ui.slider(start=1, stop=100, value=2, step=1, label="% of keep-it-simple to load")
+    mo.vstack([text_source, text_pct])
+    return text_pct, text_source
 
 
 @app.cell
-def _(mo, text_source):
+def _(mo, text_pct, text_source):
     with mo.status.spinner(title="Loading text..."):
         if text_source.value.startswith("ffurfaro"):
             try:
                 from datasets import load_dataset
 
-                _ds = load_dataset("ffurfaro/keep-it-simple", split="train[:2%]")
-                text_examples = [{"kind": "text", "text": f"{row['prompt']} {row['text']}".strip()} for row in _ds]
+                _ds = load_dataset("ffurfaro/keep-it-simple", split=f"train[:{text_pct.value}%]")
+                text_examples = [{"modality": "text", "text": f"{row['prompt']} {row['text']}".strip()} for row in _ds]
             except Exception as e:
                 mo.callout(mo.md(f"[fallback] keep-it-simple unavailable ({e}) — using inline sample"), kind="warn")
                 text_examples = [
-                    {"kind": "text", "text": "Paris is the capital of France."},
-                    {"kind": "text", "text": "The Earth orbits the Sun."},
+                    {"modality": "text", "text": "Paris is the capital of France."},
+                    {"modality": "text", "text": "The Earth orbits the Sun."},
                 ]
         else:
             text_examples = [
-                {"kind": "text", "text": "Paris is the capital of France."},
-                {"kind": "text", "text": "The Earth orbits the Sun."},
-                {"kind": "text", "text": "Water boils at 100 degrees Celsius."},
+                {"modality": "text", "text": "Paris is the capital of France."},
+                {"modality": "text", "text": "The Earth orbits the Sun."},
+                {"modality": "text", "text": "Water boils at 100 degrees Celsius."},
             ]
     mo.callout(mo.md(f"**Text examples:** `{len(text_examples)}`"), kind="success")
     return (text_examples,)
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## 📊 3.5 Modality overview & train/eval split
+    """)
+    return
+
+
+@app.cell
+def _(mo, multimodal_examples, pd, text_examples):
+    _all_ex = list(text_examples) + list(multimodal_examples)
+    _counts = pd.Series([ex["modality"] for ex in _all_ex]).value_counts().reset_index()
+    _counts.columns = ["modality", "count"]
+
+    try:
+        import altair as alt
+
+        _chart = (
+            alt.Chart(_counts)
+            .mark_bar()
+            .encode(x=alt.X("modality:N", sort="-y"), y="count:Q", tooltip=["modality", "count"])
+            .properties(title="Examples per modality (before train/eval split)", width=500)
+        )
+        _viz = mo.ui.altair_chart(_chart)
+    except ImportError:
+        _viz = mo.ui.table(_counts, label="Examples per modality (before split) — install altair for a chart")
+
+    mo.vstack([mo.md(f"**Total examples (text + multimodal):** `{len(_all_ex)}`"), _viz])
+    return
+
+
+@app.cell
+def _(mo):
+    eval_pct = mo.ui.slider(start=0, stop=50, value=10, step=1, label="% held out for eval")
+    eval_pct
+    return (eval_pct,)
+
+
+@app.cell
+def _(eval_pct, mo, multimodal_examples, random, text_examples):
+    _all_ex = list(text_examples) + list(multimodal_examples)
+    _rng = random.Random(0)
+    _shuffled = _all_ex.copy()
+    _rng.shuffle(_shuffled)
+    _n_eval = int(len(_shuffled) * eval_pct.value / 100)
+    eval_examples = _shuffled[:_n_eval]
+    train_examples = _shuffled[_n_eval:]
+    mo.callout(
+        mo.md(
+            f"**Train:** `{len(train_examples)}` ({100 - eval_pct.value}%) · **Eval:** `{len(eval_examples)}` ({eval_pct.value}%)"
+        ),
+        kind="success",
+    )
+    return eval_examples, train_examples
 
 
 @app.cell
@@ -326,10 +385,10 @@ def _(mo):
 def _(
     DataConfig,
     TrainConfig,
-    multimodal_examples,
-    text_examples,
+    eval_examples,
     train_batch,
     train_epochs,
+    train_examples,
     train_lr,
     train_max_len,
     train_run_dir,
@@ -337,11 +396,20 @@ def _(
     train_stride,
 ):
     data_config = DataConfig(
-        text_examples=text_examples,
-        multimodal_examples=multimodal_examples,
+        text_examples=[],
+        multimodal_examples=train_examples,
         max_len=train_max_len.value,
         stride=train_stride.value,
         batch_size=train_batch.value,
+    )
+    eval_data_config = DataConfig(
+        text_examples=[],
+        multimodal_examples=eval_examples,
+        max_len=train_max_len.value,
+        stride=train_stride.value,
+        batch_size=train_batch.value,
+        shuffle=False,
+        drop_last=False,
     )
     train_config = TrainConfig(
         lr=train_lr.value,
@@ -349,7 +417,7 @@ def _(
         save_every=train_save_every.value,
         run_dir=train_run_dir.value,
     )
-    return data_config, train_config
+    return data_config, eval_data_config, train_config
 
 
 @app.cell
@@ -410,6 +478,38 @@ def _(mo, pipe):
         kind="success",
     )
     return (logs,)
+
+
+@app.cell
+def _(eval_data_config, mo, pipe, torch):
+    from kairos.dataset import KairosPretrainingDataset
+    from torch.utils.data import DataLoader
+
+    if len(eval_data_config.multimodal_examples) == 0:
+        mo.callout(mo.md("No eval examples (eval % = 0) — skipping."), kind="neutral")
+        eval_loss = None
+    else:
+        with mo.status.spinner(title="Evaluating on held-out split..."):
+            eval_dataset = KairosPretrainingDataset(
+                multimodal_examples=eval_data_config.multimodal_examples,
+                tokenizer=pipe.tokenizer,
+                max_len=eval_data_config.max_len,
+                stride=eval_data_config.stride,
+            )
+            eval_loader = DataLoader(eval_dataset, batch_size=eval_data_config.batch_size, shuffle=False)
+
+            pipe.model.eval()
+            losses = []
+            with torch.no_grad():
+                for batch in eval_loader:
+                    batch = {k: v.to(pipe.device) for k, v in batch.items()}
+                    losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
+            pipe.model.train()
+            eval_loss = sum(losses) / len(losses)
+            pipe.writer.add_scalar("eval/loss", eval_loss, pipe.global_step)
+
+        mo.callout(mo.md(f"**Eval loss:** `{eval_loss:.4f}` on `{len(eval_dataset)}` samples"), kind="success")
+    return
 
 
 @app.cell
