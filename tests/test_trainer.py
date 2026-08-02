@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from kairos.dataset import KairosPretrainingDataset
+from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
 from kairos.modeling import KairosConfig, KairosDiffusionLLM
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import KairosDiffusionTrainer
@@ -60,8 +60,14 @@ def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     examples = [
-        {"kind": "text", "text": "Paris is the capital of France."},
-        {"kind": "image_caption", "image": rng.integers(0, 255, (8, 8, 3), dtype=np.uint8), "caption": "a dog"},
+        {"modality": "text", "text": "Paris is the capital of France."},
+        {
+            "modality": "image_caption",
+            "caption": "a dog",
+            "source": "test",
+            "data": pack_multimodal_data({"image": rng.integers(0, 255, (8, 8, 3), dtype=np.uint8)}),
+            "meta": None,
+        },
     ]
     ds = KairosPretrainingDataset(multimodal_examples=examples, tokenizer=tokenizer, max_len=128, stride=1)
     batch = {

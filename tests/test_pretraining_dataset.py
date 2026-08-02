@@ -1,9 +1,24 @@
+import json
+
 import numpy as np
 import pytest
 import torch
 
-from kairos.dataset import KairosPretrainingDataset
+from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
 from kairos.tokenizer import KairosTokenizer, Modality
+
+
+def make_example(modality, caption=None, source="test", **fields):
+    """Build a generic-schema row: numpy-array fields go into `data`, everything else into `meta`."""
+    arrays = {k: v for k, v in fields.items() if isinstance(v, np.ndarray)}
+    meta = {k: v for k, v in fields.items() if not isinstance(v, np.ndarray)}
+    return {
+        "modality": modality,
+        "caption": caption,
+        "source": source,
+        "data": pack_multimodal_data(arrays) if arrays else None,
+        "meta": json.dumps(meta) if meta else None,
+    }
 
 
 @pytest.fixture(scope="module")
@@ -19,24 +34,26 @@ def rng():
 @pytest.fixture
 def all_kinds_examples(rng):
     return [
-        {"kind": "text", "text": "Paris is the capital of France."},
-        {"kind": "image_caption", "image": rng.integers(0, 255, (16, 16, 3), dtype=np.uint8), "caption": "a dog"},
-        {
-            "kind": "audio_caption",
-            "audio": rng.uniform(-1, 1, 4000).astype(np.float32),
-            "sample_rate": 8000,
-            "caption": "a bark",
-        },
-        {"kind": "video_caption", "video": rng.integers(0, 255, (4, 8, 8, 3), dtype=np.uint8), "caption": "running"},
-        {"kind": "lidar", "points": rng.uniform(-10, 10, (50, 4)).astype(np.float32)},
-        {"kind": "imu", "signal": rng.uniform(-5, 5, (50, 6)).astype(np.float32)},
-        {
-            "kind": "control",
-            "action": rng.uniform(-1, 1, 200).astype(np.float32),
-            "state": rng.uniform(-1, 1, 200).astype(np.float32),
-            "sample_rate": 8000,
-            "context": "method=bang-bang",
-        },
+        {"modality": "text", "text": "Paris is the capital of France."},
+        make_example("image_caption", caption="a dog", image=rng.integers(0, 255, (16, 16, 3), dtype=np.uint8)),
+        make_example(
+            "audio_caption",
+            caption="a bark",
+            audio=rng.uniform(-1, 1, 4000).astype(np.float32),
+            sample_rate=8000,
+        ),
+        make_example(
+            "video_caption", caption="running", video=rng.integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)
+        ),
+        make_example("lidar", points=rng.uniform(-10, 10, (50, 4)).astype(np.float32)),
+        make_example("imu", signal=rng.uniform(-5, 5, (50, 6)).astype(np.float32)),
+        make_example(
+            "control",
+            caption="method=bang-bang",
+            action=rng.uniform(-1, 1, 200).astype(np.float32),
+            state=rng.uniform(-1, 1, 200).astype(np.float32),
+            sample_rate=8000,
+        ),
     ]
 
 
@@ -81,14 +98,14 @@ def test_all_kinds_cover_expected_modalities(tokenizer, all_kinds_examples):
 
 
 def test_lidar_has_no_text_caption(tokenizer, rng):
-    ex = [{"kind": "lidar", "points": rng.uniform(-10, 10, (50, 4)).astype(np.float32)}]
+    ex = [make_example("lidar", points=rng.uniform(-10, 10, (50, 4)).astype(np.float32))]
     ds = KairosPretrainingDataset(multimodal_examples=ex, tokenizer=tokenizer, max_len=4096, stride=1)
     item = ds[0]
     assert set(item["modality_ids"][item["mask"] == 1].tolist()) == {int(Modality.LIDAR)}
 
 
 def test_imu_uses_state_modality(tokenizer, rng):
-    ex = [{"kind": "imu", "signal": rng.uniform(-5, 5, (50, 6)).astype(np.float32)}]
+    ex = [make_example("imu", signal=rng.uniform(-5, 5, (50, 6)).astype(np.float32))]
     ds = KairosPretrainingDataset(multimodal_examples=ex, tokenizer=tokenizer, max_len=4096, stride=1)
     item = ds[0]
     assert set(item["modality_ids"][item["mask"] == 1].tolist()) == {int(Modality.STATE)}
@@ -96,13 +113,13 @@ def test_imu_uses_state_modality(tokenizer, rng):
 
 def test_control_uses_action_and_state_disjoint(tokenizer, rng):
     ex = [
-        {
-            "kind": "control",
-            "action": rng.uniform(-1, 1, 200).astype(np.float32),
-            "state": rng.uniform(-1, 1, 200).astype(np.float32),
-            "sample_rate": 8000,
-            "context": "bang-bang",
-        }
+        make_example(
+            "control",
+            caption="bang-bang",
+            action=rng.uniform(-1, 1, 200).astype(np.float32),
+            state=rng.uniform(-1, 1, 200).astype(np.float32),
+            sample_rate=8000,
+        )
     ]
     ds = KairosPretrainingDataset(multimodal_examples=ex, tokenizer=tokenizer, max_len=4096, stride=1)
     item = ds[0]
@@ -115,7 +132,7 @@ def test_control_uses_action_and_state_disjoint(tokenizer, rng):
 
 def test_long_example_gets_chunked(tokenizer, rng):
     big_image = rng.integers(0, 255, (40, 40, 3), dtype=np.uint8)
-    ex = [{"kind": "image_caption", "image": big_image, "caption": "big"}]
+    ex = [make_example("image_caption", caption="big", image=big_image)]
     ds = KairosPretrainingDataset(multimodal_examples=ex, tokenizer=tokenizer, max_len=256, stride=1)
     assert len(ds) > 1
 
@@ -129,9 +146,11 @@ def test_multimodal_padding_uses_text_modality(tokenizer, all_kinds_examples):
     assert torch.all(pad_region == int(Modality.TEXT))
 
 
-def test_unknown_kind_raises(tokenizer):
-    with pytest.raises(ValueError, match="unknown example kind"):
-        KairosPretrainingDataset(multimodal_examples=[{"kind": "bogus"}], tokenizer=tokenizer, max_len=64, stride=1)
+def test_unknown_modality_raises(tokenizer):
+    with pytest.raises(ValueError, match="unknown example modality"):
+        KairosPretrainingDataset(
+            multimodal_examples=[{"modality": "bogus"}], tokenizer=tokenizer, max_len=64, stride=1
+        )
 
 
 def test_multimodal_path_from_pt_file(tmp_path, tokenizer, all_kinds_examples):

@@ -1,3 +1,4 @@
+import json
 import math
 import os
 
@@ -5,9 +6,23 @@ import numpy as np
 import pytest
 import torch
 
+from kairos.dataset import pack_multimodal_data
 from kairos.modeling import KairosConfig
 from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 from kairos.tokenizer import Modality
+
+
+def make_example(modality, caption=None, source="test", **fields):
+    """Build a generic-schema row: numpy-array fields go into `data`, everything else into `meta`."""
+    arrays = {k: v for k, v in fields.items() if isinstance(v, np.ndarray)}
+    meta = {k: v for k, v in fields.items() if not isinstance(v, np.ndarray)}
+    return {
+        "modality": modality,
+        "caption": caption,
+        "source": source,
+        "data": pack_multimodal_data(arrays) if arrays else None,
+        "meta": json.dumps(meta) if meta else None,
+    }
 
 
 @pytest.fixture
@@ -18,22 +33,22 @@ def rng():
 @pytest.fixture
 def text_examples():
     return [
-        {"kind": "text", "text": "Paris is the capital of France."},
-        {"kind": "text", "text": "The Earth orbits the Sun."},
+        {"modality": "text", "text": "Paris is the capital of France."},
+        {"modality": "text", "text": "The Earth orbits the Sun."},
     ]
 
 
 @pytest.fixture
 def multimodal_examples(rng):
     return [
-        {"kind": "image_caption", "image": rng.integers(0, 255, (8, 8, 3), dtype=np.uint8), "caption": "a red square"},
-        {
-            "kind": "audio_caption",
-            "audio": rng.uniform(-1, 1, 2000).astype(np.float32),
-            "sample_rate": 4000,
-            "caption": "a beep",
-        },
-        {"kind": "lidar", "points": rng.uniform(-10, 10, (32, 4)).astype(np.float32)},
+        make_example("image_caption", caption="a red square", image=rng.integers(0, 255, (8, 8, 3), dtype=np.uint8)),
+        make_example(
+            "audio_caption",
+            caption="a beep",
+            audio=rng.uniform(-1, 1, 2000).astype(np.float32),
+            sample_rate=4000,
+        ),
+        make_example("lidar", points=rng.uniform(-10, 10, (32, 4)).astype(np.float32)),
     ]
 
 
@@ -135,7 +150,7 @@ def test_per_modality_loss_before_train_does_not_crash(model_config, text_exampl
 def test_check_per_modality_before_build_raises():
     model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
     pipe = KairosMultimodalPipeline(
-        model_config, DataConfig(text_examples=[{"kind": "text", "text": "hi"}]), TrainConfig(run_dir="unused")
+        model_config, DataConfig(text_examples=[{"modality": "text", "text": "hi"}]), TrainConfig(run_dir="unused")
     )
     with pytest.raises(RuntimeError):
         pipe.check_per_modality_loss()

@@ -1,3 +1,5 @@
+import io
+import json
 import random
 
 import numpy as np
@@ -9,6 +11,20 @@ from torch.utils.data import Dataset
 from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 MAX_LEN = 3 * 2048
+
+
+def pack_multimodal_data(arrays: dict) -> bytes:
+    """Serialize named numpy arrays into one self-describing blob — shape/dtype travel with the
+    data (via .npz), so no per-modality shape assumptions are needed to read it back."""
+    buf = io.BytesIO()
+    np.savez(buf, **arrays)
+    return buf.getvalue()
+
+
+def unpack_multimodal_data(data: bytes) -> dict:
+    """Inverse of pack_multimodal_data."""
+    with np.load(io.BytesIO(data)) as npz:
+        return {k: npz[k] for k in npz.files}
 
 
 def _pad_and_gen_mask(ids, prompt_len, max_len, pad_token_id):
@@ -93,55 +109,64 @@ class KairosPretrainingDataset(Dataset):
             "prompt_len": [0] * len(all_input_ids),
         }
 
-    def _segments_for(self, ex):
-        """Dispatch by `kind` (see build_keep_it_simple_multimodal.py)."""
-        kind = ex["kind"]
+    _KNOWN_MULTIMODAL_MODALITIES = frozenset({"image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"})
 
-        if kind == "text":
+    def _segments_for(self, ex):
+        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py). `data` is a
+        pack_multimodal_data() blob — arrays come back in whatever shape they were stored in,
+        nothing here assumes a fixed image/lidar/etc. size."""
+        modality = ex["modality"]
+
+        if modality == "text":
             return [MultimodalSegment(Modality.TEXT, ex["text"].encode("utf-8"))]
 
-        if kind == "image_caption":
-            img_markers = KairosTokenizer.encode_image(ex["image"])
+        if modality not in self._KNOWN_MULTIMODAL_MODALITIES:
+            raise ValueError(f"unknown example modality: {modality!r}")
+
+        arrays = unpack_multimodal_data(ex["data"])
+        meta = json.loads(ex["meta"]) if ex.get("meta") else {}
+        caption = ex.get("caption") or ""
+
+        if modality == "image_caption":
+            img_markers = KairosTokenizer.encode_image(arrays["image"])
             return [
-                MultimodalSegment(Modality.TEXT, ex["caption"].encode("utf-8")),
+                MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
                 MultimodalSegment(Modality.IMAGE, img_markers),
             ]
 
-        if kind == "audio_caption":
-            sr = ex.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
-            audio_markers = KairosTokenizer.encode_audio(ex["audio"], tick_samples=sr)
+        if modality == "audio_caption":
+            sr = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
+            audio_markers = KairosTokenizer.encode_audio(arrays["audio"], tick_samples=sr)
             return [
-                MultimodalSegment(Modality.TEXT, ex["caption"].encode("utf-8")),
+                MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
                 MultimodalSegment(Modality.AUDIO, audio_markers),
             ]
 
-        if kind == "video_caption":
-            video_markers = KairosTokenizer.encode_video(ex["video"])
+        if modality == "video_caption":
+            video_markers = KairosTokenizer.encode_video(arrays["video"])
             return [
-                MultimodalSegment(Modality.TEXT, ex["caption"].encode("utf-8")),
+                MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
                 MultimodalSegment(Modality.VIDEO, video_markers),
             ]
 
-        if kind == "lidar":
-            return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(ex["points"]))]
+        if modality == "lidar":
+            return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"]))]
 
-        if kind == "imu":
+        if modality == "imu":
             # flattened 1D signal, reuses the audio quantizer/tick markers
-            flat = np.clip(ex["signal"].flatten(), -1.0, 1.0).astype(np.float32)
+            flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
             return [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_audio(flat))]
 
-        if kind == "control":
-            sample_rate = ex.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
-            action_markers = KairosTokenizer.encode_audio(ex["action"], tick_samples=sample_rate)
-            state_markers = KairosTokenizer.encode_audio(ex["state"], tick_samples=sample_rate)
+        if modality == "control":
+            sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
+            action_markers = KairosTokenizer.encode_audio(arrays["action"], tick_samples=sample_rate)
+            state_markers = KairosTokenizer.encode_audio(arrays["state"], tick_samples=sample_rate)
             segments = []
-            if ex.get("context"):
-                segments.append(MultimodalSegment(Modality.TEXT, ex["context"].encode("utf-8")))
+            if caption:
+                segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
             segments.append(MultimodalSegment(Modality.ACTION, action_markers))
             segments.append(MultimodalSegment(Modality.STATE, state_markers))
             return segments
-
-        raise ValueError(f"unknown example kind: {kind!r}")
 
     def _build_multimodal(self, examples):
         if self.tokenizer is None:
