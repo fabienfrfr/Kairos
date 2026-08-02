@@ -6,7 +6,7 @@
 <a href="https://github.com/fabienfrfr/kairos">
 <img alt="GitHub" src="https://img.shields.io/badge/github-fabienfrfr%2Fkairos-black?logo=github">
 </a>
-<a href="https://huggingface.co/ffurfaro/kairos">
+<a href="https://huggingface.co/ffurfaro">
 <img alt="Hugging Face" src="https://img.shields.io/badge/HuggingFace-model-yellow?logo=huggingface">
 </a>
 </p>
