@@ -187,6 +187,125 @@ class KairosMultimodalPipeline:
         self.global_step = ckpt.get("step", self.global_step)
         return ckpt
 
+    # ------------------------------------------------------------- hf hub
+    def push_to_hub(self, repo_id: str, private: bool = False, license: str = "apache-2.0"):
+        """Pushes model+config (HF format, trust_remote_code), all local checkpoints, the
+        TensorBoard run, and a generated model card to a HF Hub model repo."""
+        from huggingface_hub import HfApi
+
+        self._require_built()
+        api = HfApi()
+        api.create_repo(repo_id, private=private, exist_ok=True)
+
+        self.model_config.register_for_auto_class()
+        self.model.register_for_auto_class("AutoModelForCausalLM")
+        self.model.push_to_hub(repo_id, private=private)
+        self.model_config.push_to_hub(repo_id, private=private)
+
+        if self.ckpt_dir.exists():
+            api.upload_folder(repo_id=repo_id, folder_path=str(self.ckpt_dir), path_in_repo="checkpoints")
+        if self.tb_dir.exists():
+            api.upload_folder(repo_id=repo_id, folder_path=str(self.tb_dir), path_in_repo="tensorboard")
+
+        api.upload_file(
+            path_or_fileobj=self._model_card(repo_id, license).encode("utf-8"),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+        )
+        return repo_id
+
+    def _model_card(self, repo_id: str, license: str) -> str:
+        name = repo_id.split("/")[-1]
+        best_loss = self.best_loss if self.best_loss != float("inf") else "n/a"
+        mc = self.model_config
+        return f"""---
+language: en
+license: {license}
+library_name: transformers
+tags:
+  - kairos
+  - diffusion
+  - multimodal
+  - moe
+  - trust_remote_code
+pipeline_tag: text-generation
+datasets:
+  - ffurfaro/keep-it-simple
+  - ffurfaro/keep-it-simple-multimodal
+---
+
+<h1 align="center"><p>🌀 {name}</p></h1>
+
+<p align="center">
+<a href="https://github.com/fabienfrfr/Kairos">
+<img alt="GitHub" src="https://img.shields.io/badge/github-fabienfrfr%2FKairos-black?logo=github">
+</a>
+<a href="https://huggingface.co/ffurfaro">
+<img alt="Hugging Face" src="https://img.shields.io/badge/HuggingFace-model-yellow?logo=huggingface">
+</a>
+</p>
+
+<h3 align="center"><p>Universal multimodal MoE trained from scratch for efficient edge AI</p></h3>
+
+Kairos is a hybrid MoE diffusion language model combining **DeltaNet** (linear attention),
+**Sliding Window Attention**, and **Attention Residuals (AttnRes)**, trained on text, image,
+video, audio, lidar, and control (state/action) modalities through a shared multimodal
+conv-byte tokenizer. See [github.com/fabienfrfr/Kairos](https://github.com/fabienfrfr/Kairos)
+for the full architecture writeup.
+
+## This checkpoint
+
+| | |
+|---|---|
+| Total params | {mc.d_model if hasattr(mc, "d_model") else "?"}-dim, {getattr(mc, "n_layers", "?")} layers |
+| Experts | {getattr(mc, "n_routed_experts", "?")} routed / {getattr(mc, "n_shared_experts", "?")} shared, top-{getattr(mc, "num_experts_per_tok", "?")} |
+| Vocab size | {mc.vocab_size} |
+| Best training loss | `{best_loss}` |
+| Steps trained | `{self.global_step}` |
+
+Note: this repo currently tracks best-training-loss only (`checkpoints/best.pt`) — no held-out
+validation split is evaluated during training yet.
+
+## Files
+
+- `checkpoints/` — `best.pt` (lowest avg training loss) + periodic `step_*.pt`
+- `tensorboard/` — `events.out.tfevents.*`, viewable in the Hub's **Training Metrics** tab
+- `config.json`, `model.safetensors` — native HF format, loadable via `trust_remote_code`
+
+## Usage
+
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("{repo_id}", trust_remote_code=True)
+```
+
+Requires the `kairos` package importable (custom architecture, not upstream `transformers`) —
+install from [github.com/fabienfrfr/Kairos](https://github.com/fabienfrfr/Kairos) first, or add
+it to `PYTHONPATH`. Alternatively, skip `Auto*` and import the class directly:
+
+```python
+from kairos.modeling import KairosDiffusionLLM
+
+model = KairosDiffusionLLM.from_pretrained("{repo_id}")
+```
+
+## Limitations
+
+Experimental, low-compute-budget training run — expect uneven quality across modalities
+(multimodal data is a small fraction of total training). Not evaluated for safety-critical use.
+
+## Citation
+
+```bibtex
+@misc{{kairos,
+  title  = {{Kairos: a multimodal MoE diffusion model for edge AI}},
+  author = {{Rince Fabien}},
+  url    = {{https://github.com/fabienfrfr/Kairos}}
+}}
+```
+"""
+
     # ------------------------------------------------------------- checks
     def check_per_modality_loss(self, n_batches: int = 1) -> dict[str, float]:
         """Masks the diffusion loss per modality so one silently ignored by the router can't hide behind the global average."""

@@ -50,7 +50,7 @@ def _():
 def _(mo, torch):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     mo.callout(mo.md(f"**Device:** `{device}`"), kind="info")
-    return (device,)
+    return
 
 
 @app.cell
@@ -62,7 +62,9 @@ def _(KairosTokenizer):
 
 @app.cell
 def _(mo):
-    mo.md("## 📦 1. Data")
+    mo.md("""
+    ## 📦 1. Data
+    """)
     return
 
 
@@ -77,19 +79,24 @@ def _(mo):
 
 @app.cell
 def _(mo):
+    multimodal_source = mo.ui.radio(
+        options=["HF Hub (ffurfaro/keep-it-simple-multimodal)", "Local .pt (build_keep_it_simple_multimodal.py)"],
+        value="HF Hub (ffurfaro/keep-it-simple-multimodal)",
+        label="Multimodal source",
+    )
     multimodal_path = mo.ui.text(
         value="data/keep-it-simple-multimodal.pt",
-        label="Multimodal .pt path (build_keep_it_simple_multimodal.py)",
+        label="Local .pt path (used if 'Local .pt' selected)",
     )
-    build_button = mo.ui.run_button(label="⚙️ Build if missing")
-    mo.hstack([multimodal_path, build_button])
-    return build_button, multimodal_path
+    build_button = mo.ui.run_button(label="⚙️ Build locally if missing")
+    mo.vstack([multimodal_source, mo.hstack([multimodal_path, build_button])])
+    return build_button, multimodal_path, multimodal_source
 
 
 @app.cell
-def _(Path, build_button, mo, multimodal_path):
+def _(Path, build_button, mo, multimodal_path, multimodal_source):
     _path = Path(multimodal_path.value)
-    if build_button.value and not _path.exists():
+    if multimodal_source.value.startswith("Local") and build_button.value and not _path.exists():
         with mo.status.spinner(title="Building keep-it-simple-multimodal..."):
             import subprocess
 
@@ -97,21 +104,28 @@ def _(Path, build_button, mo, multimodal_path):
                 ["python3", "scripts/pretrain/build_keep_it_simple_multimodal.py"],
                 check=True,
             )
-    mo.callout(
-        mo.md(f"`{_path}` {'✅ present' if _path.exists() else '❌ missing — click the button above'}"),
-        kind="success" if _path.exists() else "warn",
-    )
+    if multimodal_source.value.startswith("Local"):
+        mo.callout(
+            mo.md(f"`{_path}` {'✅ present' if _path.exists() else '❌ missing — click the button above'}"),
+            kind="success" if _path.exists() else "warn",
+        )
     return
 
 
 @app.cell
-def _(Path, mo, multimodal_path, pd, torch):
-    _path = Path(multimodal_path.value)
-    multimodal_examples = torch.load(_path, weights_only=False) if _path.exists() else []
+def _(Path, mo, multimodal_source, pd, torch):
+    with mo.status.spinner(title="Loading multimodal examples..."):
+        if multimodal_source.value.startswith("HF Hub"):
+            from datasets import load_dataset as _load_dataset
+
+            multimodal_examples = list(_load_dataset("ffurfaro/keep-it-simple-multimodal", split="train"))
+        else:
+            _path = Path("data/keep-it-simple-multimodal.pt")
+            multimodal_examples = torch.load(_path, weights_only=False) if _path.exists() else []
     if multimodal_examples:
-        _counts = pd.Series([ex["kind"] for ex in multimodal_examples]).value_counts()
+        _counts = pd.Series([ex["modality"] for ex in multimodal_examples]).value_counts()
         _table = mo.ui.table(
-            _counts.reset_index().rename(columns={"index": "kind", 0: "count"}), label="Multimodal examples by kind"
+            _counts.reset_index().rename(columns={"index": "modality", 0: "count"}), label="Multimodal examples by modality"
         )
     else:
         _table = mo.md("")
@@ -157,7 +171,9 @@ def _(mo, text_source):
 
 @app.cell
 def _(mo):
-    mo.md("## ⚙️ 2. Model configuration")
+    mo.md("""
+    ## ⚙️ 2. Model configuration
+    """)
     return
 
 
@@ -272,7 +288,9 @@ def _(
 
 @app.cell
 def _(mo):
-    mo.md("## 🏋️ 3. Training configuration")
+    mo.md("""
+    ## 🏋️ 3. Training configuration
+    """)
     return
 
 
@@ -336,7 +354,9 @@ def _(
 
 @app.cell
 def _(mo):
-    mo.md("## 🚂 4. Build & Train")
+    mo.md("""
+    ## 🚂 4. Build & Train
+    """)
     return
 
 
@@ -432,7 +452,9 @@ def _(mo, pipe):
 
 @app.cell
 def _(mo):
-    mo.md("## ♻️ 7. Resume from checkpoint")
+    mo.md("""
+    ## ♻️ 7. Resume from checkpoint
+    """)
     return
 
 
@@ -456,6 +478,35 @@ def _(mo, pipe, resume_button, resume_path):
         ),
         kind="success",
     )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## 🚀 8. Push to Hugging Face Hub
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    hub_repo_id = mo.ui.text(value="ffurfaro/kairos", label="Model repo id")
+    hub_private = mo.ui.checkbox(value=False, label="Private")
+    push_button = mo.ui.run_button(label="Push model + checkpoints + tensorboard")
+    mo.vstack([hub_repo_id, hub_private, push_button])
+    return hub_private, hub_repo_id, push_button
+
+
+@app.cell
+def _(hub_private, hub_repo_id, mo, pipe, push_button):
+    if not push_button.value:
+        mo.stop(True, mo.callout(mo.md("Click **Push** once training is done."), kind="neutral"))
+
+    with mo.status.spinner(title=f"Pushing to {hub_repo_id.value}..."):
+        pipe.push_to_hub(hub_repo_id.value, private=hub_private.value)
+
+    mo.callout(mo.md(f"✅ Pushed to [{hub_repo_id.value}](https://huggingface.co/{hub_repo_id.value})"), kind="success")
     return
 
 

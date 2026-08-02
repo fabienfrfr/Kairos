@@ -62,6 +62,44 @@ The choice of linear attention, specifically **DeltaNet**, is also driven by its
 * **Dataset:** Inspired by *SmolLM* (high-quality, filtered educational and reasoning data) + cross-modal alignment sets.
 * **Procedure:** Compact, curriculum-based training focused on **maximizing performance per compute** within a strict budget.
 
+### 1. Build the multimodal dataset
+
+```bash
+python3 scripts/pretrain/build_keep_it_simple_multimodal.py
+```
+
+Streams small slices from HF datasets (image+caption, audio+caption, video+caption, lidar,
+control state/action), resumable (Ctrl-C safe, checkpoints every 10 rows), and pushes the result
+to [`ffurfaro/keep-it-simple-multimodal`](https://huggingface.co/datasets/ffurfaro/keep-it-simple-multimodal).
+Two of the six sources are gated — accept their terms on the HF page first, then
+`huggingface-cli login` (or export `HF_TOKEN`):
+[HuggingFaceFV/finevideo](https://huggingface.co/datasets/HuggingFaceFV/finevideo),
+[nvidia/Cosmos-Transfer-LidarGen-Example](https://huggingface.co/datasets/nvidia/Cosmos-Transfer-LidarGen-Example).
+
+### 2. Train
+
+Open `notebook/kairos_multimodal_training.py` with [marimo](https://marimo.io):
+
+```bash
+marimo edit notebook/kairos_multimodal_training.py
+```
+
+It pulls `ffurfaro/keep-it-simple` (text) and `ffurfaro/keep-it-simple-multimodal` (multimodal)
+directly from the Hub, tokenizes and shuffles both together, trains, and logs to TensorBoard.
+
+### 3. Push the trained model
+
+From the notebook's last section, or programmatically:
+
+```python
+pipe.push_to_hub("ffurfaro/kairos")
+```
+
+Pushes the model in native HF format (`trust_remote_code`, inherited from `PreTrainedModel`/
+`PretrainedConfig`), every local checkpoint (`checkpoints/`), the TensorBoard run
+(`tensorboard/` — rendered by the Hub's Training Metrics tab), and a generated model card.
+
+
 ## References
 
 * *Attention Residuals for Deep Signal Stability* ([arXiv](https://arxiv.org/abs/2603.15031))
