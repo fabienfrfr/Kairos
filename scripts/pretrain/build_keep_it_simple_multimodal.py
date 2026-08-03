@@ -29,7 +29,7 @@ from kairos.dataset import pack_multimodal_data
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 CACHE_DIR = "data/cache"
-CACHE_SCHEMA_VERSION = 4  # bumped: added resumable checkpointing for streaming builders
+CACHE_SCHEMA_VERSION = 5  # bumped: caches now store RAW source rows; processing is re-run every build
 CHECKPOINT_EVERY = 10  # rows between checkpoint saves for streaming sources
 
 # per-source example count, sized so each modality lands around ~10MB (~51MB total across 5 sources)
@@ -66,36 +66,40 @@ def make_row(modality, source, caption=None, **fields):
     }
 
 
-def _iterate_resumable(ds, checkpoint_path: str, process_row, n: int, desc: str) -> list[dict]:
-    """Streams `ds` up to `n` kept rows, checkpointing."""
-    rows, consumed = [], 0
-    if os.path.exists(checkpoint_path):
-        with open(checkpoint_path, "rb") as f:
+def _iterate_resumable(ds, cache_path: str, process_row, n: int, desc: str) -> list[dict]:
+    """Streams `ds`, but caches the RAW source rows — not the processed results — so every
+    build re-runs `process_row` and picks up edits to the processing code. `--force-rebuild`
+    clears the cache to re-fetch from the network. Returns the first `n` processed rows."""
+    raw_rows, consumed = [], 0
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
             state = pickle.load(f)
-        rows, consumed = state["rows"], state["consumed"]
-        print(f"[{desc}] resuming: {len(rows)} rows kept, {consumed} source rows already consumed")
-        if len(rows) >= n:
-            return rows[:n]
-        ds = ds.skip(consumed)
+        raw_rows, consumed = state["raw_rows"], state["consumed"]
+        print(f"[{desc}] resuming: {len(raw_rows)} raw rows cached, {consumed} source rows consumed")
+
+    # always recompute from the raw rows, so processing changes take effect
+    results = [r for r in (process_row(r) for r in raw_rows) if r is not None]
 
     def save_checkpoint():
-        with open(checkpoint_path, "wb") as f:
-            pickle.dump({"rows": rows, "consumed": consumed}, f)
+        with open(cache_path, "wb") as f:
+            pickle.dump({"raw_rows": raw_rows, "consumed": consumed}, f)
 
-    with tqdm(total=n, initial=len(rows), desc=desc) as pbar:
-        for row in ds:
-            consumed += 1
-            result = process_row(row)
-            if result is not None:
-                rows.append(result)
-                pbar.update(1)
-            if consumed % CHECKPOINT_EVERY == 0:
-                save_checkpoint()
-            if len(rows) >= n:
-                break
+    with tqdm(total=n, initial=len(results), desc=desc) as pbar:
+        if len(results) < n:
+            for row in ds.skip(consumed):
+                consumed += 1
+                raw_rows.append(row)
+                result = process_row(row)
+                if result is not None:
+                    results.append(result)
+                    pbar.update(1)
+                if len(results) >= n:
+                    break
+                if consumed % CHECKPOINT_EVERY == 0:
+                    save_checkpoint()
 
     save_checkpoint()
-    return rows
+    return results[:n]
 
 
 def _peak_normalize(arr: np.ndarray, target_peak: float = 0.95) -> tuple[np.ndarray, float]:
@@ -177,8 +181,8 @@ def build_image_bbox():
             original_height=orig_h,
         )
 
-    checkpoint_path = os.path.join(CACHE_DIR, f"image_bbox_partial_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["image_bbox"], desc="image_bbox")
+    cache_path = os.path.join(CACHE_DIR, f"image_bbox_v{CACHE_SCHEMA_VERSION}.pkl")
+    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["image_bbox"], desc="image_bbox")
 
 
 def build_image_caption():
@@ -211,8 +215,8 @@ def build_image_caption():
             original_height=orig_h,
         )
 
-    checkpoint_path = os.path.join(CACHE_DIR, f"image_caption_partial_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["image_caption"], desc="image_caption")
+    cache_path = os.path.join(CACHE_DIR, f"image_caption_v{CACHE_SCHEMA_VERSION}.pkl")
+    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["image_caption"], desc="image_caption")
 
 
 def _time_stretch_to_fixed_length(signal: np.ndarray, out_samples: int) -> np.ndarray:
@@ -255,8 +259,8 @@ def build_audio_caption():
             peak_scale=peak,  # multiply by this / 0.95 to approximately undo the normalization
         )
 
-    checkpoint_path = os.path.join(CACHE_DIR, f"audio_caption_partial_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["audio_caption"], desc="audio_caption")
+    cache_path = os.path.join(CACHE_DIR, f"audio_caption_v{CACHE_SCHEMA_VERSION}.pkl")
+    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["audio_caption"], desc="audio_caption")
 
 
 def build_video_caption():
@@ -286,8 +290,8 @@ def build_video_caption():
             **video_meta,
         )
 
-    checkpoint_path = os.path.join(CACHE_DIR, f"video_caption_partial_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["video_caption"], desc="video_caption")
+    cache_path = os.path.join(CACHE_DIR, f"video_caption_v{CACHE_SCHEMA_VERSION}.pkl")
+    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["video_caption"], desc="video_caption")
 
 
 def _find_lidar_tar(repo_id: str) -> str:
@@ -376,53 +380,73 @@ def _subsample_lidar_azimuth(points: np.ndarray, n: int) -> np.ndarray:
 
 
 def build_lidar():
-    """Lidar points. Dataset: nvidia/Cosmos-Transfer-LidarGen-Example (gated, one .tar clip)."""
+    """Lidar points. Dataset: nvidia/Cosmos-Transfer-LidarGen-Example (gated, one .tar clip).
+
+    Caches the RAW merged frames (`_merge_lidar_frame` output, before subsampling) so edits to
+    `_subsample_lidar_azimuth` / `make_row` are picked up on every build. `--force-rebuild`
+    clears the cache to re-merge straight from the tar."""
     from huggingface_hub import hf_hub_download
 
-    tar_filename = LIDAR_TAR_FILENAME or _find_lidar_tar(LIDAR_REPO_ID)
-    local_path = hf_hub_download(repo_id=LIDAR_REPO_ID, repo_type="dataset", filename=tar_filename)
-
-    out, warned = [], False
+    cache_path = os.path.join(CACHE_DIR, f"lidar_v{CACHE_SCHEMA_VERSION}.pkl")
     n = N_PER_SOURCE["lidar"]
 
-    def warn_once(msg):
-        nonlocal warned
-        if not warned:
-            print(f"[lidar] {msg}")
-            warned = True
+    frames = []
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            frames = pickle.load(f)
+        print(f"[lidar] loaded {len(frames)} raw frames from cache ({cache_path})")
 
-    with tarfile.open(local_path) as tar:
-        members = [m for m in tar.getmembers() if m.isfile()]
-        groups = _group_lidar_members(members)
-        if not groups:
-            print(f"[lidar] no '<stem>.lidar_<component>.npz' members found; example names: {[m.name for m in members[:5]]}")
-            return out
+    if len(frames) < n:
+        tar_filename = LIDAR_TAR_FILENAME or _find_lidar_tar(LIDAR_REPO_ID)
+        local_path = hf_hub_download(repo_id=LIDAR_REPO_ID, repo_type="dataset", filename=tar_filename)
+        warned = False
 
-        for stem, components in tqdm(list(groups.items()), total=min(n, len(groups)), desc="lidar"):
-            if len(out) >= n:
-                break
-            points = _merge_lidar_frame(tar, components)
-            if points is None:
-                if not warned:
-                    # dump npz internals once so a real failure is debuggable, not just "0 examples"
-                    for name, member in components.items():
-                        f = tar.extractfile(member)
-                        try:
-                            with np.load(io.BytesIO(f.read())) as npz:
-                                print(f"[lidar] debug {name}: keys={npz.files} shapes={[npz[k].shape for k in npz.files]}")
-                        except Exception as e:  # noqa: BLE001
-                            print(f"[lidar] debug {name}: failed to inspect ({e})")
-                    warn_once(f"couldn't merge frame '{stem}' from components {list(components)}; skipping")
-                continue
-            out.append(
-                make_row(
-                    "lidar",
-                    "cosmos-transfer-lidargen",
-                    points=_subsample_lidar_azimuth(points, LIDAR_POINTS).astype(np.float32),
-                    n_points_original=int(points.shape[0]),
-                    components=list(components),
-                )
+        def warn_once(msg):
+            nonlocal warned
+            if not warned:
+                print(f"[lidar] {msg}")
+                warned = True
+
+        with tarfile.open(local_path) as tar:
+            members = [m for m in tar.getmembers() if m.isfile()]
+            groups = _group_lidar_members(members)
+            if not groups:
+                print(f"[lidar] no '<stem>.lidar_<component>.npz' members found; example names: {[m.name for m in members[:5]]}")
+                return []
+
+            for stem, components in tqdm(list(groups.items()), total=min(n, len(groups)), desc="lidar"):
+                if len(frames) >= n:
+                    break
+                points = _merge_lidar_frame(tar, components)
+                if points is None:
+                    if not warned:
+                        # dump npz internals once so a real failure is debuggable, not just "0 examples"
+                        for name, member in components.items():
+                            f = tar.extractfile(member)
+                            try:
+                                with np.load(io.BytesIO(f.read())) as npz:
+                                    print(f"[lidar] debug {name}: keys={npz.files} shapes={[npz[k].shape for k in npz.files]}")
+                            except Exception as e:  # noqa: BLE001
+                                print(f"[lidar] debug {name}: failed to inspect ({e})")
+                        warn_once(f"couldn't merge frame '{stem}' from components {list(components)}; skipping")
+                    continue
+                frames.append({"points": points, "components": list(components)})
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(frames, f)
+
+    out = []
+    for frame in frames[:n]:
+        points = frame["points"]
+        out.append(
+            make_row(
+                "lidar",
+                "cosmos-transfer-lidargen",
+                points=_subsample_lidar_azimuth(points, LIDAR_POINTS).astype(np.float32),
+                n_points_original=int(points.shape[0]),
+                components=frame["components"],
             )
+        )
     return out
 
 
@@ -475,8 +499,8 @@ def build_control():
             action_peak_scale=action_peak,
         )
 
-    checkpoint_path = os.path.join(CACHE_DIR, f"control_partial_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["control"], desc="control")
+    cache_path = os.path.join(CACHE_DIR, f"control_v{CACHE_SCHEMA_VERSION}.pkl")
+    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["control"], desc="control")
 
 
 def push_to_hub(examples: list[dict], repo_id: str = HF_REPO_ID):
@@ -526,7 +550,8 @@ if __name__ == "__main__":
         nargs="*",
         default=None,
         metavar="SOURCE",
-        help="Re-download these sources even if cached (no names = rebuild everything).",
+        help="Re-fetch RAW source rows for these sources (clears their raw cache; no names = all). "
+        "Processing is always re-run anyway.",
     )
     args = parser.parse_args()
 
@@ -544,20 +569,15 @@ if __name__ == "__main__":
     examples = []
     for name, builder in builders.items():
         cache_path = os.path.join(CACHE_DIR, f"{name}_v{CACHE_SCHEMA_VERSION}.pkl")
-        if name not in force and os.path.exists(cache_path):
-            with open(cache_path, "rb") as f:
-                rows = pickle.load(f)
-            print(f"[{name}] loaded {len(rows)} examples from cache ({cache_path})")
-        else:
-            try:
-                rows = builder()
-                print(f"[{name}] got {len(rows)} examples")
-                if rows:  # don't cache empty results — a source that got 0 rows should retry, not stay stuck
-                    with open(cache_path, "wb") as f:
-                        pickle.dump(rows, f)
-            except Exception as e:  # noqa: BLE001 — one broken source shouldn't abort the whole build
-                print(f"[{name}] SKIPPED ({e})")
-                rows = []
+        if name in force and os.path.exists(cache_path):
+            os.remove(cache_path)
+            print(f"[{name}] force-rebuild: cleared raw cache ({cache_path})")
+        try:
+            rows = builder()
+            print(f"[{name}] got {len(rows)} examples")
+        except Exception as e:  # noqa: BLE001 — one broken source shouldn't abort the whole build
+            print(f"[{name}] SKIPPED ({e})")
+            rows = []
         examples += rows
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
