@@ -270,15 +270,22 @@ def _(mo, multimodal_examples):
             return mo.vstack([mo.image(_fig_to_image(fig), width=n * 90), mo.md(f"`{caption}`  \n*{info}*")])
 
         if modality == "lidar":
-            points = arrays["points"]  # (N, 4) x,y,z,intensity
+            points = np.asarray(arrays["points"], dtype=np.float32)  # (N, >=2) x,y[,z[,intensity]]
+            if points.ndim == 1:
+                points = points[:, None]
+            ncols = points.shape[1]
             fig = plt.figure(figsize=(2.5, 2.5))
-            ax = fig.add_subplot(projection="3d")
-            ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, c=points[:, 3], cmap="viridis")
+            if ncols >= 3:
+                ax = fig.add_subplot(projection="3d")
+                ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, c=points[:, 3] if ncols >= 4 else "k", cmap="viridis")
+            else:
+                ax = fig.add_subplot()
+                ax.scatter(points[:, 0], points[:, 1], s=1, c="k")
             ax.set_axis_off()
             info = (
                 f"{meta['n_points_original']} pts → {points.shape[0]} (azimuth-uniform, from {meta.get('components')})"
                 if "n_points_original" in meta
-                else ""
+                else f"{points.shape[0]} pts ({ncols} cols)"
             )
             return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{ex['source']}`  \n*{info}*")])
 

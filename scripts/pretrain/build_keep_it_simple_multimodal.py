@@ -2,20 +2,13 @@
 Builds keep-it-simple-multimodal: mini multimodal dataset (image+caption, audio+caption,
 video+caption, lidar, control state/action), target ~51MB.
 
-Output shapes:
-  - image_caption : image (32, 32, 3) uint8
-  - audio_caption  : audio (8000,) float32 @ 8kHz (1s, time-stretched from original — see below)
-  - video_caption  : video (6, 16, 16, 3) uint8, 6 frames spread over the first 1s (see below)
-  - lidar          : points (300, 4) float32 (x, y, z, intensity), azimuth-uniform subsample (see below)
-  - control        : state (N,) float32, action (N,) float32, both @ source stereo sample rate
-
 Datasets used:
-  - detection-datasets/coco            -> image_caption (bbox serialized as text)
+  - detection-datasets/coco            -> image_caption (bbox serialized as text) (32, 32, 3) uint8
   - laion/relaion-coco                  -> image_caption (URL download, punsafe-filtered)
   - OpenSound/AudioCaps                  -> audio_caption
-  - HuggingFaceFV/finevideo (gated)      -> video_caption
-  - nvidia/Cosmos-Transfer-LidarGen-Example (gated) -> lidar
-  - ffurfaro/PixelBytes-OptimalControl   -> control
+  - HuggingFaceFV/finevideo (gated)      -> video_caption - video (6, 16, 16, 3) uint8
+  - nvidia/Cosmos-Transfer-LidarGen-Example (gated) -> lidar (300, 4) float32
+  - ffurfaro/PixelBytes-OptimalControl   -> control - stereo
 
 Gated sources: accept terms on the HF page, then `huggingface-cli login` or export HF_TOKEN.
 """
@@ -74,8 +67,7 @@ def make_row(modality, source, caption=None, **fields):
 
 
 def _iterate_resumable(ds, checkpoint_path: str, process_row, n: int, desc: str) -> list[dict]:
-    """Streams `ds` up to `n` kept rows, checkpointing every CHECKPOINT_EVERY rows so a
-    Ctrl-C/crash resumes via ds.skip(consumed) instead of restarting from scratch."""
+    """Streams `ds` up to `n` kept rows, checkpointing."""
     rows, consumed = [], 0
     if os.path.exists(checkpoint_path):
         with open(checkpoint_path, "rb") as f:
@@ -107,15 +99,15 @@ def _iterate_resumable(ds, checkpoint_path: str, process_row, n: int, desc: str)
 
 
 def _peak_normalize(arr: np.ndarray, target_peak: float = 0.95) -> tuple[np.ndarray, float]:
-    """Rescales `arr` so its max absolute value is `target_peak`, instead of hard-clipping —
-    clipping truncates any sample beyond [-1, 1] and is what causes audible distortion.
-    Returns (normalized_arr, peak_scale) so the original amplitude is recoverable
-    (`arr * peak_scale / target_peak` undoes it, up to float precision)."""
+    """Rescales `arr` so its max absolute value is `target_peak`, instead of hard-clipping."""
     peak = float(np.abs(arr).max())
     if peak < 1e-8:
         return arr.astype(np.float32), 1.0
     scale = target_peak / peak
     return (arr * scale).astype(np.float32), peak
+
+
+def _decode_audio_bytes(raw_bytes: bytes, layout: str = "mono", rate: int | None = None) -> tuple[np.ndarray, int]:
     """Decode audio bytes via PyAV. Returns (channels, samples) float32 in [-1, 1]."""
     import av
 
@@ -129,9 +121,7 @@ def _peak_normalize(arr: np.ndarray, target_peak: float = 0.95) -> tuple[np.ndar
 
 
 def _decode_video_bytes(raw_bytes: bytes) -> tuple[list, dict] | None:
-    """Samples VIDEO_FRAMES frames evenly spaced over min(duration, VIDEO_MAX_DURATION_SEC) —
-    time-based, not index-based, so short clips still capture real motion. Also returns the
-    original (pre-resize) width/height/fps/duration for meta."""
+    """Samples VIDEO_FRAMES frames evenly spaced over min(duration, VIDEO_MAX_DURATION_SEC)"""
     import av
     from PIL import Image
 
@@ -164,8 +154,7 @@ def _decode_video_bytes(raw_bytes: bytes) -> tuple[list, dict] | None:
 
 
 def build_image_bbox():
-    """Image + bbox-as-text. Dataset: detection-datasets/coco. Bbox stored as plain text
-    (same modality as image_caption: it's just text describing the image)."""
+    """Image + bbox-as-text. Dataset: detection-datasets/coco. Bbox stored as plain text."""
     from datasets import load_dataset
     from PIL import Image
 
@@ -193,8 +182,7 @@ def build_image_bbox():
 
 
 def build_image_caption():
-    """Image + caption. Dataset: laion/relaion-coco (image bytes not embedded, downloaded by URL;
-    filtered on `punsafe` since LAION-scale scrapes can contain unsafe content)."""
+    """Image + caption. Dataset: laion/relaion-coco."""
     import requests
     from datasets import load_dataset
     from PIL import Image
@@ -228,11 +216,7 @@ def build_image_caption():
 
 
 def _time_stretch_to_fixed_length(signal: np.ndarray, out_samples: int) -> np.ndarray:
-    """Resamples the whole clip (not just its start) to exactly `out_samples` via linear
-    interpolation over time — compresses long clips, dilates short ones. This is a simple
-    time-domain stretch (changes pitch, unlike a phase-vocoder), which is fine here since we
-    only need a fixed-length representation, not audio playback fidelity. Reversible in the
-    sense that resampling by 1/stretch_factor (stored in meta) approximates the original length."""
+    """Resamples the whole clip (not just its start) to exactly `out_samples` via linear interpolation over time"""
     if signal.shape[0] == out_samples:
         return signal
     x_old = np.linspace(0.0, 1.0, signal.shape[0])
@@ -316,20 +300,29 @@ def _find_lidar_tar(repo_id: str) -> str:
     return sorted(files)[0]
 
 
-def _load_npz_array(raw: bytes) -> np.ndarray | None:
-    """Loads the first usable array out of an .npz file's bytes (key name is unknown upfront,
-    so we just take the first array with >0 elements)."""
+def _load_npz_arrays(raw: bytes) -> dict[str, np.ndarray]:
+    """Loads ALL arrays out of an .npz file's bytes, keyed by name — a single component file."""
     with np.load(io.BytesIO(raw)) as npz:
-        for key in npz.files:
-            arr = npz[key]
-            if arr.size > 0:
-                return arr
-    return None
+        return {k: npz[k] for k in npz.files if npz[k].size > 0}
+
+
+def _stack_component_columns(arrays: dict[str, np.ndarray]) -> np.ndarray | None:
+    """Turns a component's {key: array} into a single (N, D) array"""
+    if not arrays:
+        return None
+    two_d = [a for a in arrays.values() if a.ndim == 2]
+    if len(two_d) == 1:
+        return two_d[0].astype(np.float32)
+    one_d = {k: a for k, a in arrays.items() if a.ndim == 1}
+    if not one_d:
+        return None
+    n = min(a.shape[0] for a in one_d.values())
+    cols = [a[:n] for _, a in sorted(one_d.items())]
+    return np.stack(cols, axis=1).astype(np.float32)
 
 
 def _group_lidar_members(members: list) -> dict[str, dict[str, "tarfile.TarInfo"]]:
-    """Groups tar members by frame stem: `<stem>.lidar_<component>.npz` -> {stem: {component: member}}.
-    Each frame's xyz and intensity are stored as separate .npz files."""
+    """Groups tar members by frame stem """
     groups: dict[str, dict[str, object]] = {}
     for m in members:
         if ".lidar_" not in m.name or not m.name.endswith(".npz"):
@@ -341,43 +334,39 @@ def _group_lidar_members(members: list) -> dict[str, dict[str, "tarfile.TarInfo"
 
 
 def _merge_lidar_frame(tar, components: dict) -> np.ndarray | None:
-    """Merges a frame's separate .npz components (xyz columns + intensity, or whatever's
-    present) into a single (N, 4) [x, y, z, intensity] array."""
-    arrays = {}
+    """Merges a frame's separate .npz components into a single array."""
+    per_component = {}
     for name, member in components.items():
         f = tar.extractfile(member)
         if f is None:
             continue
         try:
-            arrays[name] = _load_npz_array(f.read())
+            arrays = _load_npz_arrays(f.read())
+            stacked = _stack_component_columns(arrays)
         except Exception:  # noqa: BLE001 — a handful of corrupt npz entries is expected
             continue
+        if stacked is not None:
+            per_component[name] = stacked
 
-    xyz = next((a for k, a in arrays.items() if "col" in k or "xyz" in k or "point" in k), None)
-    if xyz is None and arrays:
-        xyz = max(arrays.values(), key=lambda a: a.size)  # best guess: largest array is the geometry
-    if xyz is None:
+    if not per_component:
         return None
-    xyz = np.asarray(xyz, dtype=np.float32).reshape(-1, xyz.shape[-1] if xyz.ndim > 1 else 1)
 
-    if xyz.shape[-1] >= 4:
-        points = xyz[:, :4]
-    else:
-        intensity = next((a for k, a in arrays.items() if "intens" in k), None)
-        if intensity is not None:
-            intensity = np.asarray(intensity, dtype=np.float32).reshape(-1, 1)[: xyz.shape[0]]
-        if intensity is None or intensity.shape[0] != xyz.shape[0]:
-            intensity = np.zeros((xyz.shape[0], 1), dtype=np.float32)
-        points = np.concatenate([xyz[:, :3], intensity], axis=1)
+    geometry = next((a for k, a in per_component.items() if "col" in k or "xyz" in k or "point" in k), None)
+    if geometry is None:
+        geometry = max(per_component.values(), key=lambda a: a.shape[1] * a.shape[0])
 
+    others = [a for k, a in per_component.items() if a is not geometry]
+    n = geometry.shape[0]
+    others = [a[:n] for a in others if a.shape[0] == n]
+    points = np.concatenate([geometry] + others, axis=1) if others else geometry
+
+    if points.shape[1] < 4:
+        return None  # not enough columns to form (x, y, z, intensity) — caller logs & skips
     return points if np.isfinite(points).all() and points.shape[0] > 0 else None
 
 
 def _subsample_lidar_azimuth(points: np.ndarray, n: int) -> np.ndarray:
-    """Subsamples to `n` points uniformly spread across the full 360° azimuth (atan2(y, x)),
-    not a contiguous prefix — a lidar sweep is ordered by scan angle, so slicing the first `n`
-    rows only covers a narrow wedge. Mirrors the video's time-uniform sampling, but in angle
-    since that's what's physically meaningful for a rotating lidar sweep."""
+    """Subsamples to `n` points uniformly spread across the full 360° azimuth """
     if points.shape[0] <= n:
         return points
     azimuth = np.arctan2(points[:, 1], points[:, 0])
@@ -456,7 +445,7 @@ def _parse_control_params(text: str) -> dict:
 
 
 def build_control():
-    """Control state + action. Dataset: ffurfaro/PixelBytes-OptimalControl (channel 0 = state, 1 = action)."""
+    """Control state + action. Dataset: ffurfaro/PixelBytes-OptimalControl (channel 1 = state, 0 = action)."""
     from datasets import Audio, load_dataset
 
     ds = load_dataset("ffurfaro/PixelBytes-OptimalControl", split="train", streaming=True)
@@ -472,8 +461,8 @@ def build_control():
             return None
         if arr.shape[0] != 2 or arr.shape[1] < 2:
             return None
-        state, state_peak = _peak_normalize(arr[0])
-        action, action_peak = _peak_normalize(arr[1])
+        state, state_peak = _peak_normalize(arr[1])
+        action, action_peak = _peak_normalize(arr[0])
         # stereo layout: channel 0 (left) = state, channel 1 (right) = action
         return make_row(
             "control",
