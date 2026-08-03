@@ -214,6 +214,7 @@ def _(mo):
 @app.cell
 def _(mo, multimodal_examples):
     import io as _io
+    import json as _json
 
     import matplotlib.pyplot as plt
     import numpy as np
@@ -230,17 +231,28 @@ def _(mo, multimodal_examples):
     def _preview_row(ex):
         modality = ex["modality"]
         arrays = unpack_multimodal_data(ex["data"])
+        meta = _json.loads(ex["meta"]) if ex.get("meta") else {}
         caption = (ex.get("caption") or "")[:80]
 
         if modality == "image_caption":
-            return mo.vstack([mo.image(arrays["image"], width=120), mo.md(f"`{caption}`")])
+            dims = f"orig {meta['original_width']}×{meta['original_height']} → 32×32" if "original_width" in meta else ""
+            return mo.vstack([mo.image(arrays["image"], width=120), mo.md(f"`{caption}`  \n*{dims}*")])
 
         if modality == "audio_caption":
             audio = arrays["audio"]
+            rate = meta.get("sample_rate", 8000)
             fig, ax = plt.subplots(figsize=(3, 1))
             ax.plot(audio, linewidth=0.5)
             ax.axis("off")
-            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.audio(audio, rate=8000), mo.md(f"`{caption}`")])
+            info = (
+                f"orig {meta['original_duration_sec']:.1f}s → {len(audio) / rate:.1f}s "
+                f"(stretch ×{meta['stretch_factor']:.2f}, peak {meta.get('peak_scale', 1.0):.2f})"
+                if "stretch_factor" in meta
+                else ""
+            )
+            return mo.vstack(
+                [mo.image(_fig_to_image(fig), width=180), mo.audio(audio, rate=rate), mo.md(f"`{caption}`  \n*{info}*")]
+            )
 
         if modality == "video_caption":
             video = arrays["video"]  # (T, H, W, 3)
@@ -249,7 +261,13 @@ def _(mo, multimodal_examples):
             for i, ax in enumerate(axes if n > 1 else [axes]):
                 ax.imshow(video[i])
                 ax.axis("off")
-            return mo.vstack([mo.image(_fig_to_image(fig), width=n * 90), mo.md(f"`{caption}`")])
+            info = (
+                f"orig {meta['original_width']}×{meta['original_height']} @ {meta['fps']:.0f}fps, "
+                f"{meta['duration_sec']:.1f}s total — {video.shape[0]} frames spread over first 1s"
+                if "original_width" in meta
+                else ""
+            )
+            return mo.vstack([mo.image(_fig_to_image(fig), width=n * 90), mo.md(f"`{caption}`  \n*{info}*")])
 
         if modality == "lidar":
             points = arrays["points"]  # (N, 4) x,y,z,intensity
@@ -257,7 +275,12 @@ def _(mo, multimodal_examples):
             ax = fig.add_subplot(projection="3d")
             ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, c=points[:, 3], cmap="viridis")
             ax.set_axis_off()
-            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{ex['source']}`")])
+            info = (
+                f"{meta['n_points_original']} pts → {points.shape[0]} (azimuth-uniform, from {meta.get('components')})"
+                if "n_points_original" in meta
+                else ""
+            )
+            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{ex['source']}`  \n*{info}*")])
 
         if modality == "control":
             state, action = arrays["state"], arrays["action"]
@@ -266,7 +289,13 @@ def _(mo, multimodal_examples):
             ax.plot(action, label="action", linewidth=0.7)
             ax.legend(fontsize=6)
             ax.set_xticks([])
-            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{caption[:60]}`")])
+            try:
+                params = _json.loads(caption)
+                caption_display = ", ".join(f"{k}={v}" for k, v in list(params.items())[:4])
+            except Exception:  # noqa: BLE001 — caption wasn't JSON, show as-is
+                caption_display = caption
+            peaks = f"peaks: state={meta.get('state_peak_scale', 1.0):.2f} action={meta.get('action_peak_scale', 1.0):.2f}"
+            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{caption_display[:80]}`  \n*{peaks}*")])
 
         return mo.md(f"(no preview for `{modality}`)")
 

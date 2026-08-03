@@ -2,6 +2,13 @@
 Builds keep-it-simple-multimodal: mini multimodal dataset (image+caption, audio+caption,
 video+caption, lidar, control state/action), target ~51MB.
 
+Output shapes:
+  - image_caption : image (32, 32, 3) uint8
+  - audio_caption  : audio (8000,) float32 @ 8kHz (1s, time-stretched from original — see below)
+  - video_caption  : video (6, 16, 16, 3) uint8, 6 frames spread over the first 1s (see below)
+  - lidar          : points (300, 4) float32 (x, y, z, intensity), azimuth-uniform subsample (see below)
+  - control        : state (N,) float32, action (N,) float32, both @ source stereo sample rate
+
 Datasets used:
   - detection-datasets/coco            -> image_caption (bbox serialized as text)
   - laion/relaion-coco                  -> image_caption (URL download, punsafe-filtered)
@@ -46,6 +53,7 @@ AUDIO_SECONDS = 1.0
 AUDIO_SAMPLE_RATE = 8000
 VIDEO_FRAMES = 6
 VIDEO_SIZE = 16
+VIDEO_MAX_DURATION_SEC = 1.0  # only sample within this window so frames capture short-term dynamics
 LIDAR_POINTS = 300
 LIDAR_REPO_ID = "nvidia/Cosmos-Transfer-LidarGen-Example"
 LIDAR_TAR_FILENAME = None  # None = auto-pick the first .tar under lidar/ in the repo
@@ -98,7 +106,16 @@ def _iterate_resumable(ds, checkpoint_path: str, process_row, n: int, desc: str)
     return rows
 
 
-def _decode_audio_bytes(raw_bytes: bytes, layout: str = "mono", rate: int | None = None) -> tuple[np.ndarray, int]:
+def _peak_normalize(arr: np.ndarray, target_peak: float = 0.95) -> tuple[np.ndarray, float]:
+    """Rescales `arr` so its max absolute value is `target_peak`, instead of hard-clipping —
+    clipping truncates any sample beyond [-1, 1] and is what causes audible distortion.
+    Returns (normalized_arr, peak_scale) so the original amplitude is recoverable
+    (`arr * peak_scale / target_peak` undoes it, up to float precision)."""
+    peak = float(np.abs(arr).max())
+    if peak < 1e-8:
+        return arr.astype(np.float32), 1.0
+    scale = target_peak / peak
+    return (arr * scale).astype(np.float32), peak
     """Decode audio bytes via PyAV. Returns (channels, samples) float32 in [-1, 1]."""
     import av
 
@@ -111,21 +128,39 @@ def _decode_audio_bytes(raw_bytes: bytes, layout: str = "mono", rate: int | None
     return np.concatenate(chunks, axis=1).astype(np.float32), out_rate
 
 
-def _decode_video_bytes(raw_bytes: bytes) -> list | None:
-    """Sample VIDEO_FRAMES evenly-spaced frames from encoded video via PyAV."""
+def _decode_video_bytes(raw_bytes: bytes) -> tuple[list, dict] | None:
+    """Samples VIDEO_FRAMES frames evenly spaced over min(duration, VIDEO_MAX_DURATION_SEC) —
+    time-based, not index-based, so short clips still capture real motion. Also returns the
+    original (pre-resize) width/height/fps/duration for meta."""
     import av
+    from PIL import Image
 
     container = av.open(io.BytesIO(raw_bytes))
-    frames = []
-    for frame in container.decode(video=0):
+    stream = container.streams.video[0]
+    orig_w, orig_h = stream.width, stream.height
+    fps = float(stream.average_rate) if stream.average_rate else None
+    duration_sec = float(stream.duration * stream.time_base) if stream.duration else None
+
+    window = min(duration_sec or VIDEO_MAX_DURATION_SEC, VIDEO_MAX_DURATION_SEC)
+    buffer = []  # (time, resized_array)
+    for frame in container.decode(stream):
+        t = float(frame.time or 0.0)
         arr = frame.to_ndarray(format="rgb24")
-        h, w = arr.shape[:2]
-        step_h, step_w = max(h // VIDEO_SIZE, 1), max(w // VIDEO_SIZE, 1)
-        frames.append(arr[::step_h, ::step_w][:VIDEO_SIZE, :VIDEO_SIZE])
-        if len(frames) >= VIDEO_FRAMES:
+        # proper resize (not a strided crop) so the whole frame is represented, not just its
+        # top-left corner after a coarse stride
+        resized = np.array(Image.fromarray(arr).resize((VIDEO_SIZE, VIDEO_SIZE), Image.BILINEAR))
+        buffer.append((t, resized))
+        if t >= window:
             break
     container.close()
-    return frames if len(frames) >= VIDEO_FRAMES else None
+    if not buffer:
+        return None
+
+    targets = np.linspace(0.0, window, VIDEO_FRAMES)
+    times = np.array([t for t, _ in buffer])
+    frames = [buffer[np.abs(times - target).argmin()][1] for target in targets]
+    meta = {"original_width": orig_w, "original_height": orig_h, "fps": fps, "duration_sec": duration_sec}
+    return frames, meta
 
 
 def build_image_bbox():
@@ -142,8 +177,16 @@ def build_image_bbox():
         if img is None or not bbox:
             return None
         caption = "; ".join(f"cat={c} box={tuple(round(v) for v in b)}" for c, b in zip(category or [], bbox))
+        orig_w, orig_h = img.size
         img = img.convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE), Image.NEAREST)
-        return make_row("image_caption", "detection-datasets-coco", caption=caption, image=np.array(img, dtype=np.uint8))
+        return make_row(
+            "image_caption",
+            "detection-datasets-coco",
+            caption=caption,
+            image=np.array(img, dtype=np.uint8),
+            original_width=orig_w,
+            original_height=orig_h,
+        )
 
     checkpoint_path = os.path.join(CACHE_DIR, f"image_bbox_partial_v{CACHE_SCHEMA_VERSION}.pkl")
     return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["image_bbox"], desc="image_bbox")
@@ -166,13 +209,35 @@ def build_image_caption():
         try:
             resp = requests.get(url, timeout=5)
             resp.raise_for_status()
-            img = Image.open(io.BytesIO(resp.content)).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE), Image.NEAREST)
+            img_full = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            orig_w, orig_h = img_full.size
+            img = img_full.resize((IMAGE_SIZE, IMAGE_SIZE), Image.NEAREST)
         except Exception:  # noqa: BLE001 — dead links/unsupported images are expected at scale
             return None
-        return make_row("image_caption", "laion-relaion-coco", caption=str(caption), image=np.array(img, dtype=np.uint8))
+        return make_row(
+            "image_caption",
+            "laion-relaion-coco",
+            caption=str(caption),
+            image=np.array(img, dtype=np.uint8),
+            original_width=orig_w,
+            original_height=orig_h,
+        )
 
     checkpoint_path = os.path.join(CACHE_DIR, f"image_caption_partial_v{CACHE_SCHEMA_VERSION}.pkl")
     return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["image_caption"], desc="image_caption")
+
+
+def _time_stretch_to_fixed_length(signal: np.ndarray, out_samples: int) -> np.ndarray:
+    """Resamples the whole clip (not just its start) to exactly `out_samples` via linear
+    interpolation over time — compresses long clips, dilates short ones. This is a simple
+    time-domain stretch (changes pitch, unlike a phase-vocoder), which is fine here since we
+    only need a fixed-length representation, not audio playback fidelity. Reversible in the
+    sense that resampling by 1/stretch_factor (stored in meta) approximates the original length."""
+    if signal.shape[0] == out_samples:
+        return signal
+    x_old = np.linspace(0.0, 1.0, signal.shape[0])
+    x_new = np.linspace(0.0, 1.0, out_samples)
+    return np.interp(x_new, x_old, signal)
 
 
 def build_audio_caption():
@@ -181,7 +246,7 @@ def build_audio_caption():
 
     ds = load_dataset("OpenSound/AudioCaps", split="train", streaming=True)
     ds = ds.cast_column("audio", Audio(decode=False))
-    max_samples = int(AUDIO_SECONDS * AUDIO_SAMPLE_RATE)
+    out_samples = int(AUDIO_SECONDS * AUDIO_SAMPLE_RATE)
 
     def process(row):
         audio, caption = row.get("audio"), row.get("caption")
@@ -191,8 +256,20 @@ def build_audio_caption():
             arr, _ = _decode_audio_bytes(audio["bytes"], layout="mono", rate=AUDIO_SAMPLE_RATE)
         except Exception:  # noqa: BLE001, S112 — a handful of malformed/unsupported clips is expected
             return None
-        arr = np.clip(arr[0, :max_samples], -1.0, 1.0)
-        return make_row("audio_caption", "audiocaps", caption=str(caption), audio=arr, sample_rate=AUDIO_SAMPLE_RATE)
+        original_samples = arr.shape[1]
+        original_duration_sec = original_samples / AUDIO_SAMPLE_RATE
+        stretched = _time_stretch_to_fixed_length(arr[0], out_samples)
+        arr, peak = _peak_normalize(stretched)
+        return make_row(
+            "audio_caption",
+            "audiocaps",
+            caption=str(caption),
+            audio=arr,
+            stretch_factor=original_samples / out_samples,  # divide output's time axis by this to undo
+            sample_rate=AUDIO_SAMPLE_RATE,
+            original_duration_sec=original_duration_sec,
+            peak_scale=peak,  # multiply by this / 0.95 to approximately undo the normalization
+        )
 
     checkpoint_path = os.path.join(CACHE_DIR, f"audio_caption_partial_v{CACHE_SCHEMA_VERSION}.pkl")
     return _iterate_resumable(ds, checkpoint_path, process, N_PER_SOURCE["audio_caption"], desc="audio_caption")
@@ -211,13 +288,18 @@ def build_video_caption():
             return None
         raw_bytes = raw if isinstance(raw, (bytes, bytearray)) else raw.get("bytes")
         try:
-            frames = _decode_video_bytes(raw_bytes)
+            decoded = _decode_video_bytes(raw_bytes)
         except Exception:  # noqa: BLE001 — a handful of malformed clips is expected
             return None
-        if not frames:
+        if not decoded:
             return None
+        frames, video_meta = decoded
         return make_row(
-            "video_caption", "finevideo", caption=str(caption), video=np.stack(frames, axis=0).astype(np.uint8)
+            "video_caption",
+            "finevideo",
+            caption=str(caption),
+            video=np.stack(frames, axis=0).astype(np.uint8),
+            **video_meta,
         )
 
     checkpoint_path = os.path.join(CACHE_DIR, f"video_caption_partial_v{CACHE_SCHEMA_VERSION}.pkl")
@@ -234,17 +316,74 @@ def _find_lidar_tar(repo_id: str) -> str:
     return sorted(files)[0]
 
 
-def _parse_lidar_frame(raw: bytes) -> np.ndarray | None:
-    """Parses one lidar sweep as flat float32 (x, y, z, [extra]); stride inferred (4 or 5).
-    Rejects frames with NaN/Inf (wrong stride guess produces garbage floats)."""
-    n_floats = len(raw) // 4
-    for stride in (4, 5):
-        if n_floats % stride == 0:
-            arr = np.frombuffer(raw, dtype=np.float32, count=(n_floats // stride) * stride)
-            arr = arr.reshape(-1, stride)[:, :4]
-            if np.isfinite(arr).all():
+def _load_npz_array(raw: bytes) -> np.ndarray | None:
+    """Loads the first usable array out of an .npz file's bytes (key name is unknown upfront,
+    so we just take the first array with >0 elements)."""
+    with np.load(io.BytesIO(raw)) as npz:
+        for key in npz.files:
+            arr = npz[key]
+            if arr.size > 0:
                 return arr
     return None
+
+
+def _group_lidar_members(members: list) -> dict[str, dict[str, "tarfile.TarInfo"]]:
+    """Groups tar members by frame stem: `<stem>.lidar_<component>.npz` -> {stem: {component: member}}.
+    Each frame's xyz and intensity are stored as separate .npz files."""
+    groups: dict[str, dict[str, object]] = {}
+    for m in members:
+        if ".lidar_" not in m.name or not m.name.endswith(".npz"):
+            continue
+        stem, _, rest = m.name.partition(".lidar_")
+        component = rest.removesuffix(".npz")
+        groups.setdefault(stem, {})[component] = m
+    return groups
+
+
+def _merge_lidar_frame(tar, components: dict) -> np.ndarray | None:
+    """Merges a frame's separate .npz components (xyz columns + intensity, or whatever's
+    present) into a single (N, 4) [x, y, z, intensity] array."""
+    arrays = {}
+    for name, member in components.items():
+        f = tar.extractfile(member)
+        if f is None:
+            continue
+        try:
+            arrays[name] = _load_npz_array(f.read())
+        except Exception:  # noqa: BLE001 — a handful of corrupt npz entries is expected
+            continue
+
+    xyz = next((a for k, a in arrays.items() if "col" in k or "xyz" in k or "point" in k), None)
+    if xyz is None and arrays:
+        xyz = max(arrays.values(), key=lambda a: a.size)  # best guess: largest array is the geometry
+    if xyz is None:
+        return None
+    xyz = np.asarray(xyz, dtype=np.float32).reshape(-1, xyz.shape[-1] if xyz.ndim > 1 else 1)
+
+    if xyz.shape[-1] >= 4:
+        points = xyz[:, :4]
+    else:
+        intensity = next((a for k, a in arrays.items() if "intens" in k), None)
+        if intensity is not None:
+            intensity = np.asarray(intensity, dtype=np.float32).reshape(-1, 1)[: xyz.shape[0]]
+        if intensity is None or intensity.shape[0] != xyz.shape[0]:
+            intensity = np.zeros((xyz.shape[0], 1), dtype=np.float32)
+        points = np.concatenate([xyz[:, :3], intensity], axis=1)
+
+    return points if np.isfinite(points).all() and points.shape[0] > 0 else None
+
+
+def _subsample_lidar_azimuth(points: np.ndarray, n: int) -> np.ndarray:
+    """Subsamples to `n` points uniformly spread across the full 360° azimuth (atan2(y, x)),
+    not a contiguous prefix — a lidar sweep is ordered by scan angle, so slicing the first `n`
+    rows only covers a narrow wedge. Mirrors the video's time-uniform sampling, but in angle
+    since that's what's physically meaningful for a rotating lidar sweep."""
+    if points.shape[0] <= n:
+        return points
+    azimuth = np.arctan2(points[:, 1], points[:, 0])
+    order = np.argsort(azimuth)
+    idx = np.linspace(0, len(order) - 1, n).astype(int)
+    return points[order[idx]]
 
 
 def build_lidar():
@@ -265,20 +404,36 @@ def build_lidar():
 
     with tarfile.open(local_path) as tar:
         members = [m for m in tar.getmembers() if m.isfile()]
-        for member in tqdm(members, total=min(n, len(members)), desc="lidar"):
+        groups = _group_lidar_members(members)
+        if not groups:
+            print(f"[lidar] no '<stem>.lidar_<component>.npz' members found; example names: {[m.name for m in members[:5]]}")
+            return out
+
+        for stem, components in tqdm(list(groups.items()), total=min(n, len(groups)), desc="lidar"):
             if len(out) >= n:
                 break
-            f = tar.extractfile(member)
-            if f is None:
+            points = _merge_lidar_frame(tar, components)
+            if points is None:
+                if not warned:
+                    # dump npz internals once so a real failure is debuggable, not just "0 examples"
+                    for name, member in components.items():
+                        f = tar.extractfile(member)
+                        try:
+                            with np.load(io.BytesIO(f.read())) as npz:
+                                print(f"[lidar] debug {name}: keys={npz.files} shapes={[npz[k].shape for k in npz.files]}")
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[lidar] debug {name}: failed to inspect ({e})")
+                    warn_once(f"couldn't merge frame '{stem}' from components {list(components)}; skipping")
                 continue
-            raw = f.read()
-            arr = _parse_lidar_frame(raw)
-            if arr is None:
-                warn_once(f"couldn't infer point stride for {member.name} ({len(raw)} bytes); skipping")
-                continue
-            if arr.shape[0] == 0:
-                continue
-            out.append(make_row("lidar", "cosmos-transfer-lidargen", points=arr[:LIDAR_POINTS].astype(np.float32)))
+            out.append(
+                make_row(
+                    "lidar",
+                    "cosmos-transfer-lidargen",
+                    points=_subsample_lidar_azimuth(points, LIDAR_POINTS).astype(np.float32),
+                    n_points_original=int(points.shape[0]),
+                    components=list(components),
+                )
+            )
     return out
 
 
@@ -301,7 +456,7 @@ def _parse_control_params(text: str) -> dict:
 
 
 def build_control():
-    """Control state + action. Dataset: ffurfaro/PixelBytes-OptimalControl (channel 0 = action, 1 = state)."""
+    """Control state + action. Dataset: ffurfaro/PixelBytes-OptimalControl (channel 0 = state, 1 = action)."""
     from datasets import Audio, load_dataset
 
     ds = load_dataset("ffurfaro/PixelBytes-OptimalControl", split="train", streaming=True)
@@ -317,14 +472,18 @@ def build_control():
             return None
         if arr.shape[0] != 2 or arr.shape[1] < 2:
             return None
-        # stereo layout: channel 0 (left) = action, channel 1 (right) = state
+        state, state_peak = _peak_normalize(arr[0])
+        action, action_peak = _peak_normalize(arr[1])
+        # stereo layout: channel 0 (left) = state, channel 1 (right) = action
         return make_row(
             "control",
             "pixelbytes-optimalcontrol",
             caption=json.dumps(_parse_control_params(str(row.get("text", "")))),
-            action=np.clip(arr[0], -1.0, 1.0).astype(np.float32),
-            state=np.clip(arr[1], -1.0, 1.0).astype(np.float32),
+            state=state,
+            action=action,
             sample_rate=sample_rate,
+            state_peak_scale=state_peak,
+            action_peak_scale=action_peak,
         )
 
     checkpoint_path = os.path.join(CACHE_DIR, f"control_partial_v{CACHE_SCHEMA_VERSION}.pkl")
