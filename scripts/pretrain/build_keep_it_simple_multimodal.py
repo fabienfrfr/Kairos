@@ -66,10 +66,12 @@ def make_row(modality, source, caption=None, **fields):
     }
 
 
-def _iterate_resumable(ds, cache_path: str, process_row, n: int, desc: str) -> list[dict]:
-    """Streams `ds`, but caches the RAW source rows — not the processed results — so every
-    build re-runs `process_row` and picks up edits to the processing code. `--force-rebuild`
-    clears the cache to re-fetch from the network. Returns the first `n` processed rows."""
+def _iterate_resumable(ds, cache_path: str, fetch, process_row, n: int, desc: str) -> list[dict]:
+    """Streams `ds`, caching the FETCHED raw rows — network payloads included — not the
+    processed results. `fetch(row)` does the network work once (its output is cached, e.g.
+    downloaded image bytes); `process_row(fetched)` is the CPU transform that is RE-RUN on
+    every build, so edits to it take effect without re-hitting the network. Returns the first
+    `n` processed rows. `--force-rebuild` clears the cache to re-fetch from the network."""
     raw_rows, consumed = [], 0
     if os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
@@ -88,8 +90,11 @@ def _iterate_resumable(ds, cache_path: str, process_row, n: int, desc: str) -> l
         if len(results) < n:
             for row in ds.skip(consumed):
                 consumed += 1
-                raw_rows.append(row)
-                result = process_row(row)
+                fetched = fetch(row)
+                if fetched is None:  # unfetchable row: count as consumed, don't cache, don't retry
+                    continue
+                raw_rows.append(fetched)
+                result = process_row(fetched)
                 if result is not None:
                     results.append(result)
                     pbar.update(1)
@@ -182,7 +187,7 @@ def build_image_bbox():
         )
 
     cache_path = os.path.join(CACHE_DIR, f"image_bbox_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["image_bbox"], desc="image_bbox")
+    return _iterate_resumable(ds, cache_path, lambda r: r, process, N_PER_SOURCE["image_bbox"], desc="image_bbox")
 
 
 def build_image_caption():
@@ -194,17 +199,27 @@ def build_image_caption():
     ds = load_dataset("laion/relaion-coco", split="train", streaming=True)
     PUNSAFE_MAX = 0.1
 
-    def process(row):
-        url, caption, punsafe = row.get("URL"), row.get("top_caption"), row.get("punsafe")
-        if not url or not caption or (punsafe is not None and punsafe > PUNSAFE_MAX):
+    def fetch(row):
+        """Download the image once; the bytes are cached as raw, so rebuilds don't re-hit URLs."""
+        url, punsafe = row.get("URL"), row.get("punsafe")
+        if not url or (punsafe is not None and punsafe > PUNSAFE_MAX):
             return None
         try:
             resp = requests.get(url, timeout=5)
             resp.raise_for_status()
-            img_full = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        except Exception:  # noqa: BLE001 — dead links are expected at scale
+            return None
+        return {**row, "_image_bytes": resp.content}
+
+    def process(cached):
+        caption = cached.get("top_caption")
+        if not caption:
+            return None
+        try:
+            img_full = Image.open(io.BytesIO(cached["_image_bytes"])).convert("RGB")
             orig_w, orig_h = img_full.size
             img = img_full.resize((IMAGE_SIZE, IMAGE_SIZE), Image.NEAREST)
-        except Exception:  # noqa: BLE001 — dead links/unsupported images are expected at scale
+        except Exception:  # noqa: BLE001 — unsupported/corrupt image bytes are expected at scale
             return None
         return make_row(
             "image_caption",
@@ -216,7 +231,7 @@ def build_image_caption():
         )
 
     cache_path = os.path.join(CACHE_DIR, f"image_caption_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["image_caption"], desc="image_caption")
+    return _iterate_resumable(ds, cache_path, fetch, process, N_PER_SOURCE["image_caption"], desc="image_caption")
 
 
 def _time_stretch_to_fixed_length(signal: np.ndarray, out_samples: int) -> np.ndarray:
@@ -260,7 +275,7 @@ def build_audio_caption():
         )
 
     cache_path = os.path.join(CACHE_DIR, f"audio_caption_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["audio_caption"], desc="audio_caption")
+    return _iterate_resumable(ds, cache_path, lambda r: r, process, N_PER_SOURCE["audio_caption"], desc="audio_caption")
 
 
 def build_video_caption():
@@ -291,7 +306,7 @@ def build_video_caption():
         )
 
     cache_path = os.path.join(CACHE_DIR, f"video_caption_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["video_caption"], desc="video_caption")
+    return _iterate_resumable(ds, cache_path, lambda r: r, process, N_PER_SOURCE["video_caption"], desc="video_caption")
 
 
 def _find_lidar_tar(repo_id: str) -> str:
@@ -500,7 +515,7 @@ def build_control():
         )
 
     cache_path = os.path.join(CACHE_DIR, f"control_v{CACHE_SCHEMA_VERSION}.pkl")
-    return _iterate_resumable(ds, cache_path, process, N_PER_SOURCE["control"], desc="control")
+    return _iterate_resumable(ds, cache_path, lambda r: r, process, N_PER_SOURCE["control"], desc="control")
 
 
 def push_to_hub(examples: list[dict], repo_id: str = HF_REPO_ID):
