@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import math
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,12 +18,11 @@ from .dataset import KairosPretrainingDataset
 from .modeling import KairosConfig, KairosDiffusionLLM
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer
+from .utils import TrainingSummary, training_summary
 
 
 @dataclass
 class DataConfig:
-    """Everything needed to build the training dataset: multimodal_examples/path plus optional text_examples merged in."""
-
     multimodal_examples: list | None = None
     multimodal_path: str | None = None
     text_examples: list | None = None
@@ -38,13 +40,14 @@ class TrainConfig:
     save_every: int = 200
     grad_clip: float = 1.0
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
-    device: str | None = None  # None -> auto (cuda if available else cpu)
+    device: str | None = None  # None -> auto
     report_to: list = field(default_factory=list)
+    hub_repo_id: str | None = None  # set to also push each periodic checkpoint to this HF repo
+    hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as they're saved
+    hub_private: bool = False
 
 
 class KairosMultimodalPipeline:
-    """Usage: pipe = KairosMultimodalPipeline(model_config, data_config, train_config); pipe.build(); pipe.train()."""
-
     def __init__(
         self,
         model_config: KairosConfig,
@@ -70,6 +73,7 @@ class KairosMultimodalPipeline:
         self.log_rows: list[dict] = []
         self.best_loss: float = float("inf")
         self.global_step: int = 0
+        self.skipped_nonfinite_steps: int = 0
 
     # ------------------------------------------------------------------ build
     def _build_dataset(self) -> KairosPretrainingDataset:
@@ -77,30 +81,20 @@ class KairosMultimodalPipeline:
         examples = list(dc.text_examples or []) + list(dc.multimodal_examples or [])
         if examples:
             return KairosPretrainingDataset(
-                multimodal_examples=examples,
-                tokenizer=self.tokenizer,
-                max_len=dc.max_len,
-                stride=dc.stride,
+                multimodal_examples=examples, tokenizer=self.tokenizer, max_len=dc.max_len, stride=dc.stride
             )
         if dc.multimodal_path:
             return KairosPretrainingDataset(
-                multimodal_path=dc.multimodal_path,
-                tokenizer=self.tokenizer,
-                max_len=dc.max_len,
-                stride=dc.stride,
+                multimodal_path=dc.multimodal_path, tokenizer=self.tokenizer, max_len=dc.max_len, stride=dc.stride
             )
         raise ValueError("DataConfig needs multimodal_examples, text_examples, and/or multimodal_path")
 
     def build(self) -> KairosMultimodalPipeline:
+        """Wires up dataset, model, optimizer, scheduler, and (if resuming later) the checkpoint dirs."""
         dc, tc = self.data_config, self.train_config
 
         self.dataset = self._build_dataset()
-        self.loader = DataLoader(
-            self.dataset,
-            batch_size=dc.batch_size,
-            shuffle=dc.shuffle,
-            drop_last=dc.drop_last,
-        )
+        self.loader = DataLoader(self.dataset, batch_size=dc.batch_size, shuffle=dc.shuffle, drop_last=dc.drop_last)
 
         self.model = KairosDiffusionLLM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
@@ -114,11 +108,50 @@ class KairosMultimodalPipeline:
         self.tb_dir.mkdir(parents=True, exist_ok=True)
 
         self.hf_trainer = KairosDiffusionTrainer(
-            model=self.model,
-            args=TrainingArguments(output_dir=str(run_dir), report_to=tc.report_to),
+            model=self.model, args=TrainingArguments(output_dir=str(run_dir), report_to=tc.report_to)
         )
         self.writer = SummaryWriter(str(self.tb_dir))
+
+        if tc.hub_repo_id and tc.hub_push_every_ckpt:
+            from huggingface_hub import HfApi
+
+            HfApi().create_repo(tc.hub_repo_id, private=tc.hub_private, exist_ok=True)
         return self
+
+    # -------------------------------------------------------------- summary
+    def summary(self, benchmark: bool = True, n_bench_steps: int = 5) -> TrainingSummary:
+        """Params/memory/estimated-time report; benchmark steps are timed then reverted, no side effects."""
+        self._require_built()
+
+        step_fn = None
+        model_state = optimizer_state = None
+        if benchmark:
+            model_state = copy.deepcopy(self.model.state_dict())
+            optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+            loader_iter = iter(self.loader)
+
+            def step_fn():
+                batch = next(loader_iter)
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                self.optimizer.zero_grad()
+                loss = self.hf_trainer.compute_loss(self.model, batch)
+                loss.backward()
+                self.optimizer.step()
+
+        try:
+            return training_summary(
+                self.model,
+                self.loader,
+                epochs=self.train_config.epochs,
+                step_fn=step_fn,
+                n_bench_steps=n_bench_steps,
+                num_experts_per_tok=self.model_config.num_experts_per_tok if self.model_config.use_moe else None,
+                num_local_experts=self.model_config.num_local_experts if self.model_config.use_moe else None,
+            )
+        finally:
+            if benchmark:
+                self.model.load_state_dict(model_state)
+                self.optimizer.load_state_dict(optimizer_state)
 
     # ---------------------------------------------------------------- train
     def _require_built(self):
@@ -126,9 +159,7 @@ class KairosMultimodalPipeline:
             raise RuntimeError("call .build() before .train()/.check_per_modality_loss()")
 
     def train(self, progress_callback=None, resume: bool = True) -> list[dict]:
-        """`progress_callback(step, total_steps, loss)` is called after every step, if given —
-        used by the notebook to drive a live progress bar. If `resume` and a `last.pt` exists in
-        the run dir, training picks up from there instead of restarting from step 0."""
+        """Runs the training loop; resumes from local last.pt or, failing that, the hub repo, if resume=True."""
         self._require_built()
         tc = self.train_config
         self.model.train()
@@ -136,10 +167,14 @@ class KairosMultimodalPipeline:
         last_ckpt = self.ckpt_dir / "last.pt"
         start_epoch = 1
         if resume and last_ckpt.exists():
-            ckpt = self.load_checkpoint(str(last_ckpt))
-            start_epoch = ckpt.get("epoch", 1)
+            start_epoch = self._safe_resume(last_ckpt)
+        elif resume and tc.hub_repo_id:
+            ckpt = self._try_resume_from_hub(tc.hub_repo_id)
+            if ckpt is not None:
+                start_epoch = ckpt.get("epoch", 1)
 
         total_steps = tc.epochs * len(self.loader)
+        skipped_nonfinite = 0
 
         for epoch in range(start_epoch, tc.epochs + 1):
             epoch_loss = 0.0
@@ -148,12 +183,22 @@ class KairosMultimodalPipeline:
 
                 self.optimizer.zero_grad()
                 loss = self.hf_trainer.compute_loss(self.model, batch)
+                loss_val = loss.item()
+                if not math.isfinite(loss_val):
+                    # a corrupted batch (extreme values in some modality) can spike the loss to
+                    # inf/nan; backpropagating it would poison the optimizer's running averages,
+                    # so skip this batch entirely rather than step on garbage
+                    skipped_nonfinite += 1
+                    warnings.warn(
+                        f"non-finite loss ({loss_val}) at step {self.global_step + 1}, skipping batch", stacklevel=2
+                    )
+                    continue
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=tc.grad_clip)
                 self.optimizer.step()
                 self.scheduler.step()
 
-                loss_val = loss.item()
                 epoch_loss += loss_val
                 self.global_step += 1
 
@@ -164,19 +209,26 @@ class KairosMultimodalPipeline:
                 if progress_callback is not None:
                     progress_callback(self.global_step, total_steps, loss_val)
 
+                self._save(last_ckpt, loss_val, epoch)  # cheap, overwritten every step: always resumable locally
                 if self.global_step % tc.save_every == 0:
-                    self._save(self.ckpt_dir / f"step_{self.global_step:06d}.pt", loss_val, epoch)
-                self._save(last_ckpt, loss_val, epoch)  # cheap, overwritten every step: always resumable
+                    step_ckpt = self.ckpt_dir / f"step_{self.global_step:06d}.pt"
+                    self._save(step_ckpt, loss_val, epoch)
+                    if tc.hub_repo_id and tc.hub_push_every_ckpt:
+                        self._push_checkpoint_to_hub(step_ckpt)
+                        self._push_checkpoint_to_hub(last_ckpt)
 
             avg_loss = epoch_loss / max(1, len(self.loader))
             self.writer.add_scalar("train/epoch_avg_loss", avg_loss, epoch)
             if avg_loss < self.best_loss:
                 self.best_loss = avg_loss
                 self._save(self.ckpt_dir / "best.pt", avg_loss, epoch)
+                if tc.hub_repo_id and tc.hub_push_every_ckpt:
+                    self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
 
         last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume from anymore
         self.writer.flush()
         self.writer.close()
+        self.skipped_nonfinite_steps = skipped_nonfinite
         return self.log_rows
 
     def _save(self, path: Path, loss_val: float, epoch: int = 1):
@@ -194,6 +246,7 @@ class KairosMultimodalPipeline:
         )
 
     def load_checkpoint(self, path: str):
+        """Loads a local .pt checkpoint into the built model/optimizer/scheduler."""
         self._require_built()
         ckpt = torch.load(path, map_location="cpu")
         self.model.load_state_dict(ckpt["model_state"])
@@ -204,10 +257,40 @@ class KairosMultimodalPipeline:
         self.global_step = ckpt.get("step", self.global_step)
         return ckpt
 
+    def _safe_resume(self, path: Path) -> int:
+        # a checkpoint saved under a different model_config (layers/experts/d_model changed) can't
+        # be loaded into the current architecture; warn and start fresh rather than crash the run
+        try:
+            ckpt = self.load_checkpoint(str(path))
+            return ckpt.get("epoch", 1)
+        except RuntimeError as e:
+            warnings.warn(f"{path} is incompatible with the current model_config, starting fresh: {e}", stacklevel=2)
+            return 1
+
     # ------------------------------------------------------------- hf hub
+    def _push_checkpoint_to_hub(self, path: Path):
+        from huggingface_hub import HfApi
+
+        HfApi().upload_file(
+            path_or_fileobj=str(path), path_in_repo=f"checkpoints/{path.name}", repo_id=self.train_config.hub_repo_id
+        )
+
+    def load_checkpoint_from_hub(self, repo_id: str, filename: str = "checkpoints/last.pt"):
+        """Downloads a checkpoint from a HF hub repo and loads it, same as load_checkpoint."""
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(repo_id, filename)
+        return self.load_checkpoint(path)
+
+    def _try_resume_from_hub(self, repo_id: str):
+        # best-effort: no checkpoint on the repo yet (fresh run) is not an error
+        try:
+            return self.load_checkpoint_from_hub(repo_id)
+        except Exception:  # noqa: BLE001 — no checkpoint on the hub yet is not an error, just start fresh
+            return None
+
     def push_to_hub(self, repo_id: str, private: bool = False, license: str = "apache-2.0"):
-        """Pushes model+config (HF format, trust_remote_code), all local checkpoints, the
-        TensorBoard run, and a generated model card to a HF Hub model repo."""
+        """Pushes the model, config, checkpoints, tensorboard logs, and a model card to a HF hub repo."""
         from huggingface_hub import HfApi
 
         self._require_built()
@@ -325,7 +408,7 @@ Experimental, low-compute-budget training run — expect uneven quality across m
 
     # ------------------------------------------------------------- checks
     def check_per_modality_loss(self, n_batches: int = 1) -> dict[str, float]:
-        """Masks the diffusion loss per modality so one silently ignored by the router can't hide behind the global average."""
+        """Diffusion loss averaged per modality over n_batches, so a router-ignored modality can't hide in the global mean."""
         self._require_built()
         self.model.eval()
         losses_by_modality: dict[str, list[float]] = defaultdict(list)
@@ -344,7 +427,6 @@ Experimental, low-compute-budget training run — expect uneven quality across m
         return {name: sum(v) / len(v) for name, v in losses_by_modality.items()}
 
     def _per_modality_loss_for_batch(self, batch: dict) -> dict[str, float]:
-        """Same masked-diffusion recipe as compute_loss, but cross-entropy is aggregated separately per modality id."""
         import torch.nn.functional as F
 
         x0 = batch["input_ids"]

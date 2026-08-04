@@ -19,12 +19,22 @@ dependencies = [
     "ipython>=7.34.0",
     "lxml>=6.0.3",
     "nbformat>=5.10.4",
+    "numpy>=1.26",
     "pathspec>=1.1.1",
     "pytest>=8.4.2",
     "ruff>=0.15.20",
     "tensorboard>=2.19.0",
     "torch>=2.10.0",
     "transformers>=5.12.1", # mandatoy for gemma
+]
+
+[project.optional-dependencies]
+# `pip install -e ".[notebook]"` — everything notebook/kairos_multimodal_training.py needs on a bare Colab/Kaggle
+notebook = [
+    "marimo>=0.23.9",
+    "matplotlib>=3.10.0",
+    "pandas>=2.0",
+    "tqdm>=4.67.0",
 ]
 
 

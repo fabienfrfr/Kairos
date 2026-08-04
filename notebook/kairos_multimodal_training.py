@@ -6,24 +6,7 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    import marimo as mo
-
-    return (mo,)
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    # 🌀 Kairos — Multimodal Pretraining Notebook
-    Text · Image · Video · Audio · Lidar · IMU · Control
-
-    Config + calls into `kairos.pipeline.KairosMultimodalPipeline`.
-    """)
-    return
-
-
-@app.cell
-def _():
+    # !pip install -q -e ".[notebook]"   # uncomment on a bare Colab/Kaggle
     import random
     from pathlib import Path
 
@@ -34,373 +17,210 @@ def _():
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
 
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"device: {device}")
+
+    tokenizer = KairosTokenizer()
+    print(f"vocab size: {len(tokenizer)}")
     return (
         DataConfig,
         KairosConfig,
         KairosMultimodalPipeline,
-        KairosTokenizer,
         Modality,
         Path,
         TrainConfig,
+        device,
         pd,
         random,
+        tokenizer,
         torch,
     )
 
 
 @app.cell
-def _(mo, torch):
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    mo.callout(mo.md(f"**Device:** `{device}`"), kind="info")
-    return
+def _():
+    # ---- data settings ----
+    MULTIMODAL_SOURCE = "hf"  # "hf" or "local" (.pt built by build_keep_it_simple_multimodal.py)
+    MULTIMODAL_LOCAL_PATH = "data/keep-it-simple-multimodal.pt"
+    BUILD_LOCAL_IF_MISSING = False
 
+    TEXT_SOURCE = "hf"  # "hf" (ffurfaro/keep-it-simple) or "inline" (tiny built-in sample)
+    TEXT_PCT = 2  # % of keep-it-simple to load, only used if TEXT_SOURCE == "hf"
 
-@app.cell
-def _(KairosTokenizer):
-    # created once, shared by model config (vocab_size) and the pipeline below
-    tokenizer = KairosTokenizer()
-    return (tokenizer,)
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## 📦 1. Data
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    `build_keep_it_simple_multimodal.py` builds a small `list[dict]` sample from 6
-    sources; `keep-it-simple` supplies the text data.
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    multimodal_source = mo.ui.radio(
-        options=["HF Hub (ffurfaro/keep-it-simple-multimodal)", "Local .pt (build_keep_it_simple_multimodal.py)"],
-        value="HF Hub (ffurfaro/keep-it-simple-multimodal)",
-        label="Multimodal source",
+    EVAL_PCT = 10  # % held out for eval
+    return (
+        BUILD_LOCAL_IF_MISSING,
+        EVAL_PCT,
+        MULTIMODAL_LOCAL_PATH,
+        MULTIMODAL_SOURCE,
+        TEXT_PCT,
+        TEXT_SOURCE,
     )
-    multimodal_path = mo.ui.text(
-        value="data/keep-it-simple-multimodal.pt",
-        label="Local .pt path (used if 'Local .pt' selected)",
-    )
-    build_button = mo.ui.run_button(label="⚙️ Build locally if missing")
-    mo.vstack([multimodal_source, mo.hstack([multimodal_path, build_button])])
-    return build_button, multimodal_path, multimodal_source
 
 
 @app.cell
-def _(Path, build_button, mo, multimodal_path, multimodal_source):
-    _path = Path(multimodal_path.value)
-    if multimodal_source.value.startswith("Local") and build_button.value and not _path.exists():
-        with mo.status.spinner(title="Building keep-it-simple-multimodal..."):
+def _(BUILD_LOCAL_IF_MISSING, MULTIMODAL_LOCAL_PATH, MULTIMODAL_SOURCE, Path, torch):
+    if MULTIMODAL_SOURCE == "hf":
+        from datasets import load_dataset as _load_dataset
+
+        multimodal_examples = list(_load_dataset("ffurfaro/keep-it-simple-multimodal", split="train"))
+    else:
+        _path = Path(MULTIMODAL_LOCAL_PATH)
+        if BUILD_LOCAL_IF_MISSING and not _path.exists():
             import subprocess
 
-            subprocess.run(
-                ["python3", "scripts/pretrain/build_keep_it_simple_multimodal.py"],
-                check=True,
-            )
-    if multimodal_source.value.startswith("Local"):
-        mo.callout(
-            mo.md(f"`{_path}` {'✅ present' if _path.exists() else '❌ missing — click the button above'}"),
-            kind="success" if _path.exists() else "warn",
-        )
-    return
+            subprocess.run(["python3", "scripts/pretrain/build_keep_it_simple_multimodal.py"], check=True)
+        multimodal_examples = torch.load(_path, weights_only=False) if _path.exists() else []
 
-
-@app.cell
-def _(Path, mo, multimodal_source, pd, torch):
-    with mo.status.spinner(title="Loading multimodal examples..."):
-        if multimodal_source.value.startswith("HF Hub"):
-            from datasets import load_dataset as _load_dataset
-
-            multimodal_examples = list(_load_dataset("ffurfaro/keep-it-simple-multimodal", split="train"))
-        else:
-            _path = Path("data/keep-it-simple-multimodal.pt")
-            multimodal_examples = torch.load(_path, weights_only=False) if _path.exists() else []
-    if multimodal_examples:
-        _counts = pd.Series([ex["modality"] for ex in multimodal_examples]).value_counts()
-        _table = mo.ui.table(
-            _counts.reset_index().rename(columns={"index": "modality", 0: "count"}), label="Multimodal examples by modality"
-        )
-    else:
-        _table = mo.md("")
-    _table
+    print(f"multimodal examples: {len(multimodal_examples)}")
     return (multimodal_examples,)
 
 
 @app.cell
-def _(mo):
-    text_source = mo.ui.radio(
-        options=["ffurfaro/keep-it-simple", "small inline sample"],
-        value="ffurfaro/keep-it-simple",
-        label="Text source",
-    )
-    text_pct = mo.ui.slider(start=1, stop=100, value=2, step=1, label="% of keep-it-simple to load")
-    mo.vstack([text_source, text_pct])
-    return text_pct, text_source
+def _(TEXT_PCT, TEXT_SOURCE):
+    if TEXT_SOURCE == "hf":
+        try:
+            from datasets import load_dataset
 
-
-@app.cell
-def _(mo, text_pct, text_source):
-    with mo.status.spinner(title="Loading text..."):
-        if text_source.value.startswith("ffurfaro"):
-            try:
-                from datasets import load_dataset
-
-                _ds = load_dataset("ffurfaro/keep-it-simple", split=f"train[:{text_pct.value}%]")
-                text_examples = [{"modality": "text", "text": f"{row['prompt']} {row['text']}".strip()} for row in _ds]
-            except Exception as e:
-                mo.callout(mo.md(f"[fallback] keep-it-simple unavailable ({e}) — using inline sample"), kind="warn")
-                text_examples = [
-                    {"modality": "text", "text": "Paris is the capital of France."},
-                    {"modality": "text", "text": "The Earth orbits the Sun."},
-                ]
-        else:
+            _ds = load_dataset("ffurfaro/keep-it-simple", split=f"train[:{TEXT_PCT}%]")
+            text_examples = [{"modality": "text", "text": f"{row['prompt']} {row['text']}".strip()} for row in _ds]
+        except Exception as e:  # noqa: BLE001 — network/dataset-availability failure, fall back to a tiny inline sample
+            print(f"[fallback] keep-it-simple unavailable ({e}) - using inline sample")
             text_examples = [
                 {"modality": "text", "text": "Paris is the capital of France."},
                 {"modality": "text", "text": "The Earth orbits the Sun."},
-                {"modality": "text", "text": "Water boils at 100 degrees Celsius."},
             ]
-    mo.callout(mo.md(f"**Text examples:** `{len(text_examples)}`"), kind="success")
+    else:
+        text_examples = [
+            {"modality": "text", "text": "Paris is the capital of France."},
+            {"modality": "text", "text": "The Earth orbits the Sun."},
+            {"modality": "text", "text": "Water boils at 100 degrees Celsius."},
+        ]
+    print(f"text examples: {len(text_examples)}")
     return (text_examples,)
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## 📊 3.5 Modality overview & train/eval split
-    """)
-    return
-
-
-@app.cell
-def _(mo, multimodal_examples, pd, text_examples):
+def _(multimodal_examples, pd, text_examples):
     _all_ex = list(text_examples) + list(multimodal_examples)
-    _counts = pd.Series([ex["modality"] for ex in _all_ex]).value_counts().reset_index()
-    _counts.columns = ["modality", "count"]
-
-    try:
-        import altair as alt
-
-        _chart = (
-            alt.Chart(_counts)
-            .mark_bar()
-            .encode(x=alt.X("modality:N", sort="-y"), y="count:Q", tooltip=["modality", "count"])
-            .properties(title="Examples per modality (before train/eval split)", width=500)
-        )
-        _viz = mo.ui.altair_chart(_chart)
-    except ImportError:
-        _viz = mo.ui.table(_counts, label="Examples per modality (before split) — install altair for a chart")
-
-    mo.vstack([mo.md(f"**Total examples (text + multimodal):** `{len(_all_ex)}`"), _viz])
+    print(f"total examples: {len(_all_ex)}")
+    print(pd.Series([ex["modality"] for ex in _all_ex]).value_counts())
     return
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## 👀 3.6 Preview samples (real decoded content, not just counts)
-    """)
+def _():
+    SHOW_PREVIEW = True  # set False to skip decoding/plotting sample content
+    return (SHOW_PREVIEW,)
+
+
+@app.cell
+def _(SHOW_PREVIEW, multimodal_examples):
+    if SHOW_PREVIEW and multimodal_examples:
+        import json as _json
+
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        from kairos.dataset import unpack_multimodal_data
+
+        _by_modality: dict[str, list] = {}
+        for _ex in multimodal_examples:
+            _by_modality.setdefault(_ex["modality"], []).append(_ex)
+
+        for _mod, _rows in _by_modality.items():
+            print(f"--- {_mod} ({len(_rows)} examples) ---")
+            _sample = np.random.default_rng(0).choice(len(_rows), size=min(3, len(_rows)), replace=False)
+            for _i in _sample:
+                _row = _rows[_i]
+                _arrays = unpack_multimodal_data(_row["data"])
+                _caption = (_row.get("caption") or "")[:80]
+                _meta = _json.loads(_row["meta"]) if _row.get("meta") else {}
+                print(f"  caption: {_caption!r}  meta: {_meta}")
+
+                if _mod == "image_caption":
+                    plt.figure(figsize=(2, 2))
+                    plt.imshow(_arrays["image"])
+                    plt.axis("off")
+                    plt.show()
+                elif _mod == "audio_caption":
+                    plt.figure(figsize=(3, 1))
+                    plt.plot(_arrays["audio"], linewidth=0.5)
+                    plt.axis("off")
+                    plt.show()
+                elif _mod == "video_caption":
+                    _video = _arrays["video"]
+                    _n = min(4, _video.shape[0])
+                    _fig, _axes = plt.subplots(1, _n, figsize=(_n * 1.2, 1.2))
+                    for _j, _ax in enumerate(_axes if _n > 1 else [_axes]):
+                        _ax.imshow(_video[_j])
+                        _ax.axis("off")
+                    plt.show()
+                elif _mod == "lidar":
+                    _points = np.asarray(_arrays["points"], dtype=np.float32)
+                    _fig = plt.figure(figsize=(2.5, 2.5))
+                    _ax = _fig.add_subplot(projection="3d") if _points.shape[1] >= 3 else _fig.add_subplot()
+                    if _points.shape[1] >= 3:
+                        _ax.scatter(_points[:, 0], _points[:, 1], _points[:, 2], s=1)
+                    else:
+                        _ax.scatter(_points[:, 0], _points[:, 1], s=1)
+                    plt.show()
+                elif _mod == "control":
+                    plt.figure(figsize=(3, 1.2))
+                    plt.plot(_arrays["state"], label="state")
+                    plt.plot(_arrays["action"], label="action")
+                    plt.legend(fontsize=6)
+                    plt.show()
+    else:
+        print("preview skipped")
     return
 
 
 @app.cell
-def _(mo, multimodal_examples):
-    import io as _io
-    import json as _json
-
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    from kairos.dataset import unpack_multimodal_data
-
-    def _fig_to_image(fig):
-        buf = _io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-        return buf
-
-    def _preview_row(ex):
-        modality = ex["modality"]
-        arrays = unpack_multimodal_data(ex["data"])
-        meta = _json.loads(ex["meta"]) if ex.get("meta") else {}
-        caption = (ex.get("caption") or "")[:80]
-
-        if modality == "image_caption":
-            dims = f"orig {meta['original_width']}×{meta['original_height']} → 32×32" if "original_width" in meta else ""
-            return mo.vstack([mo.image(arrays["image"], width=120), mo.md(f"`{caption}`  \n*{dims}*")])
-
-        if modality == "audio_caption":
-            audio = arrays["audio"]
-            rate = meta.get("sample_rate", 8000)
-            fig, ax = plt.subplots(figsize=(3, 1))
-            ax.plot(audio, linewidth=0.5)
-            ax.axis("off")
-            info = (
-                f"orig {meta['original_duration_sec']:.1f}s → {len(audio) / rate:.1f}s "
-                f"(stretch ×{meta['stretch_factor']:.2f}, peak {meta.get('peak_scale', 1.0):.2f})"
-                if "stretch_factor" in meta
-                else ""
-            )
-            return mo.vstack(
-                [mo.image(_fig_to_image(fig), width=180), mo.audio(audio, rate=rate), mo.md(f"`{caption}`  \n*{info}*")]
-            )
-
-        if modality == "video_caption":
-            video = arrays["video"]  # (T, H, W, 3)
-            n = min(4, video.shape[0])
-            fig, axes = plt.subplots(1, n, figsize=(n * 1.2, 1.2))
-            for i, ax in enumerate(axes if n > 1 else [axes]):
-                ax.imshow(video[i])
-                ax.axis("off")
-            info = (
-                f"orig {meta['original_width']}×{meta['original_height']} @ {meta['fps']:.0f}fps, "
-                f"{meta['duration_sec']:.1f}s total — {video.shape[0]} frames spread over first 1s"
-                if "original_width" in meta
-                else ""
-            )
-            return mo.vstack([mo.image(_fig_to_image(fig), width=n * 90), mo.md(f"`{caption}`  \n*{info}*")])
-
-        if modality == "lidar":
-            points = np.asarray(arrays["points"], dtype=np.float32)  # (N, >=2) x,y[,z[,intensity]]
-            if points.ndim == 1:
-                points = points[:, None]
-            ncols = points.shape[1]
-            fig = plt.figure(figsize=(2.5, 2.5))
-            if ncols >= 3:
-                ax = fig.add_subplot(projection="3d")
-                ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, c=points[:, 3] if ncols >= 4 else "k", cmap="viridis")
-            else:
-                ax = fig.add_subplot()
-                ax.scatter(points[:, 0], points[:, 1], s=1, c="k")
-            ax.set_axis_off()
-            info = (
-                f"{meta['n_points_original']} pts → {points.shape[0]} (azimuth-uniform, from {meta.get('components')})"
-                if "n_points_original" in meta
-                else f"{points.shape[0]} pts ({ncols} cols)"
-            )
-            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{ex['source']}`  \n*{info}*")])
-
-        if modality == "control":
-            state, action = arrays["state"], arrays["action"]
-            fig, ax = plt.subplots(figsize=(3, 1.2))
-            ax.plot(state, label="state", linewidth=0.7)
-            ax.plot(action, label="action", linewidth=0.7)
-            ax.legend(fontsize=6)
-            ax.set_xticks([])
-            try:
-                params = _json.loads(caption)
-                caption_display = ", ".join(f"{k}={v}" for k, v in list(params.items())[:4])
-            except Exception:  # noqa: BLE001 — caption wasn't JSON, show as-is
-                caption_display = caption
-            peaks = f"peaks: state={meta.get('state_peak_scale', 1.0):.2f} action={meta.get('action_peak_scale', 1.0):.2f}"
-            return mo.vstack([mo.image(_fig_to_image(fig), width=180), mo.md(f"`{caption_display[:80]}`  \n*{peaks}*")])
-
-        return mo.md(f"(no preview for `{modality}`)")
-
-    _by_modality: dict[str, list] = {}
-    for _ex in multimodal_examples:
-        _by_modality.setdefault(_ex["modality"], []).append(_ex)
-
-    _sections = []
-    for _mod, _rows in _by_modality.items():
-        _sample = np.random.default_rng(0).choice(len(_rows), size=min(3, len(_rows)), replace=False)
-        _cards = [_preview_row(_rows[i]) for i in _sample]
-        _sections.append(mo.vstack([mo.md(f"### `{_mod}` ({len(_rows)} examples)"), mo.hstack(_cards, wrap=True)]))
-
-    mo.vstack(_sections) if _sections else mo.md("*(no multimodal examples loaded)*")
-    return
-
-
-@app.cell
-def _(mo):
-    eval_pct = mo.ui.slider(start=0, stop=50, value=10, step=1, label="% held out for eval")
-    eval_pct
-    return (eval_pct,)
-
-
-@app.cell
-def _(eval_pct, mo, multimodal_examples, random, text_examples):
+def _(EVAL_PCT, multimodal_examples, random, text_examples):
     _all_ex = list(text_examples) + list(multimodal_examples)
     _rng = random.Random(0)
     _shuffled = _all_ex.copy()
     _rng.shuffle(_shuffled)
-    _n_eval = int(len(_shuffled) * eval_pct.value / 100)
+    _n_eval = int(len(_shuffled) * EVAL_PCT / 100)
     eval_examples = _shuffled[:_n_eval]
     train_examples = _shuffled[_n_eval:]
-    mo.callout(
-        mo.md(
-            f"**Train:** `{len(train_examples)}` ({100 - eval_pct.value}%) · **Eval:** `{len(eval_examples)}` ({eval_pct.value}%)"
-        ),
-        kind="success",
-    )
+    print(f"train: {len(train_examples)} ({100 - EVAL_PCT}%)  eval: {len(eval_examples)} ({EVAL_PCT}%)")
     return eval_examples, train_examples
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## ⚙️ 2. Model configuration
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    `modality_scales` routes each modality to a `PyramidalConvCodec` scale;
-    `attnres_block_size` sets the v3 Block-AttnRes window (`1` = classic AttnRes).
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    cfg_d_model = mo.ui.slider(32, 768, step=32, value=128, label="d_model (hidden size)")
-    cfg_n_heads = mo.ui.slider(2, 16, step=2, value=4, label="n_heads")
-    cfg_n_layers = mo.ui.slider(1, 24, step=1, value=8, label="n_layers")
-    cfg_stride = mo.ui.slider(1, 6, step=1, value=3, label="PyramidalConvCodec stride")
-    cfg_num_scales = mo.ui.slider(2, 6, step=1, value=4, label="num_scales")
-    cfg_attnres_block = mo.ui.slider(1, 8, step=1, value=4, label="attnres_block_size (v3 Block-AttnRes)")
-    cfg_experts = mo.ui.slider(0, 32, step=1, value=8, label="Routed experts (0 = dense FFN)")
-    cfg_experts_per_tok = mo.ui.slider(1, 8, step=1, value=2, label="Experts active per token")
-    cfg_shared_experts = mo.ui.slider(0, 4, step=1, value=1, label="Shared experts")
-    cfg_intermediate = mo.ui.slider(128, 2048, step=128, value=512, label="FFN/MoE intermediate size")
-
-    mo.vstack(
-        [
-            mo.hstack([cfg_d_model, cfg_n_heads, cfg_n_layers]),
-            mo.hstack([cfg_stride, cfg_num_scales, cfg_attnres_block]),
-            mo.hstack([cfg_experts, cfg_experts_per_tok, cfg_shared_experts]),
-            cfg_intermediate,
-        ]
-    )
+def _():
+    # ---- model settings ----
+    # modality_scales routes each modality to a PyramidalConvCodec scale; attnres_block_size sets
+    # the v3 Block-AttnRes window (1 = classic AttnRes)
+    CFG_D_MODEL = 88
+    CFG_N_HEADS = 4
+    CFG_N_LAYERS = 4
+    CFG_STRIDE = 3
+    CFG_NUM_SCALES = 4
+    CFG_ATTNRES_BLOCK = 4
+    CFG_EXPERTS = 7  # 0 = dense FFN
+    CFG_EXPERTS_PER_TOK = 1
+    CFG_SHARED_EXPERTS = 1
+    CFG_INTERMEDIATE = 352
     return (
-        cfg_attnres_block,
-        cfg_d_model,
-        cfg_experts,
-        cfg_experts_per_tok,
-        cfg_intermediate,
-        cfg_n_heads,
-        cfg_n_layers,
-        cfg_num_scales,
-        cfg_shared_experts,
-        cfg_stride,
+        CFG_ATTNRES_BLOCK,
+        CFG_D_MODEL,
+        CFG_EXPERTS,
+        CFG_EXPERTS_PER_TOK,
+        CFG_INTERMEDIATE,
+        CFG_N_HEADS,
+        CFG_N_LAYERS,
+        CFG_NUM_SCALES,
+        CFG_SHARED_EXPERTS,
+        CFG_STRIDE,
     )
 
 
 @app.cell
 def _(Modality):
-    # scale 0: finest temporal resolution (text, control) · 1: images/lidar
-    # scale 2: audio/video frames (chunked by <TICK>/<ENDFRAME>) · 3: coarse/META
+    # scale 0: finest temporal res (text, control) · 1: images/lidar · 2: audio/video frames · 3: coarse/META
     modality_scales = {
         int(Modality.TEXT): [0, 1],
         int(Modality.STATE): [0],
@@ -416,323 +236,253 @@ def _(Modality):
 
 @app.cell
 def _(
+    CFG_ATTNRES_BLOCK,
+    CFG_D_MODEL,
+    CFG_EXPERTS,
+    CFG_EXPERTS_PER_TOK,
+    CFG_INTERMEDIATE,
+    CFG_N_HEADS,
+    CFG_N_LAYERS,
+    CFG_NUM_SCALES,
+    CFG_SHARED_EXPERTS,
+    CFG_STRIDE,
     KairosConfig,
-    cfg_attnres_block,
-    cfg_d_model,
-    cfg_experts,
-    cfg_experts_per_tok,
-    cfg_intermediate,
-    cfg_n_heads,
-    cfg_n_layers,
-    cfg_num_scales,
-    cfg_shared_experts,
-    cfg_stride,
-    mo,
     modality_scales,
     tokenizer,
 ):
-    use_moe = cfg_experts.value > 0
+    use_moe = CFG_EXPERTS > 0
 
     model_config = KairosConfig(
-        d_model=cfg_d_model.value,
-        n_heads=cfg_n_heads.value,
-        n_layers=cfg_n_layers.value,
-        stride=cfg_stride.value,
+        d_model=CFG_D_MODEL,
+        n_heads=CFG_N_HEADS,
+        n_layers=CFG_N_LAYERS,
+        stride=CFG_STRIDE,
         vocab_size=len(tokenizer),
         num_modalities=8,
-        num_scales=cfg_num_scales.value,
+        num_scales=CFG_NUM_SCALES,
         modality_scales=modality_scales,
-        intermediate_size=cfg_intermediate.value,
-        moe_intermediate_size=cfg_intermediate.value,
-        n_routed_experts=cfg_experts.value if use_moe else 8,
-        num_experts_per_tok=cfg_experts_per_tok.value,
-        n_shared_experts=cfg_shared_experts.value,
+        intermediate_size=CFG_INTERMEDIATE,
+        moe_intermediate_size=CFG_INTERMEDIATE,
+        n_routed_experts=CFG_EXPERTS if use_moe else 8,
+        num_local_experts=CFG_EXPERTS if use_moe else 8,  # DeepseekV3MoE backend reads this one, not n_routed_experts
+        num_experts_per_tok=CFG_EXPERTS_PER_TOK,
+        n_shared_experts=CFG_SHARED_EXPERTS,
         use_moe=use_moe,
-        attnres_block_size=cfg_attnres_block.value,
+        attnres_block_size=CFG_ATTNRES_BLOCK,
     )
-
-    mo.callout(
-        mo.md(
-            f"**Vocab size:** `{len(tokenizer)}`  \n"
-            f"**MoE:** `{'Yes — ' + str(cfg_experts.value) + ' routed + ' + str(cfg_shared_experts.value) + ' shared' if use_moe else 'No — dense FFN'}`  \n"
-            f"**Block-AttnRes window:** `{cfg_attnres_block.value}`"
-        ),
-        kind="success",
-    )
+    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}")
     return (model_config,)
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## 🏋️ 3. Training configuration
-    """)
-    return
+def _():
+    # ---- training settings ----
+    TRAIN_LR = 3e-4
+    TRAIN_BATCH = 8
+    TRAIN_EPOCHS = 3
+    TRAIN_MAX_LEN = 1024
+    TRAIN_STRIDE = 3
+    TRAIN_SAVE_EVERY = 200
+    TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to auto-resume
 
-
-@app.cell
-def _(mo):
-    train_lr = mo.ui.number(1e-5, 1e-2, step=1e-5, value=3e-4, label="Learning rate")
-    train_batch = mo.ui.slider(1, 64, step=1, value=8, label="Batch size")
-    train_epochs = mo.ui.slider(1, 50, step=1, value=3, label="Epochs")
-    train_max_len = mo.ui.slider(64, 4096, step=64, value=1024, label="Max sequence length")
-    train_stride = mo.ui.slider(1, 6, step=1, value=3, label="Chunking stride")
-    train_save_every = mo.ui.slider(10, 1000, step=10, value=200, label="Save every N steps")
-    train_run_dir = mo.ui.text(value="checkpoints/kairos-multimodal/run_01", label="Run directory")
-
-    mo.vstack(
-        [
-            mo.hstack([train_lr, train_batch, train_epochs]),
-            mo.hstack([train_max_len, train_stride, train_save_every]),
-            train_run_dir,
-        ]
-    )
+    # ---- HF hub push-per-checkpoint (optional) ----
+    HUB_REPO_ID = None  # e.g. "ffurfaro/kairos" - set to also push each checkpoint as it's saved
+    HUB_PUSH_EVERY_CKPT = False
+    HUB_PRIVATE = False
     return (
-        train_batch,
-        train_epochs,
-        train_lr,
-        train_max_len,
-        train_run_dir,
-        train_save_every,
-        train_stride,
+        HUB_PRIVATE,
+        HUB_PUSH_EVERY_CKPT,
+        HUB_REPO_ID,
+        TRAIN_BATCH,
+        TRAIN_EPOCHS,
+        TRAIN_LR,
+        TRAIN_MAX_LEN,
+        TRAIN_RUN_DIR,
+        TRAIN_SAVE_EVERY,
+        TRAIN_STRIDE,
     )
 
 
 @app.cell
 def _(
     DataConfig,
+    HUB_PRIVATE,
+    HUB_PUSH_EVERY_CKPT,
+    HUB_REPO_ID,
+    TRAIN_BATCH,
+    TRAIN_EPOCHS,
+    TRAIN_LR,
+    TRAIN_MAX_LEN,
+    TRAIN_RUN_DIR,
+    TRAIN_SAVE_EVERY,
+    TRAIN_STRIDE,
     TrainConfig,
     eval_examples,
-    train_batch,
-    train_epochs,
     train_examples,
-    train_lr,
-    train_max_len,
-    train_run_dir,
-    train_save_every,
-    train_stride,
 ):
     data_config = DataConfig(
         text_examples=[],
         multimodal_examples=train_examples,
-        max_len=train_max_len.value,
-        stride=train_stride.value,
-        batch_size=train_batch.value,
+        max_len=TRAIN_MAX_LEN,
+        stride=TRAIN_STRIDE,
+        batch_size=TRAIN_BATCH,
     )
     eval_data_config = DataConfig(
         text_examples=[],
         multimodal_examples=eval_examples,
-        max_len=train_max_len.value,
-        stride=train_stride.value,
-        batch_size=train_batch.value,
+        max_len=TRAIN_MAX_LEN,
+        stride=TRAIN_STRIDE,
+        batch_size=TRAIN_BATCH,
         shuffle=False,
         drop_last=False,
     )
     train_config = TrainConfig(
-        lr=train_lr.value,
-        epochs=train_epochs.value,
-        save_every=train_save_every.value,
-        run_dir=train_run_dir.value,
+        lr=TRAIN_LR,
+        epochs=TRAIN_EPOCHS,
+        save_every=TRAIN_SAVE_EVERY,
+        run_dir=TRAIN_RUN_DIR,
+        hub_repo_id=HUB_REPO_ID,
+        hub_push_every_ckpt=HUB_PUSH_EVERY_CKPT,
+        hub_private=HUB_PRIVATE,
     )
     return data_config, eval_data_config, train_config
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## 🚂 4. Build & Train
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    run_button = mo.ui.run_button(label="▶ Start Training")
-    run_button
-    return (run_button,)
-
-
-@app.cell
-def _(
-    KairosMultimodalPipeline,
-    data_config,
-    mo,
-    model_config,
-    run_button,
-    tokenizer,
-    train_config,
-):
-    if not run_button.value:
-        mo.stop(True, mo.callout(mo.md("Click **▶ Start Training** to begin."), kind="neutral"))
+def _(KairosMultimodalPipeline, data_config, model_config, tokenizer, train_config):
+    from kairos.utils import count_active_parameters
 
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config, tokenizer=tokenizer)
-
-    with mo.status.spinner(title="Building pipeline (tokenizer/dataset/model/optimizer)..."):
-        pipe.build()
+    pipe.build()
 
     total_params = sum(p.numel() for p in pipe.model.parameters())
-    mo.callout(
-        mo.md(
-            f"**Total params:** `{total_params / 1e6:.2f}M`  |  **Device:** `{pipe.device}`  |  **Samples:** `{len(pipe.dataset)}`"
-        ),
-        kind="success",
+    active_params = count_active_parameters(
+        pipe.model,
+        model_config.num_experts_per_tok if model_config.use_moe else None,
+        model_config.num_local_experts if model_config.use_moe else None,
     )
+    print(f"total params: {total_params / 1e6:.2f}M  active params/tok: {active_params / 1e6:.2f}M")
+    print(f"device: {pipe.device}  samples: {len(pipe.dataset)}")
     return (pipe,)
 
 
 @app.cell
-def _(mo, pipe):
-    _resumed = (pipe.ckpt_dir / "last.pt").exists()
-    if _resumed:
-        mo.callout(mo.md(f"↻ Found `last.pt` in `{pipe.ckpt_dir}` — resuming from there."), kind="info")
-
-    _total_steps = pipe.train_config.epochs * len(pipe.loader)
-    with mo.status.progress_bar(total=_total_steps, title="Training", subtitle="step 0") as _bar:
-
-        def _on_step(step, total, loss_val):
-            _bar.update(increment=1, subtitle=f"step {step}/{total} — loss {loss_val:.4f}")
-
-        logs = pipe.train(progress_callback=_on_step, resume=True)
-
-    mo.callout(
-        mo.md(
-            f"✅ **Training complete**  \n"
-            f"Steps: `{len(logs)}` | Best avg-epoch loss: `{pipe.best_loss:.4f}`  \n"
-            f"Checkpoints: `{pipe.ckpt_dir}`  \n"
-            f"TensorBoard: `tensorboard --logdir {pipe.tb_dir}`"
-        ),
-        kind="success",
-    )
-    return (logs,)
+def _():
+    # compute-cost summary: params/memory instantly, plus an estimated total training time from a
+    # few real timed steps (state is restored right after, so this doesn't affect training below)
+    RUN_BENCHMARK = True
+    N_BENCH_STEPS = 5
+    return N_BENCH_STEPS, RUN_BENCHMARK
 
 
 @app.cell
-def _(eval_data_config, mo, pipe, torch):
-    from kairos.dataset import KairosPretrainingDataset
-    from torch.utils.data import DataLoader
-
-    if len(eval_data_config.multimodal_examples) == 0:
-        mo.callout(mo.md("No eval examples (eval % = 0) — skipping."), kind="neutral")
-        eval_loss = None
-    else:
-        with mo.status.spinner(title="Evaluating on held-out split..."):
-            eval_dataset = KairosPretrainingDataset(
-                multimodal_examples=eval_data_config.multimodal_examples,
-                tokenizer=pipe.tokenizer,
-                max_len=eval_data_config.max_len,
-                stride=eval_data_config.stride,
-            )
-            eval_loader = DataLoader(eval_dataset, batch_size=eval_data_config.batch_size, shuffle=False)
-
-            pipe.model.eval()
-            losses = []
-            with torch.no_grad():
-                for batch in eval_loader:
-                    batch = {k: v.to(pipe.device) for k, v in batch.items()}
-                    losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
-            pipe.model.train()
-            eval_loss = sum(losses) / len(losses)
-            pipe.writer.add_scalar("eval/loss", eval_loss, pipe.global_step)
-
-        mo.callout(mo.md(f"**Eval loss:** `{eval_loss:.4f}` on `{len(eval_dataset)}` samples"), kind="success")
+def _(N_BENCH_STEPS, RUN_BENCHMARK, pipe):
+    cost_summary = pipe.summary(benchmark=RUN_BENCHMARK, n_bench_steps=N_BENCH_STEPS)
+    print(cost_summary)
     return
 
 
 @app.cell
-def _(logs, mo, pd):
-    mo.vstack(
-        [
-            mo.md("## 📊 5. Logs"),
-            mo.ui.table(pd.DataFrame(logs), label="Step logs", pagination=True, page_size=20),
-        ]
-    )
+def _(pipe):
+    from kairos.utils import make_progress_callback
+
+    _resumed = (pipe.ckpt_dir / "last.pt").exists()
+    if _resumed:
+        print(f"found last.pt in {pipe.ckpt_dir} - resuming")
+
+    logs = pipe.train(progress_callback=make_progress_callback(), resume=True)
+    print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
+    print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
+    print(f"checkpoints: {pipe.ckpt_dir}")
+    return (logs,)
+
+
+@app.cell
+def _(eval_data_config, pipe, torch):
+    from kairos.dataset import KairosPretrainingDataset
+    from torch.utils.data import DataLoader
+
+    if len(eval_data_config.multimodal_examples) == 0:
+        print("no eval examples - skipping")
+    else:
+        eval_dataset = KairosPretrainingDataset(
+            multimodal_examples=eval_data_config.multimodal_examples,
+            tokenizer=pipe.tokenizer,
+            max_len=eval_data_config.max_len,
+            stride=eval_data_config.stride,
+        )
+        eval_loader = DataLoader(eval_dataset, batch_size=eval_data_config.batch_size, shuffle=False)
+
+        pipe.model.eval()
+        losses = []
+        with torch.no_grad():
+            for batch in eval_loader:
+                batch = {k: v.to(pipe.device) for k, v in batch.items()}
+                losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
+        pipe.model.train()
+        eval_loss = sum(losses) / len(losses)
+        pipe.writer.add_scalar("eval/loss", eval_loss, pipe.global_step)
+        print(f"eval loss: {eval_loss:.4f} on {len(eval_dataset)} samples")
     return
 
 
 @app.cell
 def _(logs, pd):
-    pd.DataFrame(logs).plot(x="step", y="loss", figsize=(8, 4), title="Multimodal diffusion loss")
+    logs_df = pd.DataFrame(logs)
+    print(logs_df)
+    return (logs_df,)
+
+
+@app.cell
+def _(logs_df):
+    if not logs_df.empty:
+        logs_df.plot(x="step", y="loss", figsize=(8, 4), title="Multimodal diffusion loss")
+    else:
+        print("no logged steps - nothing to plot")
     return
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## 🔍 6. Per-modality check
-    Diffusion loss masked per modality so a router-ignored one can't hide behind the global average.
-    """)
+def _(pipe):
+    # diffusion loss masked per modality, so a router-ignored one can't hide behind the global average
+    per_modality = pipe.check_per_modality_loss(n_batches=10)
+    for _k, _v in sorted(per_modality.items(), key=lambda kv: -kv[1]):
+        print(f"{_k}: {_v:.4f}")
     return
 
 
 @app.cell
-def _(mo, pipe):
-    with mo.status.spinner(title="Checking per-modality loss..."):
-        per_modality = pipe.check_per_modality_loss(n_batches=10)
+def _():
+    # not needed for a simple crash-recovery (training already auto-resumes from last.pt or the hub) -
+    # use this only to load a *different* checkpoint, e.g. best.pt or an older step_*.pt
+    RESUME_CKPT_PATH = ""
+    return (RESUME_CKPT_PATH,)
 
-    mo.ui.table(
-        [{"modality": k, "loss": round(v, 4)} for k, v in sorted(per_modality.items(), key=lambda kv: -kv[1])],
-        label="Per-modality diffusion loss",
-    )
+
+@app.cell
+def _(RESUME_CKPT_PATH, pipe):
+    if RESUME_CKPT_PATH:
+        _ckpt = pipe.load_checkpoint(RESUME_CKPT_PATH)
+        print(f"loaded {RESUME_CKPT_PATH} - step {_ckpt.get('step', '?')}  loss {_ckpt.get('loss', 0):.4f}")
+    else:
+        print("RESUME_CKPT_PATH is empty - nothing to do")
     return
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## ♻️ 7. Resume from checkpoint
-    """)
-    return
+def _():
+    PUSH_FULL_MODEL_TO_HUB = False  # pushes weights+config+model card, on top of any per-checkpoint pushes above
+    FULL_MODEL_HUB_REPO_ID = "ffurfaro/kairos"
+    return FULL_MODEL_HUB_REPO_ID, PUSH_FULL_MODEL_TO_HUB
 
 
 @app.cell
-def _(mo):
-    resume_path = mo.ui.text(value="", label="Checkpoint path (.pt)")
-    resume_button = mo.ui.run_button(label="Load checkpoint")
-    mo.hstack([resume_path, resume_button])
-    return resume_button, resume_path
-
-
-@app.cell
-def _(mo, pipe, resume_button, resume_path):
-    if not resume_button.value or not resume_path.value:
-        mo.stop(True)
-
-    _ckpt = pipe.load_checkpoint(resume_path.value)
-    mo.callout(
-        mo.md(
-            f"✅ Loaded `{resume_path.value}`  \nStep: `{_ckpt.get('step', '?')}` | Loss: `{_ckpt.get('loss', 0):.4f}`"
-        ),
-        kind="success",
-    )
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## 🚀 8. Push to Hugging Face Hub
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    hub_repo_id = mo.ui.text(value="ffurfaro/kairos", label="Model repo id")
-    hub_private = mo.ui.checkbox(value=False, label="Private")
-    push_button = mo.ui.run_button(label="Push model + checkpoints + tensorboard")
-    mo.vstack([hub_repo_id, hub_private, push_button])
-    return hub_private, hub_repo_id, push_button
-
-
-@app.cell
-def _(hub_private, hub_repo_id, mo, pipe, push_button):
-    if not push_button.value:
-        mo.stop(True, mo.callout(mo.md("Click **Push** once training is done."), kind="neutral"))
-
-    with mo.status.spinner(title=f"Pushing to {hub_repo_id.value}..."):
-        pipe.push_to_hub(hub_repo_id.value, private=hub_private.value)
-
-    mo.callout(mo.md(f"✅ Pushed to [{hub_repo_id.value}](https://huggingface.co/{hub_repo_id.value})"), kind="success")
+def _(FULL_MODEL_HUB_REPO_ID, HUB_PRIVATE, PUSH_FULL_MODEL_TO_HUB, pipe):
+    if PUSH_FULL_MODEL_TO_HUB:
+        pipe.push_to_hub(FULL_MODEL_HUB_REPO_ID, private=HUB_PRIVATE)
+        print(f"pushed to https://huggingface.co/{FULL_MODEL_HUB_REPO_ID}")
+    else:
+        print("PUSH_FULL_MODEL_TO_HUB is False - skipping")
     return
 
 
