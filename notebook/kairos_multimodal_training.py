@@ -29,7 +29,6 @@ def _():
         Modality,
         Path,
         TrainConfig,
-        device,
         pd,
         random,
         tokenizer,
@@ -59,7 +58,13 @@ def _():
 
 
 @app.cell
-def _(BUILD_LOCAL_IF_MISSING, MULTIMODAL_LOCAL_PATH, MULTIMODAL_SOURCE, Path, torch):
+def _(
+    BUILD_LOCAL_IF_MISSING,
+    MULTIMODAL_LOCAL_PATH,
+    MULTIMODAL_SOURCE,
+    Path,
+    torch,
+):
     if MULTIMODAL_SOURCE == "hf":
         from datasets import load_dataset as _load_dataset
 
@@ -210,9 +215,9 @@ def _():
         CFG_EXPERTS,
         CFG_EXPERTS_PER_TOK,
         CFG_INTERMEDIATE,
+        CFG_NUM_SCALES,
         CFG_N_HEADS,
         CFG_N_LAYERS,
-        CFG_NUM_SCALES,
         CFG_SHARED_EXPERTS,
         CFG_STRIDE,
     )
@@ -241,9 +246,9 @@ def _(
     CFG_EXPERTS,
     CFG_EXPERTS_PER_TOK,
     CFG_INTERMEDIATE,
+    CFG_NUM_SCALES,
     CFG_N_HEADS,
     CFG_N_LAYERS,
-    CFG_NUM_SCALES,
     CFG_SHARED_EXPERTS,
     CFG_STRIDE,
     KairosConfig,
@@ -349,7 +354,13 @@ def _(
 
 
 @app.cell
-def _(KairosMultimodalPipeline, data_config, model_config, tokenizer, train_config):
+def _(
+    KairosMultimodalPipeline,
+    data_config,
+    model_config,
+    tokenizer,
+    train_config,
+):
     from kairos.utils import count_active_parameters
 
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config, tokenizer=tokenizer)
@@ -383,14 +394,22 @@ def _(N_BENCH_STEPS, RUN_BENCHMARK, pipe):
 
 
 @app.cell
-def _(pipe):
+def _():
+    FORCE_RESTART = True  # True ignores any existing last.pt / hub checkpoint and starts from step 0
+    return (FORCE_RESTART,)
+
+
+@app.cell
+def _(FORCE_RESTART, pipe):
     from kairos.utils import make_progress_callback
 
-    _resumed = (pipe.ckpt_dir / "last.pt").exists()
+    _resumed = not FORCE_RESTART and (pipe.ckpt_dir / "last.pt").exists()
     if _resumed:
         print(f"found last.pt in {pipe.ckpt_dir} - resuming")
+    elif FORCE_RESTART:
+        print("FORCE_RESTART is True - ignoring any existing checkpoint")
 
-    logs = pipe.train(progress_callback=make_progress_callback(), resume=True)
+    logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
     print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
     print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
     print(f"checkpoints: {pipe.ckpt_dir}")
