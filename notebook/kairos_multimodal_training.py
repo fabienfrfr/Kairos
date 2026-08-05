@@ -6,6 +6,14 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    # marimo without widget for Jupyter/Colab compatibility. (but only ok with mo.status.progress_bar) -
+    import marimo as mo
+
+    return (mo,)
+
+
+@app.cell
+def _():
     # !pip install -q -e ".[notebook]"   # uncomment on a bare Colab/Kaggle
     import random
     from pathlib import Path
@@ -400,16 +408,27 @@ def _():
 
 
 @app.cell
-def _(FORCE_RESTART, pipe):
-    from kairos.utils import make_progress_callback
-
+def _(FORCE_RESTART, mo, pipe):
     _resumed = not FORCE_RESTART and (pipe.ckpt_dir / "last.pt").exists()
     if _resumed:
         print(f"found last.pt in {pipe.ckpt_dir} - resuming")
     elif FORCE_RESTART:
         print("FORCE_RESTART is True - ignoring any existing checkpoint")
 
-    logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
+    _total_steps = pipe.train_config.epochs * len(pipe.loader)
+
+    if mo.running_in_notebook():
+        with mo.status.progress_bar(total=_total_steps, title="training") as _bar:
+
+            def _on_step(step, total, loss_val):
+                _bar.update(subtitle=f"step {step}/{total} - loss {loss_val:.4f}")
+
+            logs = pipe.train(progress_callback=_on_step, resume=not FORCE_RESTART)
+    else:
+        from kairos.utils import make_progress_callback
+
+        logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
+
     print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
     print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
     print(f"checkpoints: {pipe.ckpt_dir}")

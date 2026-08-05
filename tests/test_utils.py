@@ -164,10 +164,9 @@ def test_training_summary_includes_active_params_for_moe():
 
 # ------------------------------------------------------------- make_progress_callback
 class _FakeBar:
-    def __init__(self, total, desc, file=None):
+    def __init__(self, total, desc):
         self.total = total
         self.desc = desc
-        self.file = file
         self.n = 0
         self.postfix = None
         self.closed = False
@@ -182,25 +181,9 @@ class _FakeBar:
         self.closed = True
 
 
-def _patch_tqdm(monkeypatch):
-    created, written = [], []
-
-    class _FakeTqdmClass:
-        def __new__(cls, total, desc, file=None):
-            bar = _FakeBar(total, desc, file)
-            created.append(bar)
-            return bar
-
-        @staticmethod
-        def write(msg, file=None):
-            written.append(msg)
-
-    monkeypatch.setattr("tqdm.auto.tqdm", _FakeTqdmClass)
-    return created, written
-
-
 def test_make_progress_callback_updates_bar(monkeypatch):
-    created, _ = _patch_tqdm(monkeypatch)
+    created = []
+    monkeypatch.setattr("tqdm.auto.tqdm", lambda total, desc: created.append(_FakeBar(total, desc)) or created[-1])
 
     callback = make_progress_callback(desc="training")
     callback(1, 10, 0.5)
@@ -213,34 +196,12 @@ def test_make_progress_callback_updates_bar(monkeypatch):
     assert not bar.closed
 
 
-def test_make_progress_callback_uses_stdout_not_stderr(monkeypatch):
-    import sys
-
-    created, _ = _patch_tqdm(monkeypatch)
-    make_progress_callback()(1, 5, 1.0)
-    assert created[0].file is sys.stdout
-
-
 def test_make_progress_callback_closes_bar_at_last_step(monkeypatch):
-    created, _ = _patch_tqdm(monkeypatch)
+    created = []
+    monkeypatch.setattr("tqdm.auto.tqdm", lambda total, desc: created.append(_FakeBar(total, desc)) or created[-1])
 
     callback = make_progress_callback()
     callback(1, 3, 1.0)
     callback(3, 3, 0.1)
 
     assert created[0].closed
-
-
-def test_make_progress_callback_writes_plain_lines_for_first_and_last_step(monkeypatch):
-    # tqdm.write emits a normal printed line (no carriage return), so it stays visible even in
-    # environments that don't live-render tqdm's bar (e.g. marimo)
-    _, written = _patch_tqdm(monkeypatch)
-
-    callback = make_progress_callback(desc="training")
-    callback(1, 3, 1.0)
-    callback(2, 3, 0.5)  # too soon after step 1 to trigger the 5s throttle - no new line
-    callback(3, 3, 0.1)
-
-    assert len(written) == 2
-    assert "step 1/3" in written[0]
-    assert "step 3/3" in written[1]

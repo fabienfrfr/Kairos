@@ -64,30 +64,17 @@ def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | N
 
 
 def make_progress_callback(desc: str = "training"):
-    """Returns a (step, total, loss) -> None callback for pipeline.train(), backed by a tqdm bar.
-
-    Also prints a plain line every ~5s via tqdm.write: marimo doesn't live-render tqdm's carriage-
-    return bar (only its own mo.status.progress_bar), so the bar alone shows nothing there — the
-    printed lines are the fallback that stays visible everywhere, tqdm bar or not."""
-    import sys
-    import time
-
+    """Returns a (step, total, loss) -> None callback for pipeline.train(), backed by a tqdm/marimo bar."""
     from tqdm.auto import tqdm
 
-    state = {"bar": None, "last_print": 0.0}
+    state = {"bar": None}
 
     def _callback(step: int, total: int, loss_val: float) -> None:
         if state["bar"] is None:
-            state["bar"] = tqdm(total=total, desc=desc, file=sys.stdout)
+            state["bar"] = tqdm(total=total, desc=desc)
         state["bar"].n = step
         state["bar"].set_postfix(loss=f"{loss_val:.4f}")
         state["bar"].refresh()
-
-        now = time.monotonic()
-        if step == 1 or step == total or now - state["last_print"] >= 5:
-            tqdm.write(f"{desc}: step {step}/{total} - loss {loss_val:.4f}", file=sys.stdout)
-            state["last_print"] = now
-
         if step >= total:
             state["bar"].close()
 
