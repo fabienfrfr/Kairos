@@ -73,6 +73,46 @@ def built_pipeline(tmp_path, model_config, text_examples, multimodal_examples):
     return pipe
 
 
+def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
+    # full-width (d_model=768, matching the real KairosConfig default) but shallow (2 layers)
+    # so it stays fast in CI; a regression here means the problem isn't depth-specific
+    model_config = KairosConfig(d_model=768, n_heads=12, n_layers=2)
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=256, batch_size=2)
+    train_config = TrainConfig(epochs=3, lr=1e-3, save_every=1000, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+    first_epoch_avg = sum(r["loss"] for r in logs if r["epoch"] == 1) / sum(1 for r in logs if r["epoch"] == 1)
+    last_epoch_avg = sum(r["loss"] for r in logs if r["epoch"] == 3) / sum(1 for r in logs if r["epoch"] == 3)
+    assert last_epoch_avg < first_epoch_avg
+
+
+def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
+    # a small, highly repetitive corpus should be learnable within enough steps; if avg loss
+    # doesn't trend down (or any batch goes non-finite) something regressed
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=4)
+    train_config = TrainConfig(
+        epochs=30, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+
+    first_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] <= 3) / sum(1 for r in logs if r["epoch"] <= 3)
+    last_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] > 27) / sum(1 for r in logs if r["epoch"] > 27)
+    assert last_epochs_avg < first_epochs_avg
+
+
 def test_build_creates_all_components(built_pipeline):
     assert built_pipeline.model is not None
     assert built_pipeline.dataset is not None
@@ -369,6 +409,213 @@ def test_train_skips_nonfinite_loss_batches(built_pipeline, monkeypatch):
 
     assert built_pipeline.skipped_nonfinite_steps == 1
     assert all(math.isfinite(row["loss"]) for row in logs)  # the nan batch never made it into the logs
+
+
+def test_nan_log_captures_diagnostics(built_pipeline, monkeypatch):
+    def _always_nan(model, batch, **kw):
+        return torch.tensor(float("nan"), requires_grad=True)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _always_nan)
+    built_pipeline.train_config.max_consecutive_nan = 1000  # don't trip the circuit breaker in this test
+
+    with pytest.warns(UserWarning, match="non-finite"):
+        built_pipeline.train(resume=False)
+
+    assert len(built_pipeline.nan_log) == built_pipeline.skipped_nonfinite_steps
+    assert all("step" in row and "loss" in row for row in built_pipeline.nan_log)
+
+
+def test_nan_log_includes_trainer_diagnostics_for_real_forward_pass(built_pipeline, monkeypatch):
+    # don't mock compute_loss: corrupt the model's own forward pass so the trainer's internal
+    # non-finite check fires naturally and populates diagnostics from real logits/inputs
+    real_forward = built_pipeline.model.forward
+
+    def _nan_forward(*args, **kw):
+        out = real_forward(*args, **kw)
+        out.logits[:] = float("nan")
+        return out
+
+    monkeypatch.setattr(built_pipeline.model, "forward", _nan_forward)
+    built_pipeline.train_config.max_consecutive_nan = 1000
+
+    with pytest.warns(UserWarning, match="non-finite"):
+        built_pipeline.train(resume=False)
+
+    assert built_pipeline.nan_log
+    row = built_pipeline.nan_log[0]
+    assert "logits_nan_frac" in row
+    assert "batch_size" in row
+
+
+def test_training_aborts_after_too_many_consecutive_nans(built_pipeline, monkeypatch):
+    def _always_nan(model, batch, **kw):
+        return torch.tensor(float("nan"), requires_grad=True)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _always_nan)
+    built_pipeline.train_config.max_consecutive_nan = 3
+
+    with pytest.warns(UserWarning, match="non-finite"), pytest.raises(RuntimeError, match="consecutive non-finite"):
+        built_pipeline.train(resume=False)
+
+    # circuit breaker must fire well before silently exhausting the whole loader
+    assert built_pipeline.skipped_nonfinite_steps == 3
+
+
+def test_consecutive_nan_counter_resets_on_a_good_batch(built_pipeline, monkeypatch):
+    real_compute_loss = built_pipeline.hf_trainer.compute_loss
+    calls = {"n": 0}
+
+    def _nan_every_other(model, batch, **kw):
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:
+            return torch.tensor(float("nan"), requires_grad=True)
+        return real_compute_loss(model, batch, **kw)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _nan_every_other)
+    built_pipeline.train_config.max_consecutive_nan = 2  # would trip if the counter didn't reset
+
+    with pytest.warns(UserWarning, match="non-finite"):
+        built_pipeline.train(resume=False)  # should complete without raising
+
+
+def test_circuit_breaker_error_includes_nan_source(built_pipeline, monkeypatch):
+    real_forward = built_pipeline.model.forward
+
+    def _nan_forward(*args, **kw):
+        out = real_forward(*args, **kw)
+        out.logits[:] = float("nan")
+        return out
+
+    monkeypatch.setattr(built_pipeline.model, "forward", _nan_forward)
+    built_pipeline.train_config.max_consecutive_nan = 2
+
+    with pytest.warns(UserWarning, match="non-finite"), pytest.raises(RuntimeError, match="First non-finite module") as exc_info:
+        built_pipeline.train(resume=False)
+
+    assert "lm_head" in str(exc_info.value) or "module" in str(exc_info.value)
+
+
+def test_inspect_batch_reports_real_tokenized_input(built_pipeline):
+    reports = built_pipeline.inspect_batch(n=1)
+
+    assert len(reports) == built_pipeline.data_config.batch_size
+    row = reports[0]
+    assert row["seq_len"] == built_pipeline.data_config.max_len
+    assert set(row["out_of_bounds"]) == {"token_ids", "modality_ids"}
+    assert isinstance(row["modality_counts"], dict)
+    assert isinstance(row["text_preview"], str)
+
+
+def test_inspect_batch_flags_out_of_range_token_id(built_pipeline):
+    real_batch = next(iter(built_pipeline.loader))
+    real_batch["input_ids"][0, 0] = 99999  # far past vocab_size
+
+    class _FakeLoader:
+        def __iter__(self):
+            yield real_batch
+
+    built_pipeline.loader = _FakeLoader()
+    reports = built_pipeline.inspect_batch(n=1)
+
+    assert reports[0]["out_of_bounds"]["token_ids"] == [0]
+    assert reports[0]["token_id_range"][1] == 99999
+
+
+def test_inspect_batch_flags_out_of_range_modality_id(built_pipeline):
+    real_batch = next(iter(built_pipeline.loader))
+    real_batch["modality_ids"][0, 0] = 999  # far past num_modalities
+
+    class _FakeLoader:
+        def __iter__(self):
+            yield real_batch
+
+    built_pipeline.loader = _FakeLoader()
+    reports = built_pipeline.inspect_batch(n=1)
+
+    assert reports[0]["out_of_bounds"]["modality_ids"] == [0]
+
+
+def test_inspect_batch_exposes_raw_numeric_ids(built_pipeline):
+    reports = built_pipeline.inspect_batch(n=1)
+    row = reports[0]
+
+    assert isinstance(row["input_ids"], list)
+    assert len(row["input_ids"]) == row["seq_len"]
+    assert isinstance(row["modality_ids"], list)
+    assert len(row["modality_ids"]) == row["seq_len"]
+    assert isinstance(row["top_token_ids"], list)
+    assert all(isinstance(pair, tuple) and len(pair) == 2 for pair in row["top_token_ids"])
+    assert set(row["max_repeat_run"]) == {"id", "length"}
+
+
+def test_inspect_batch_flags_a_degenerate_repeated_run(built_pipeline):
+    real_batch = next(iter(built_pipeline.loader))
+    real_batch["input_ids"][0, 5:25] = 42  # 20 identical ids in a row: a corrupted-example signal
+
+    class _FakeLoader:
+        def __iter__(self):
+            yield real_batch
+
+    built_pipeline.loader = _FakeLoader()
+    reports = built_pipeline.inspect_batch(n=1)
+
+    assert reports[0]["max_repeat_run"] == {"id": 42, "length": 20}
+
+
+def test_inspect_batch_ignores_padding_tail_in_repeat_run(built_pipeline):
+    # a short example padded out to max_len legitimately repeats pad_token_id hundreds of times;
+    # that must NOT be reported as a degenerate/corrupted run
+    real_batch = next(iter(built_pipeline.loader))
+    seq_len = real_batch["input_ids"].size(1)
+    real_len = 8
+    real_batch["mask"][0] = 0
+    real_batch["mask"][0, :real_len] = 1
+    real_batch["input_ids"][0, real_len:] = built_pipeline.tokenizer.pad_token_id
+
+    class _FakeLoader:
+        def __iter__(self):
+            yield real_batch
+
+    built_pipeline.loader = _FakeLoader()
+    reports = built_pipeline.inspect_batch(n=1)
+
+    assert reports[0]["max_repeat_run"]["length"] < seq_len - real_len
+
+
+def test_locate_nan_source_returns_none_before_any_skip(built_pipeline):
+    assert built_pipeline.locate_nan_source() is None
+
+
+def test_progress_callback_still_called_on_nonfinite_loss(built_pipeline, monkeypatch):
+    def _always_nan(model, batch, **kw):
+        return torch.tensor(float("nan"), requires_grad=True)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _always_nan)
+
+    seen_steps = []
+    with pytest.warns(UserWarning, match="non-finite"):
+        built_pipeline.train(resume=False, progress_callback=lambda step, total, loss: seen_steps.append(step))
+
+    # every batch was skipped, but the callback must still fire so a run doesn't look frozen
+    assert len(seen_steps) == len(built_pipeline.loader) * built_pipeline.train_config.epochs
+
+
+def test_last_ckpt_not_written_every_step(built_pipeline, monkeypatch):
+    save_calls = []
+    real_save = built_pipeline._save
+
+    def _tracking_save(path, loss_val, epoch=1):
+        save_calls.append(path.name)
+        return real_save(path, loss_val, epoch)
+
+    monkeypatch.setattr(built_pipeline, "_save", _tracking_save)
+    built_pipeline.train_config.last_ckpt_every = 1000  # higher than total steps in this fixture
+    built_pipeline.train(resume=False)
+
+    # last.pt should only be written at the configured cadence + once at epoch end,
+    # not on every single training step
+    last_pt_saves = save_calls.count("last.pt")
+    assert last_pt_saves <= built_pipeline.train_config.epochs
 
 
 def test_train_does_not_step_optimizer_on_nonfinite_loss(built_pipeline, monkeypatch):

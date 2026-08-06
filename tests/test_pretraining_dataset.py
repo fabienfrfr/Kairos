@@ -166,6 +166,32 @@ def test_multimodal_dataset_creates_default_tokenizer_when_none_given(all_kinds_
     assert len(ds) > 0
 
 
+def test_empty_text_examples_are_skipped(tokenizer):
+    ds = KairosPretrainingDataset(
+        texts=["", "   ", "Paris is the capital of France."], tokenizer=tokenizer, max_len=64, stride=1
+    )
+    assert len(ds) > 0  # only the non-empty text produced chunks, but it shouldn't crash or hang
+
+
+def test_nonfinite_multimodal_array_is_skipped_not_raised(tokenizer, rng):
+    bad = make_example("lidar", points=np.full((32, 4), np.nan, dtype=np.float32))
+    good = make_example("lidar", points=rng.uniform(-10, 10, (32, 4)).astype(np.float32))
+
+    with pytest.warns(UserWarning, match="skipping corrupt example"):
+        ds = KairosPretrainingDataset(multimodal_examples=[bad, good], tokenizer=tokenizer, max_len=128, stride=1)
+
+    assert len(ds) > 0  # the good example still produced chunks despite the corrupt one
+
+
+def test_all_nonfinite_multimodal_examples_yields_empty_dataset(tokenizer):
+    bad = make_example("lidar", points=np.full((32, 4), np.inf, dtype=np.float32))
+
+    with pytest.warns(UserWarning, match="skipping corrupt example"):
+        ds = KairosPretrainingDataset(multimodal_examples=[bad], tokenizer=tokenizer, max_len=128, stride=1)
+
+    assert len(ds) == 0
+
+
 def test_text_dataset_defaults_to_cosmopedia_when_no_texts_given(tokenizer, monkeypatch):
     def fake_config_names(name):
         return ["sample"]

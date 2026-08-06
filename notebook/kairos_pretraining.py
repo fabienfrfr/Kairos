@@ -402,6 +402,42 @@ def _(N_BENCH_STEPS, RUN_BENCHMARK, pipe):
 
 
 @app.cell
+def _(pd, pipe):
+    # visualize the tokenized input exactly as the model receives it (post-tokenization,
+    # post-collation) - use this to rule data in/out before suspecting the architecture.
+    # note: a single row can (and often does) mix several modalities at once, since text/image/
+    # audio/... segments get concatenated into one token sequence before chunking.
+    _reports = pipe.inspect_batch(n=1)
+    _table = pd.DataFrame(
+        [
+            {
+                "row": r["row"],
+                "modality_counts": r["modality_counts"],
+                "token_id_range": r["token_id_range"],
+                "top_token_ids": r["top_token_ids"],  # [(id, count), ...] - most frequent raw ids
+                "max_repeat_run": r["max_repeat_run"],  # longest run of one id repeated in a row
+                "out_of_bounds_tokens": len(r["out_of_bounds"]["token_ids"]),
+                "out_of_bounds_modality": len(r["out_of_bounds"]["modality_ids"]),
+                "pad_frac": round(r["pad_frac"], 3) if r["pad_frac"] is not None else None,
+            }
+            for r in _reports
+        ]
+    )
+    n_oob = _table["out_of_bounds_tokens"].sum() + _table["out_of_bounds_modality"].sum()
+    if n_oob:
+        print(f"WARNING: {n_oob} out-of-bounds ids found in this batch - inspect before training")
+    max_run = max(r["max_repeat_run"]["length"] for r in _reports)
+    if max_run > 50:  # arbitrary but generous threshold; a real sequence rarely repeats this much
+        print(f"WARNING: a row repeats the same token id {max_run} times in a row - likely corrupted")
+    print(_table.to_string())
+
+    # raw numeric view of the first row: exactly what the embedding layer indexes with
+    print("\nrow 0 input_ids  :", _reports[0]["input_ids"])
+    print("row 0 modality_ids:", _reports[0]["modality_ids"])
+    return
+
+
+@app.cell
 def _():
     FORCE_RESTART = True  # True ignores any existing last.pt / hub checkpoint and starts from step 0
     return (FORCE_RESTART,)
@@ -419,9 +455,11 @@ def _(FORCE_RESTART, mo, pipe):
 
     if mo.running_in_notebook():
         with mo.status.progress_bar(total=_total_steps, title="training") as _bar:
+            _state = {"last_step": 0}
 
             def _on_step(step, total, loss_val):
-                _bar.update(subtitle=f"step {step}/{total} - loss {loss_val:.4f}")
+                _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
+                _state["last_step"] = step
 
             logs = pipe.train(progress_callback=_on_step, resume=not FORCE_RESTART)
     else:

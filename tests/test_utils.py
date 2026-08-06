@@ -1,6 +1,7 @@
 import time
 
 import pytest
+import torch
 from torch import nn
 
 from kairos.utils import (
@@ -11,9 +12,33 @@ from kairos.utils import (
     estimate_optimizer_memory_mb,
     estimate_param_memory_mb,
     format_duration,
+    locate_first_nonfinite_module,
     make_progress_callback,
     training_summary,
 )
+
+
+# --------------------------------------------------- locate_first_nonfinite_module
+def test_locate_first_nonfinite_module_finds_the_offending_layer():
+    class Bad(nn.Module):
+        def forward(self, x):
+            return x * float("nan")
+
+    model = nn.Sequential(nn.Linear(4, 4), Bad(), nn.Linear(4, 4))
+    x = torch.randn(2, 4)
+
+    result = locate_first_nonfinite_module(model, lambda: model(x))
+
+    assert result is not None
+    assert result["module_type"] == "Bad"
+    assert result["nan_frac"] == 1.0
+
+
+def test_locate_first_nonfinite_module_returns_none_when_all_finite():
+    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+    x = torch.randn(2, 4)
+
+    assert locate_first_nonfinite_module(model, lambda: model(x)) is None
 
 
 # ------------------------------------------------------------- format_duration

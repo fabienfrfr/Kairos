@@ -5,6 +5,52 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+import torch
+
+
+def locate_first_nonfinite_module(model, forward_fn) -> dict | None:
+    """Runs forward_fn() (a no-arg callable doing a full model forward) with hooks on every
+    submodule, and returns diagnostics for the FIRST module (in execution order) whose output
+    contains NaN/Inf. Returns None if the forward pass is entirely finite.
+
+    This narrows "somewhere in the model produces NaN" down to a specific layer name, which is
+    the fastest way to tell a numerically-unstable module (bad init, exploding activation) apart
+    from a data problem: a fixed module firing on every batch regardless of content points at
+    architecture/init, not input data.
+    """
+    found: dict | None = None
+    handles = []
+
+    def _make_hook(name):
+        def _hook(module, inputs, output):
+            nonlocal found
+            if found is not None:
+                return
+            tensors = output if isinstance(output, (tuple, list)) else [output]
+            for t in tensors:
+                if isinstance(t, torch.Tensor) and t.is_floating_point() and not torch.isfinite(t).all():
+                    found = {
+                        "module": name,
+                        "module_type": type(module).__name__,
+                        "nan_frac": float(torch.isnan(t).float().mean()),
+                        "inf_frac": float(torch.isinf(t).float().mean()),
+                    }
+                    return
+
+        return _hook
+
+    for name, module in model.named_modules():
+        if name:  # skip the root module itself, only leaf/inner submodules are informative
+            handles.append(module.register_forward_hook(_make_hook(name)))
+
+    try:
+        forward_fn()
+    finally:
+        for h in handles:
+            h.remove()
+
+    return found
+
 
 def format_duration(seconds: float | None) -> str:
     """Formats seconds as e.g. "1h 2m 5s"; returns "n/a" for None."""
