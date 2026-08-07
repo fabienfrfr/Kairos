@@ -19,8 +19,7 @@ class NonFiniteDataError(ValueError):
 
 
 def pack_multimodal_data(arrays: dict) -> bytes:
-    """Serialize named numpy arrays into one self-describing blob — shape/dtype travel with the
-    data (via .npz), so no per-modality shape assumptions are needed to read it back."""
+    """Serialize named numpy arrays into one self-describing blob — shape/dtype travel with the data (via .npz), so no per-modality shape assumptions are needed to read it back."""
     buf = io.BytesIO()
     np.savez(buf, **arrays)
     return buf.getvalue()
@@ -121,9 +120,7 @@ class KairosPretrainingDataset(Dataset):
     _KNOWN_MULTIMODAL_MODALITIES = frozenset({"image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"})
 
     def _segments_for(self, ex):
-        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py). `data` is a
-        pack_multimodal_data() blob — arrays come back in whatever shape they were stored in,
-        nothing here assumes a fixed image/lidar/etc. size."""
+        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py). `data` is a pack_multimodal_data() blob — arrays come back in whatever shape they were stored in, nothing here assumes a fixed image/lidar/etc. size."""
         modality = ex["modality"]
 
         if modality == "text":

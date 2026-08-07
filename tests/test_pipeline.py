@@ -73,6 +73,68 @@ def built_pipeline(tmp_path, model_config, text_examples, multimodal_examples):
     return pipe
 
 
+def test_training_converges_with_moe_enabled(tmp_path):
+    # use_moe=True was never covered by any other convergence test
+    model_config = KairosConfig(
+        d_model=64, n_heads=4, n_layers=12, use_moe=True, num_local_experts=2, num_experts_per_tok=1
+    )
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
+    train_config = TrainConfig(
+        epochs=6, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+    first_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] <= 2) / sum(1 for r in logs if r["epoch"] <= 2)
+    last_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] > 4) / sum(1 for r in logs if r["epoch"] > 4)
+    assert last_epochs_avg < first_epochs_avg
+
+
+def test_training_converges_with_attnres_block_size_four(tmp_path):
+    # attnres_block_size defaults to 1 everywhere else in this suite; =4 changes the AttnRes
+    model_config = KairosConfig(d_model=64, n_heads=4, n_layers=12, attnres_block_size=4)
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
+    train_config = TrainConfig(
+        epochs=6, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+
+
+def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
+    # the exact combination the user reported NaN
+    model_config = KairosConfig(
+        d_model=64, n_heads=4, n_layers=12, use_moe=True, attnres_block_size=4, num_local_experts=2,
+        num_experts_per_tok=1,
+    )
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
+    train_config = TrainConfig(
+        epochs=6, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+    first_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] <= 2) / sum(1 for r in logs if r["epoch"] <= 2)
+    last_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] > 4) / sum(1 for r in logs if r["epoch"] > 4)
+    assert last_epochs_avg < first_epochs_avg
+
+
 def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
     # full-width (d_model=768, matching the real KairosConfig default) but shallow (2 layers)
     # so it stays fast in CI; a regression here means the problem isn't depth-specific
@@ -111,6 +173,13 @@ def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
     first_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] <= 3) / sum(1 for r in logs if r["epoch"] <= 3)
     last_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] > 27) / sum(1 for r in logs if r["epoch"] > 27)
     assert last_epochs_avg < first_epochs_avg
+
+
+def test_model_card_renders_from_template(built_pipeline):
+    card = built_pipeline._model_card("user/my-model", "apache-2.0")
+    assert "license: apache-2.0" in card
+    assert "my-model" in card
+    assert "{" not in card.split("```bibtex")[0]  # no leftover unformatted placeholders
 
 
 def test_build_creates_all_components(built_pipeline):

@@ -50,9 +50,7 @@ class TrainConfig:
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
-    """Maps each distinct id to the length of its longest run of consecutive occurrences.
-    A single id repeating for hundreds of positions in a row is a classic sign of a corrupted
-    or degenerate example (e.g. a modality encoder producing a constant/clipped output)."""
+    """Maps each distinct id to the length of its longest run of consecutive occurrences. A single id repeating for hundreds of positions in a row is a classic sign of a corrupted or degenerate example (e.g. a modality encoder producing a constant/clipped output)."""
     if ids.numel() == 0:
         return {}
     values = ids.tolist()
@@ -279,11 +277,7 @@ class KairosMultimodalPipeline:
         return self.log_rows
 
     def locate_nan_source(self) -> dict | None:
-        """Re-runs the forward pass on the last batch that produced a non-finite loss, with a
-        hook on every submodule, to find exactly which layer first outputs NaN/Inf. A single
-        module firing on every batch regardless of content points at architecture/init
-        instability rather than a data problem. Returns None if there's no such batch on record,
-        or if the re-run happens to come out finite (non-determinism in dropout/RNG)."""
+        """Re-runs the last non-finite batch with hooks to find which module first outputs NaN/Inf."""
         if self._last_nonfinite_batch is None:
             return None
         return locate_first_nonfinite_module(
@@ -291,16 +285,7 @@ class KairosMultimodalPipeline:
         )
 
     def inspect_batch(self, n: int = 1, from_loader: bool = True) -> list[dict]:
-        """Pulls `n` real batches exactly as they'd be handed to the model (post-tokenization,
-        post-collation, same dtype/device) and returns a human-readable report per row: decoded
-        text preview, modality breakdown, and out-of-bounds checks against the embedding tables.
-        This is the actual input the model sees — use it to rule data in or out as the cause of
-        a NaN before suspecting the architecture.
-
-        Example:
-            for report in pipe.inspect_batch(n=1):
-                print(report["text_preview"], report["modality_counts"], report["out_of_bounds"])
-        """
+        """Pulls `n` real post-tokenization batches and reports per row: text, modalities, id bounds."""
         self._require_built()
         vocab_size = len(self.tokenizer)
         num_modalities = self.model_config.num_modalities
@@ -454,96 +439,22 @@ class KairosMultimodalPipeline:
         return repo_id
 
     def _model_card(self, repo_id: str, license: str) -> str:
-        name = repo_id.split("/")[-1]
-        best_loss = self.best_loss if self.best_loss != float("inf") else "n/a"
+        template_path = Path(__file__).parent / "templates" / "model_card.md"
         mc = self.model_config
-        return f"""---
-language: en
-license: {license}
-library_name: transformers
-tags:
-  - kairos
-  - diffusion
-  - multimodal
-  - moe
-  - trust_remote_code
-pipeline_tag: text-generation
-datasets:
-  - ffurfaro/keep-it-simple
-  - ffurfaro/keep-it-simple-multimodal
----
-
-<h1 align="center"><p>🌀 {name}</p></h1>
-
-<p align="center">
-<a href="https://github.com/fabienfrfr/Kairos">
-<img alt="GitHub" src="https://img.shields.io/badge/github-fabienfrfr%2FKairos-black?logo=github">
-</a>
-<a href="https://huggingface.co/ffurfaro">
-<img alt="Hugging Face" src="https://img.shields.io/badge/HuggingFace-model-yellow?logo=huggingface">
-</a>
-</p>
-
-<h3 align="center"><p>Universal multimodal MoE trained from scratch for efficient edge AI</p></h3>
-
-Kairos is a hybrid MoE diffusion language model combining **DeltaNet** (linear attention),
-**Sliding Window Attention**, and **Attention Residuals (AttnRes)**, trained on text, image,
-video, audio, lidar, and control (state/action) modalities through a shared multimodal
-conv-byte tokenizer. See [github.com/fabienfrfr/Kairos](https://github.com/fabienfrfr/Kairos)
-for the full architecture writeup.
-
-## This checkpoint
-
-| | |
-|---|---|
-| Total params | {mc.d_model if hasattr(mc, "d_model") else "?"}-dim, {getattr(mc, "n_layers", "?")} layers |
-| Experts | {getattr(mc, "n_routed_experts", "?")} routed / {getattr(mc, "n_shared_experts", "?")} shared, top-{getattr(mc, "num_experts_per_tok", "?")} |
-| Vocab size | {mc.vocab_size} |
-| Best training loss | `{best_loss}` |
-| Steps trained | `{self.global_step}` |
-
-Note: this repo currently tracks best-training-loss only (`checkpoints/best.pt`) — no held-out
-validation split is evaluated during training yet.
-
-## Files
-
-- `checkpoints/` — `best.pt` (lowest avg training loss) + periodic `step_*.pt`
-- `tensorboard/` — `events.out.tfevents.*`, viewable in the Hub's **Training Metrics** tab
-- `config.json`, `model.safetensors` — native HF format, loadable via `trust_remote_code`
-
-## Usage
-
-```python
-from transformers import AutoModelForCausalLM
-
-model = AutoModelForCausalLM.from_pretrained("{repo_id}", trust_remote_code=True)
-```
-
-Requires the `kairos` package importable (custom architecture, not upstream `transformers`) —
-install from [github.com/fabienfrfr/Kairos](https://github.com/fabienfrfr/Kairos) first, or add
-it to `PYTHONPATH`. Alternatively, skip `Auto*` and import the class directly:
-
-```python
-from kairos.modeling import KairosDiffusionLLM
-
-model = KairosDiffusionLLM.from_pretrained("{repo_id}")
-```
-
-## Limitations
-
-Experimental, low-compute-budget training run — expect uneven quality across modalities
-(multimodal data is a small fraction of total training). Not evaluated for safety-critical use.
-
-## Citation
-
-```bibtex
-@misc{{kairos,
-  title  = {{Kairos: a multimodal MoE diffusion model for edge AI}},
-  author = {{Rince Fabien}},
-  url    = {{https://github.com/fabienfrfr/Kairos}}
-}}
-```
-"""
+        best_loss = self.best_loss if self.best_loss != float("inf") else "n/a"
+        return template_path.read_text().format(
+            license=license,
+            name=repo_id.split("/")[-1],
+            repo_id=repo_id,
+            d_model=getattr(mc, "d_model", "?"),
+            n_layers=getattr(mc, "n_layers", "?"),
+            n_routed_experts=getattr(mc, "n_routed_experts", "?"),
+            n_shared_experts=getattr(mc, "n_shared_experts", "?"),
+            num_experts_per_tok=getattr(mc, "num_experts_per_tok", "?"),
+            vocab_size=mc.vocab_size,
+            best_loss=best_loss,
+            global_step=self.global_step,
+        )
 
     # ------------------------------------------------------------- checks
     def check_per_modality_loss(self, n_batches: int = 1) -> dict[str, float]:

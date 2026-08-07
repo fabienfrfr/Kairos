@@ -51,6 +51,22 @@ Our conviction: AGI will emerge from a generalist, multimodal, causal model capa
 The choice of linear attention, specifically **DeltaNet**, is also driven by its ability to compress long-range history into a fixed-size state, enabling a continuous information flow. Unlike quadratic attention, this allows the model to maintain persistent context across sessions with constant memory usage, effectively bypassing the bottleneck of expanding KV caches while preserving architectural efficiency.
 
 
+## Code Structure
+
+| File | Role |
+|---|---|
+| `kairos/modeling.py` | `KairosConfig`, `KairosDiffusionLLM` (top-level model), DeltaNet/SWA blocks, MoE wiring |
+| `kairos/attentions.py` | LiZAttention2 (shared QKV/O between SWA and DeltaNet), sliding-window kernel |
+| `kairos/tokenizer.py` | `KairosTokenizer` — shared byte-level codec for text/image/video/audio/lidar |
+| `kairos/dataset.py` | Pretraining/SFT/RL dataset builders, multimodal packing |
+| `kairos/pipeline.py` | `KairosMultimodalPipeline` — tokenizer → dataset → model → train → push_to_hub |
+| `kairos/trainer.py` | Masked-diffusion loss (`KairosDiffusionTrainer`) |
+| `kairos/utils.py` | Param counts, memory/step-time estimates, NaN-source localization |
+| `kairos/templates/model_card.md` | Hub model card template, filled in by `pipeline.py` on push |
+
+MoE config: `use_moe`, `n_routed_experts`, and `num_local_experts` must be set together
+(`num_local_experts` is what the DeepSeek-V3 backend actually reads for expert count).
+
 ## Roadmap: Toward Universal Intelligence
 
 * **Multimodal Integration:** Early-stage training for image, video, audio & lidar tokens (1% of training).

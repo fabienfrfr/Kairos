@@ -9,15 +9,7 @@ import torch
 
 
 def locate_first_nonfinite_module(model, forward_fn) -> dict | None:
-    """Runs forward_fn() (a no-arg callable doing a full model forward) with hooks on every
-    submodule, and returns diagnostics for the FIRST module (in execution order) whose output
-    contains NaN/Inf. Returns None if the forward pass is entirely finite.
-
-    This narrows "somewhere in the model produces NaN" down to a specific layer name, which is
-    the fastest way to tell a numerically-unstable module (bad init, exploding activation) apart
-    from a data problem: a fixed module firing on every batch regardless of content points at
-    architecture/init, not input data.
-    """
+    """Runs forward_fn() with hooks on every submodule and returns diagnostics for the first one whose output contains NaN/Inf, or None if all finite."""
     found: dict | None = None
     handles = []
 
