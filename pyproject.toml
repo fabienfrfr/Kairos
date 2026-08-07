@@ -19,6 +19,7 @@ dependencies = [
     "ipython>=7.34.0",
     "lxml>=6.0.3",
     "nbformat>=5.10.4",
+    "numpy>=1.26",
     "pathspec>=1.1.1",
     "pytest>=8.4.2",
     "ruff>=0.15.20",
@@ -27,10 +28,22 @@ dependencies = [
     "transformers>=5.12.1", # mandatoy for gemma
 ]
 
+[project.optional-dependencies]
+# `pip install -e ".[notebook]"` — everything notebook/kairos_multimodal_training.py needs on a bare Colab/Kaggle
+notebook = [
+    "marimo>=0.23.9",
+    "matplotlib>=3.10.0",
+    "pandas>=2.0",
+    "tqdm>=4.67.0",
+]
+
 
 
 [tool.setuptools]
 packages = ["kairos"]
+
+[tool.setuptools.package-data]
+kairos = ["templates/*.md"]
 
 
 [tool.pytest.ini_options]
@@ -42,8 +55,10 @@ markers = [
 
 [dependency-groups]
 dev = [
+    "altair>=5.5.0",
     "libzim>=3.10.0",
     "marimo>=0.23.9",
+    "matplotlib>=3.10.0",
     "mwparserfromhell>=0.7.2",
     "pytest-cov>=7.1.0",
 ]

@@ -209,6 +209,33 @@ def test_kairos_model_init(config):
     assert model is not None
 
 
+def test_post_init_is_called_and_initializes_all_parameters():
+    # regression test for the actual NaN root cause: KairosDiffusionLLM used to skip self.post_init() (DeepseekV3Experts')
+    config = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
+    )
+    model = KairosDiffusionLLM(config)
+
+    non_finite = [name for name, p in model.named_parameters() if not torch.isfinite(p).all()]
+    assert non_finite == [], f"non-finite parameters right after construction: {non_finite}"
+
+
+def test_moe_expert_weights_are_not_uninitialized_memory():
+    # more targeted than the finite-check above: torch.empty() garbage happens to often be xactly 0.0 (freshly-allocated/zeroed pages)
+    config = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
+    )
+    model = KairosDiffusionLLM(config)
+
+    found_experts = False
+    for module in model.modules():
+        if type(module).__name__ == "DeepseekV3Experts":
+            found_experts = True
+            assert module.gate_up_proj.data.std().item() > 0, "gate_up_proj looks untouched (all-zero/constant)"
+            assert module.down_proj.data.std().item() > 0, "down_proj looks untouched (all-zero/constant)"
+    assert found_experts, "test setup didn't actually build a KairosMoE - config wiring changed?"
+
+
 def test_kairos_model_forward(config):
     model = KairosDiffusionLLM(config)
     x = torch.randint(0, 259, (2, 16))

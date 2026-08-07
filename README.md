@@ -51,6 +51,22 @@ Our conviction: AGI will emerge from a generalist, multimodal, causal model capa
 The choice of linear attention, specifically **DeltaNet**, is also driven by its ability to compress long-range history into a fixed-size state, enabling a continuous information flow. Unlike quadratic attention, this allows the model to maintain persistent context across sessions with constant memory usage, effectively bypassing the bottleneck of expanding KV caches while preserving architectural efficiency.
 
 
+## Code Structure
+
+| File | Role |
+|---|---|
+| `kairos/modeling.py` | `KairosConfig`, `KairosDiffusionLLM` (top-level model), DeltaNet/SWA blocks, MoE wiring |
+| `kairos/attentions.py` | LiZAttention2 (shared QKV/O between SWA and DeltaNet), sliding-window kernel |
+| `kairos/tokenizer.py` | `KairosTokenizer` — shared byte-level codec for text/image/video/audio/lidar |
+| `kairos/dataset.py` | Pretraining/SFT/RL dataset builders, multimodal packing |
+| `kairos/pipeline.py` | `KairosMultimodalPipeline` — tokenizer → dataset → model → train → push_to_hub |
+| `kairos/trainer.py` | Masked-diffusion loss (`KairosDiffusionTrainer`) |
+| `kairos/utils.py` | Param counts, memory/step-time estimates, NaN-source localization |
+| `kairos/templates/model_card.md` | Hub model card template, filled in by `pipeline.py` on push |
+
+MoE config: `use_moe`, `n_routed_experts`, and `num_local_experts` must be set together
+(`num_local_experts` is what the DeepSeek-V3 backend actually reads for expert count).
+
 ## Roadmap: Toward Universal Intelligence
 
 * **Multimodal Integration:** Early-stage training for image, video, audio & lidar tokens (1% of training).
@@ -61,6 +77,44 @@ The choice of linear attention, specifically **DeltaNet**, is also driven by its
 
 * **Dataset:** Inspired by *SmolLM* (high-quality, filtered educational and reasoning data) + cross-modal alignment sets.
 * **Procedure:** Compact, curriculum-based training focused on **maximizing performance per compute** within a strict budget.
+
+### 1. Build the multimodal dataset
+
+```bash
+python3 scripts/pretrain/build_keep_it_simple_multimodal.py
+```
+
+Streams small slices from HF datasets (image+caption, audio+caption, video+caption, lidar,
+control state/action), resumable (Ctrl-C safe, checkpoints every 10 rows), and pushes the result
+to [`ffurfaro/keep-it-simple-multimodal`](https://huggingface.co/datasets/ffurfaro/keep-it-simple-multimodal).
+Two of the six sources are gated — accept their terms on the HF page first, then
+`huggingface-cli login` (or export `HF_TOKEN`):
+[HuggingFaceFV/finevideo](https://huggingface.co/datasets/HuggingFaceFV/finevideo),
+[nvidia/Cosmos-Transfer-LidarGen-Example](https://huggingface.co/datasets/nvidia/Cosmos-Transfer-LidarGen-Example).
+
+### 2. Train
+
+Open `notebook/kairos_multimodal_training.py` with [marimo](https://marimo.io):
+
+```bash
+marimo edit notebook/kairos_multimodal_training.py
+```
+
+It pulls `ffurfaro/keep-it-simple` (text) and `ffurfaro/keep-it-simple-multimodal` (multimodal)
+directly from the Hub, tokenizes and shuffles both together, trains, and logs to TensorBoard.
+
+### 3. Push the trained model
+
+From the notebook's last section, or programmatically:
+
+```python
+pipe.push_to_hub("ffurfaro/kairos")
+```
+
+Pushes the model in native HF format (`trust_remote_code`, inherited from `PreTrainedModel`/
+`PretrainedConfig`), every local checkpoint (`checkpoints/`), the TensorBoard run
+(`tensorboard/` — rendered by the Hub's Training Metrics tab), and a generated model card.
+
 
 ## References
 

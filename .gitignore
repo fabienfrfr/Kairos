@@ -2,6 +2,7 @@ uv.lock
 project_structure.json
 /.vscode
 /data
+/checkpoints
 /tmp*
 
 *.zim

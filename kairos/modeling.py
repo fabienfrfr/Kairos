@@ -78,6 +78,7 @@ class KairosConfig(PretrainedConfig):
         self.time_step_max = 0.1
         self.time_step_floor = 1e-4
         self.A_init_range = (1.0, 16.0)
+        self.initializer_range = kwargs.get("initializer_range", 0.02)
 
         self.intermediate_size = intermediate_size
 
@@ -184,7 +185,14 @@ class KairosFFN(Qwen2MoeMLP):
 
 
 class KairosMoE(DeepseekV3MoE):
-    pass
+    """DeepseekV3MoE's expert weights are raw torch.empty() tensors, never initialized by default; fixed here on self.experts/self.gate (version-stable) instead of via fragile isinstance checks on internal class names."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        std = getattr(config, "initializer_range", 0.02)
+        self.experts.gate_up_proj.data.normal_(mean=0.0, std=std)
+        self.experts.down_proj.data.normal_(mean=0.0, std=std)
+        self.gate.weight.data.normal_(mean=0.0, std=std)  # was torch.zeros() at construction; fine either way
 
 
 class DiffusionBlock(nn.Module):
@@ -421,6 +429,17 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         self.rotary = KairosRotaryEmbedding(config, config.head_dim)
         self.norm = KairosNorm(config.hidden_size)
         self.lm_head = OutputHead(self.embedding)
+        self.post_init()  # triggers _init_weights on every submodule/parameter below
+
+    def _init_weights(self, module):
+        """Every PreTrainedModel subclass must define this (the base class default is a no-op). MoE expert/router weights are handled separately in KairosMoE.__init__ itself, not here - see that class for why."""
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
 
     def forward(
         self,

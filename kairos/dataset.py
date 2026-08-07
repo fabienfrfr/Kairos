@@ -1,6 +1,7 @@
 import io
 import json
 import random
+import warnings
 
 import numpy as np
 import torch
@@ -13,9 +14,12 @@ from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
 MAX_LEN = 3 * 2048
 
 
+class NonFiniteDataError(ValueError):
+    """Raised when a multimodal example contains NaN/Inf — a data-quality issue to skip, not a schema error."""
+
+
 def pack_multimodal_data(arrays: dict) -> bytes:
-    """Serialize named numpy arrays into one self-describing blob — shape/dtype travel with the
-    data (via .npz), so no per-modality shape assumptions are needed to read it back."""
+    """Serialize named numpy arrays into one self-describing blob — shape/dtype travel with the data (via .npz), so no per-modality shape assumptions are needed to read it back."""
     buf = io.BytesIO()
     np.savez(buf, **arrays)
     return buf.getvalue()
@@ -98,7 +102,11 @@ class KairosPretrainingDataset(Dataset):
             for prompt, text in zip(prompts, texts):
                 # anti-Reversal Curse: randomize prompt/text order
                 merged = " ".join([prompt, text] if random.random() < 0.5 else [text, prompt]).strip()
+                if not merged:
+                    continue  # empty example: nothing to learn, wastes a padded-only chunk
                 tokens = self.tokenizer.encode(merged, add_special_tokens=False)
+                if not tokens:
+                    continue
                 yield tokens, [int(Modality.TEXT)] * len(tokens)
 
         all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
@@ -112,9 +120,7 @@ class KairosPretrainingDataset(Dataset):
     _KNOWN_MULTIMODAL_MODALITIES = frozenset({"image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"})
 
     def _segments_for(self, ex):
-        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py). `data` is a
-        pack_multimodal_data() blob — arrays come back in whatever shape they were stored in,
-        nothing here assumes a fixed image/lidar/etc. size."""
+        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py). `data` is a pack_multimodal_data() blob — arrays come back in whatever shape they were stored in, nothing here assumes a fixed image/lidar/etc. size."""
         modality = ex["modality"]
 
         if modality == "text":
@@ -124,6 +130,11 @@ class KairosPretrainingDataset(Dataset):
             raise ValueError(f"unknown example modality: {modality!r}")
 
         arrays = unpack_multimodal_data(ex["data"])
+        for name, arr in arrays.items():
+            if np.issubdtype(arr.dtype, np.floating) and not np.isfinite(arr).all():
+                # NaN/Inf in a raw modality array (corrupt sensor/audio capture) silently poisons
+                # embeddings downstream and is a leading cause of loss divergence; reject early
+                raise NonFiniteDataError(f"non-finite values in {modality!r} field {name!r}")
         meta = json.loads(ex["meta"]) if ex.get("meta") else {}
         caption = ex.get("caption") or ""
 
@@ -173,8 +184,15 @@ class KairosPretrainingDataset(Dataset):
             self.tokenizer = KairosTokenizer()
 
         def sources():
+            skipped = 0
             for ex in examples:
-                encoded = self.tokenizer.encode_multimodal(self._segments_for(ex))
+                try:
+                    segments = self._segments_for(ex)
+                except NonFiniteDataError as e:
+                    skipped += 1
+                    warnings.warn(f"skipping corrupt example ({e}); {skipped} skipped so far", stacklevel=2)
+                    continue
+                encoded = self.tokenizer.encode_multimodal(segments)
                 yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist()
 
         all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
