@@ -191,8 +191,13 @@ def random_state_carry_plan(batch_size, max_group=3, rng=None):
     return plan
 
 
-def build_carried_cache(config, prev_cache, plan):
-    """New KairosMultiCache whose DeltaNet layers' conv/ssm state is, per row, the detached sum of prev_cache's rows named in plan[row] (empty list = zero-state); non-DeltaNet (SWA-only) layers are left unset - carrying stale positional K/V into an unrelated new batch isn't the same as perturbing a compressed recurrent state, so it's out of scope here."""
+def all_rows_carry_plan(batch_size):
+    """Every row gets the same recipe: all rows of the previous batch, aggregated (mean or sum) in build_carried_cache. This is the default: every batch t row sees a summary of everything batch t-1 saw at that layer/scale, rather than a random per-row subset."""
+    return [list(range(batch_size))] * batch_size
+
+
+def build_carried_cache(config, prev_cache, plan, agg="mean"):
+    """New KairosMultiCache whose DeltaNet layers' conv/ssm state is, per row, the detached mean or sum (agg="mean"/"sum") of prev_cache's rows named in plan[row] (empty list = zero-state); non-DeltaNet (SWA-only) layers are left unset - carrying stale positional K/V into an unrelated new batch isn't the same as perturbing a compressed recurrent state, so it's out of scope here."""
     new_cache = KairosMultiCache(config)
     if prev_cache is None:
         return new_cache
@@ -209,7 +214,8 @@ def build_carried_cache(config, prev_cache, plan):
                     if not recipe:
                         rows.append(torch.zeros_like(old_states[0]))
                     else:
-                        rows.append(sum(old_states[r].detach() for r in recipe))
+                        combined = sum(old_states[r].detach() for r in recipe)
+                        rows.append(combined / len(recipe) if agg == "mean" else combined)
                 getattr(new_scale, attr)[layer_idx] = torch.stack(rows, dim=0)
     return new_cache
 

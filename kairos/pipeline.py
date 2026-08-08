@@ -16,7 +16,13 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .dataset import KairosPretrainingDataset
-from .modeling import KairosConfig, KairosDiffusionLLM, build_carried_cache, random_state_carry_plan
+from .modeling import (
+    KairosConfig,
+    KairosDiffusionLLM,
+    all_rows_carry_plan,
+    build_carried_cache,
+    random_state_carry_plan,
+)
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
@@ -50,8 +56,10 @@ class TrainConfig:
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as they're saved
     hub_private: bool = False
     hub_subfolder: str | None = None  # push checkpoints/model under repo_id/<subfolder> instead of repo root
-    state_carry: bool = False  # perturb DeltaNet cache across batches with random zero/carry/sum recipes
-    state_carry_max_group: int = 3  # max rows summed into one carried state
+    state_carry: bool = False  # carry DeltaNet cache across batches (memory/robustness regularizer)
+    state_carry_mode: str = "all"  # "all": every row gets agg(all prev rows); "random": per-row random recipe
+    state_carry_agg: str = "mean"  # "mean" or "sum", used by both modes
+    state_carry_max_group: int = 3  # only used when state_carry_mode == "random"
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
@@ -225,8 +233,11 @@ class KairosMultimodalPipeline:
                         cur_bsz = batch["input_ids"].size(0)
                         if prev_cache is not None and prev_bsz != cur_bsz:
                             prev_cache = None  # batch size changed (e.g. last partial batch); start fresh
-                        plan = random_state_carry_plan(cur_bsz, tc.state_carry_max_group)
-                        cache_params = build_carried_cache(self.model_config, prev_cache, plan)
+                        if tc.state_carry_mode == "random":
+                            plan = random_state_carry_plan(cur_bsz, tc.state_carry_max_group)
+                        else:
+                            plan = all_rows_carry_plan(cur_bsz)
+                        cache_params = build_carried_cache(self.model_config, prev_cache, plan, agg=tc.state_carry_agg)
                         prev_bsz = cur_bsz
 
                     self.optimizer.zero_grad()

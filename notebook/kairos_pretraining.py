@@ -298,20 +298,36 @@ def _():
     TRAIN_SAVE_EVERY = 200
     TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to auto-resume
 
+    # ---- packing: concatenate samples before chunking so only the last chunk is padded ----
+    TRAIN_PACK = True
+
+    # ---- DeltaNet state carry across batches (memory/robustness regularizer) ----
+    TRAIN_STATE_CARRY = True
+    TRAIN_STATE_CARRY_MODE = "all"  # "all": every row gets agg(all prev rows); "random": per-row random recipe
+    TRAIN_STATE_CARRY_AGG = "mean"  # "mean" or "sum"
+    TRAIN_STATE_CARRY_MAX_GROUP = 3  # only used when TRAIN_STATE_CARRY_MODE == "random"
+
     # ---- HF hub push-per-checkpoint (optional) ----
     HUB_REPO_ID = None  # e.g. "ffurfaro/kairos" - set to also push each checkpoint as it's saved
     HUB_PUSH_EVERY_CKPT = False
     HUB_PRIVATE = False
+    HUB_SUBFOLDER = None  # e.g. "run_01" - push under repo_id/<subfolder> so multiple runs share one repo
     return (
         HUB_PRIVATE,
         HUB_PUSH_EVERY_CKPT,
         HUB_REPO_ID,
+        HUB_SUBFOLDER,
         TRAIN_BATCH,
         TRAIN_EPOCHS,
         TRAIN_LR,
         TRAIN_MAX_LEN,
+        TRAIN_PACK,
         TRAIN_RUN_DIR,
         TRAIN_SAVE_EVERY,
+        TRAIN_STATE_CARRY,
+        TRAIN_STATE_CARRY_AGG,
+        TRAIN_STATE_CARRY_MAX_GROUP,
+        TRAIN_STATE_CARRY_MODE,
         TRAIN_STRIDE,
     )
 
@@ -322,12 +338,18 @@ def _(
     HUB_PRIVATE,
     HUB_PUSH_EVERY_CKPT,
     HUB_REPO_ID,
+    HUB_SUBFOLDER,
     TRAIN_BATCH,
     TRAIN_EPOCHS,
     TRAIN_LR,
     TRAIN_MAX_LEN,
+    TRAIN_PACK,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
+    TRAIN_STATE_CARRY,
+    TRAIN_STATE_CARRY_AGG,
+    TRAIN_STATE_CARRY_MAX_GROUP,
+    TRAIN_STATE_CARRY_MODE,
     TRAIN_STRIDE,
     TrainConfig,
     eval_examples,
@@ -339,6 +361,7 @@ def _(
         max_len=TRAIN_MAX_LEN,
         stride=TRAIN_STRIDE,
         batch_size=TRAIN_BATCH,
+        pack=TRAIN_PACK,
     )
     eval_data_config = DataConfig(
         text_examples=[],
@@ -357,6 +380,11 @@ def _(
         hub_repo_id=HUB_REPO_ID,
         hub_push_every_ckpt=HUB_PUSH_EVERY_CKPT,
         hub_private=HUB_PRIVATE,
+        hub_subfolder=HUB_SUBFOLDER,
+        state_carry=TRAIN_STATE_CARRY,
+        state_carry_mode=TRAIN_STATE_CARRY_MODE,
+        state_carry_agg=TRAIN_STATE_CARRY_AGG,
+        state_carry_max_group=TRAIN_STATE_CARRY_MAX_GROUP,
     )
     return data_config, eval_data_config, train_config
 

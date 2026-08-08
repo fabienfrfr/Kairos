@@ -188,7 +188,27 @@ def test_state_carry_trains_without_crashing(tmp_path, model_config):
     texts = [{"modality": "text", "text": "the quick brown fox jumps"}] * 8
     data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
     train_config = TrainConfig(
-        epochs=2, run_dir=str(tmp_path / "run"), state_carry=True, state_carry_max_group=2, save_every=1000
+        epochs=2, run_dir=str(tmp_path / "run"), state_carry=True, save_every=1000
+    )  # default mode="all", agg="mean"
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+
+
+def test_state_carry_random_mode_trains_without_crashing(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps"}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
+    train_config = TrainConfig(
+        epochs=2,
+        run_dir=str(tmp_path / "run"),
+        state_carry=True,
+        state_carry_mode="random",
+        state_carry_max_group=2,
+        save_every=1000,
     )
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()

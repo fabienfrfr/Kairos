@@ -14,6 +14,7 @@ from kairos.modeling import (
     KairosEmbedding,
     KairosMultiCache,
     PyramidalConvCodec,
+    all_rows_carry_plan,
     build_carried_cache,
     random_state_carry_plan,
 )
@@ -254,6 +255,31 @@ def test_kairos_model_forward(config):
     assert out.logits.shape == (2, 16, 259)
 
 
+def test_all_rows_carry_plan_targets_every_row(config):
+    plan = all_rows_carry_plan(4)
+    assert plan == [[0, 1, 2, 3]] * 4
+
+
+def test_build_carried_cache_mean_vs_sum(config):
+    cache = KairosMultiCache(config)
+    B = 4
+    for scale in cache.caches:
+        for i, layer_type in enumerate(config.layers_config):
+            if "d" in layer_type:
+                scale.ssm_caches[i] = torch.arange(B).float().view(B, 1, 1, 1).expand(B, 2, 2, 2).clone()
+
+    plan = all_rows_carry_plan(B)  # every row: mean/sum of [0,1,2,3] -> values 0,1,2,3
+    layer_idx = next(i for i, t in enumerate(config.layers_config) if "d" in t)
+
+    sum_cache = build_carried_cache(config, cache, plan, agg="sum")
+    mean_cache = build_carried_cache(config, cache, plan, agg="mean")
+    sum_means = sum_cache.caches[0].ssm_caches[layer_idx].mean(dim=[1, 2, 3])
+    mean_means = mean_cache.caches[0].ssm_caches[layer_idx].mean(dim=[1, 2, 3])
+
+    assert sum_means.tolist() == [6.0, 6.0, 6.0, 6.0]  # 0+1+2+3
+    assert mean_means.tolist() == [1.5, 1.5, 1.5, 1.5]  # (0+1+2+3)/4
+
+
 def test_random_state_carry_plan_respects_batch_size():
     plan = random_state_carry_plan(batch_size=5, max_group=3)
     assert len(plan) == 5
@@ -271,7 +297,7 @@ def test_build_carried_cache_sums_selected_rows(config):
                 scale.ssm_caches[i] = torch.arange(B).float().view(B, 1, 1, 1).expand(B, 2, 2, 2).clone()
 
     plan = [[], [0], [1, 2], [0, 1, 2, 3]]
-    new_cache = build_carried_cache(config, cache, plan)
+    new_cache = build_carried_cache(config, cache, plan, agg="sum")
     layer_idx = next(i for i, t in enumerate(config.layers_config) if "d" in t)
     means = new_cache.caches[0].ssm_caches[layer_idx].mean(dim=[1, 2, 3])
     assert means.tolist() == [0.0, 0.0, 3.0, 6.0]
