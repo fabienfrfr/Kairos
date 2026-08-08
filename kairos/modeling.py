@@ -1,3 +1,4 @@
+import random
 from dataclasses import dataclass
 
 import torch
@@ -178,6 +179,40 @@ class KairosMultiCache(DynamicCache):
         out.config = self.config
         out.caches = [c.clone() for c in self.caches]
         return out
+
+
+def random_state_carry_plan(batch_size, max_group=3, rng=None):
+    """Per-row recipe for build_carried_cache: each row gets 0 (zero-state), 1 (direct carry), or up to max_group (summed) source rows sampled from a batch of the same size, biased toward zero/single carry so a summed state stays the exception."""
+    rng = rng or random
+    plan = []
+    for _ in range(batch_size):
+        k = rng.choices(range(max_group + 1), weights=[3, 3] + [1] * (max_group - 1))[0]
+        k = min(k, batch_size)
+        plan.append(rng.sample(range(batch_size), k) if k else [])
+    return plan
+
+
+def build_carried_cache(config, prev_cache, plan):
+    """New KairosMultiCache whose DeltaNet layers' conv/ssm state is, per row, the detached sum of prev_cache's rows named in plan[row] (empty list = zero-state); non-DeltaNet (SWA-only) layers are left unset - carrying stale positional K/V into an unrelated new batch isn't the same as perturbing a compressed recurrent state, so it's out of scope here."""
+    new_cache = KairosMultiCache(config)
+    if prev_cache is None:
+        return new_cache
+    for scale_idx, (old_scale, new_scale) in enumerate(zip(prev_cache.caches, new_cache.caches)):
+        for layer_idx, layer_type in enumerate(config.layers_config):
+            if "d" not in layer_type:
+                continue
+            for attr in ("conv_caches", "ssm_caches"):
+                old_states = getattr(old_scale, attr)[layer_idx]
+                if old_states is None:
+                    continue
+                rows = []
+                for recipe in plan:
+                    if not recipe:
+                        rows.append(torch.zeros_like(old_states[0]))
+                    else:
+                        rows.append(sum(old_states[r].detach() for r in recipe))
+                getattr(new_scale, attr)[layer_idx] = torch.stack(rows, dim=0)
+    return new_cache
 
 
 class KairosFFN(Qwen2MoeMLP):

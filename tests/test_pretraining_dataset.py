@@ -166,6 +166,18 @@ def test_multimodal_dataset_creates_default_tokenizer_when_none_given(all_kinds_
     assert len(ds) > 0
 
 
+def test_pack_concatenates_sources_before_chunking(tokenizer):
+    examples = [{"modality": "text", "text": "short one"}, {"modality": "text", "text": "another short bit"}]
+    unpacked = KairosPretrainingDataset(multimodal_examples=examples, tokenizer=tokenizer, max_len=64, stride=1)
+    packed = KairosPretrainingDataset(
+        multimodal_examples=examples, tokenizer=tokenizer, max_len=64, stride=1, pack=True
+    )
+    assert len(packed) < len(unpacked)  # fewer, fuller chunks
+    packed_pad_frac = 1 - packed[0]["mask"].float().mean().item()
+    unpacked_pad_frac = 1 - unpacked[0]["mask"].float().mean().item()
+    assert packed_pad_frac < unpacked_pad_frac
+
+
 def test_empty_text_examples_are_skipped(tokenizer):
     ds = KairosPretrainingDataset(
         texts=["", "   ", "Paris is the capital of France."], tokenizer=tokenizer, max_len=64, stride=1

@@ -8,7 +8,7 @@ class KairosDiffusionTrainer(Trainer):
 
     last_loss_diagnostics: dict | None = None
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, cache_params=None):
         x0 = inputs["input_ids"]
         prompt_len = inputs["prompt_len"]
         modality_ids = inputs.get("modality_ids")
@@ -38,7 +38,7 @@ class KairosDiffusionTrainer(Trainer):
         noise = torch.randint_like(x0, model.lm_head.vocab_size)
         xt[noise_mask] = noise[noise_mask]
 
-        logits = model(decoder_input_ids=xt, modality_ids=modality_ids).logits
+        logits = model(decoder_input_ids=xt, modality_ids=modality_ids, cache_params=cache_params).logits
 
         loss = F.cross_entropy(logits[noise_mask], x0[noise_mask], reduction="none")
         loss = (loss / p[noise_mask]).mean()

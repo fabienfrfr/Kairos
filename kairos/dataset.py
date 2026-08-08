@@ -51,11 +51,13 @@ class KairosPretrainingDataset(Dataset):
         stride=3,
         multimodal_examples=None,
         multimodal_path=None,
+        pack=False,
     ):
         self.tokenizer = tokenizer
         self.stride = stride
         self.target_len = max_len
         self.max_len = (max_len // stride) * stride
+        self.pack = pack
 
         if multimodal_examples is not None or multimodal_path is not None:
             if multimodal_examples is None:
@@ -85,8 +87,14 @@ class KairosPretrainingDataset(Dataset):
             yield ids_chunk, mod_chunk, mask
 
     def _collect_chunks(self, chunk_sources):
-        """Run each (ids, modality_ids) pair through self._chunk and flatten into three lists."""
+        """Run each (ids, modality_ids) pair through self._chunk and flatten into three lists; if self.pack, concatenate all sources into one continuous stream first so only the final chunk is padded."""
         all_input_ids, all_modality_ids, all_masks = [], [], []
+        if self.pack:
+            packed_ids, packed_mods = [], []
+            for ids, mods in chunk_sources:
+                packed_ids += ids
+                packed_mods += mods
+            chunk_sources = [(packed_ids, packed_mods)]
         for ids, mods in chunk_sources:
             for ids_chunk, mod_chunk, mask in self._chunk(ids, mods):
                 all_input_ids.append(ids_chunk)

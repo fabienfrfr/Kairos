@@ -14,6 +14,8 @@ from kairos.modeling import (
     KairosEmbedding,
     KairosMultiCache,
     PyramidalConvCodec,
+    build_carried_cache,
+    random_state_carry_plan,
 )
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import KairosDiffusionTrainer
@@ -210,7 +212,14 @@ def test_kairos_model_init(config):
 
 
 def test_post_init_is_called_and_initializes_all_parameters():
-    # regression test for the actual NaN root cause: KairosDiffusionLLM used to skip self.post_init() (DeepseekV3Experts')
+    # regression test for the actual NaN root cause: KairosDiffusionLLM used to skip
+    # self.post_init(), so DeepseekV3Experts' raw nn.Parameter(torch.empty(...)) weights
+    # (gate_up_proj/down_proj) were left as uninitialized memory - which can be NaN/Inf on
+    # construction alone, before any forward pass. Every parameter in the model must be
+    # finite immediately after construction, with no training and no data involved.
+    # Uses num_modalities=8 (the real default) deliberately: num_modalities=2 (the shared
+    # `config` fixture) triggers an unrelated pre-existing memory-growth issue during
+    # construction with use_moe=True, which is a separate bug from the one this test targets.
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -221,7 +230,9 @@ def test_post_init_is_called_and_initializes_all_parameters():
 
 
 def test_moe_expert_weights_are_not_uninitialized_memory():
-    # more targeted than the finite-check above: torch.empty() garbage happens to often be xactly 0.0 (freshly-allocated/zeroed pages)
+    # more targeted than the finite-check above: torch.empty() garbage happens to often be
+    # exactly 0.0 (freshly-allocated/zeroed pages), which would pass a finite-only check while
+    # still being wrong (an all-zero expert can never learn). Confirm the actual init call ran.
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -241,6 +252,34 @@ def test_kairos_model_forward(config):
     x = torch.randint(0, 259, (2, 16))
     out = model(input_ids=x)
     assert out.logits.shape == (2, 16, 259)
+
+
+def test_random_state_carry_plan_respects_batch_size():
+    plan = random_state_carry_plan(batch_size=5, max_group=3)
+    assert len(plan) == 5
+    for recipe in plan:
+        assert all(0 <= r < 5 for r in recipe)
+        assert len(recipe) == len(set(recipe))  # no repeated source row within one recipe
+
+
+def test_build_carried_cache_sums_selected_rows(config):
+    cache = KairosMultiCache(config)
+    B = 4
+    for scale in cache.caches:
+        for i, layer_type in enumerate(config.layers_config):
+            if "d" in layer_type:
+                scale.ssm_caches[i] = torch.arange(B).float().view(B, 1, 1, 1).expand(B, 2, 2, 2).clone()
+
+    plan = [[], [0], [1, 2], [0, 1, 2, 3]]
+    new_cache = build_carried_cache(config, cache, plan)
+    layer_idx = next(i for i, t in enumerate(config.layers_config) if "d" in t)
+    means = new_cache.caches[0].ssm_caches[layer_idx].mean(dim=[1, 2, 3])
+    assert means.tolist() == [0.0, 0.0, 3.0, 6.0]
+
+
+def test_build_carried_cache_none_prev_returns_empty_cache(config):
+    cache = build_carried_cache(config, None, [[], []])
+    assert cache.caches[0].ssm_caches[0] is None
 
 
 def test_no_nan_forward(config):

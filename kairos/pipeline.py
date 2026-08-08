@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .dataset import KairosPretrainingDataset
-from .modeling import KairosConfig, KairosDiffusionLLM
+from .modeling import KairosConfig, KairosDiffusionLLM, build_carried_cache, random_state_carry_plan
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
@@ -31,6 +31,7 @@ class DataConfig:
     batch_size: int = 8
     shuffle: bool = True
     drop_last: bool = True
+    pack: bool = False  # concatenate samples before chunking so only the last chunk is padded
 
 
 @dataclass
@@ -47,6 +48,8 @@ class TrainConfig:
     hub_repo_id: str | None = None  # set to also push each periodic checkpoint to this HF repo
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as they're saved
     hub_private: bool = False
+    state_carry: bool = False  # perturb DeltaNet cache across batches with random zero/carry/sum recipes
+    state_carry_max_group: int = 3  # max rows summed into one carried state
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
@@ -102,11 +105,19 @@ class KairosMultimodalPipeline:
         examples = list(dc.text_examples or []) + list(dc.multimodal_examples or [])
         if examples:
             return KairosPretrainingDataset(
-                multimodal_examples=examples, tokenizer=self.tokenizer, max_len=dc.max_len, stride=dc.stride
+                multimodal_examples=examples,
+                tokenizer=self.tokenizer,
+                max_len=dc.max_len,
+                stride=dc.stride,
+                pack=dc.pack,
             )
         if dc.multimodal_path:
             return KairosPretrainingDataset(
-                multimodal_path=dc.multimodal_path, tokenizer=self.tokenizer, max_len=dc.max_len, stride=dc.stride
+                multimodal_path=dc.multimodal_path,
+                tokenizer=self.tokenizer,
+                max_len=dc.max_len,
+                stride=dc.stride,
+                pack=dc.pack,
             )
         raise ValueError("DataConfig needs multimodal_examples, text_examples, and/or multimodal_path")
 
@@ -197,6 +208,8 @@ class KairosMultimodalPipeline:
         total_steps = tc.epochs * len(self.loader)
         skipped_nonfinite = 0
         consecutive_nan = 0
+        prev_cache = None
+        prev_bsz = None
 
         try:
             for epoch in range(start_epoch, tc.epochs + 1):
@@ -204,9 +217,20 @@ class KairosMultimodalPipeline:
                 for batch in self.loader:
                     batch = {k: v.to(self.device) for k, v in batch.items()}
 
+                    cache_params = None
+                    if tc.state_carry:
+                        cur_bsz = batch["input_ids"].size(0)
+                        if prev_cache is not None and prev_bsz != cur_bsz:
+                            prev_cache = None  # batch size changed (e.g. last partial batch); start fresh
+                        plan = random_state_carry_plan(cur_bsz, tc.state_carry_max_group)
+                        cache_params = build_carried_cache(self.model_config, prev_cache, plan)
+                        prev_bsz = cur_bsz
+
                     self.optimizer.zero_grad()
-                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                    loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
                     loss_val = loss.item()
+                    if tc.state_carry:
+                        prev_cache = cache_params  # forward wrote this step's final states into it
                     if not math.isfinite(loss_val):
                         # a corrupted batch (extreme values in some modality) can spike the loss to
                         # inf/nan; backpropagating it would poison the optimizer's running averages,

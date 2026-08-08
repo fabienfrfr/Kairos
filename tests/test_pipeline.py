@@ -74,7 +74,10 @@ def built_pipeline(tmp_path, model_config, text_examples, multimodal_examples):
 
 
 def test_training_converges_with_moe_enabled(tmp_path):
-    # use_moe=True was never covered by any other convergence test
+    # use_moe=True was never covered by any other convergence test - if MoE routing produces
+    # NaN or blocks convergence, this must fail instead of that gap staying silent.
+    # num_local_experts/num_experts_per_tok kept small: MoE checkpoints are large (many FFN
+    # copies) and this test writes a checkpoint on every improved epoch.
     model_config = KairosConfig(
         d_model=64, n_heads=4, n_layers=12, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -97,6 +100,7 @@ def test_training_converges_with_moe_enabled(tmp_path):
 
 def test_training_converges_with_attnres_block_size_four(tmp_path):
     # attnres_block_size defaults to 1 everywhere else in this suite; =4 changes the AttnRes
+    # aggregator to sum 4 layer outputs per block before aggregation (see KairosDiffusionBackbone)
     model_config = KairosConfig(d_model=64, n_heads=4, n_layers=12, attnres_block_size=4)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
     data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
@@ -113,7 +117,10 @@ def test_training_converges_with_attnres_block_size_four(tmp_path):
 
 
 def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
-    # the exact combination the user reported NaN
+    # the exact combination the user reported NaN with: use_moe=True + attnres_block_size=4,
+    # at real depth (12 layers). Width is reduced (d_model=64 vs the real 768) to stay CI-fast;
+    # if this passes but the real 768-width run still NaNs, the bug is width-dependent and this
+    # test's job is to at least rule the *mechanism* in/out cheaply.
     model_config = KairosConfig(
         d_model=64, n_heads=4, n_layers=12, use_moe=True, attnres_block_size=4, num_local_experts=2,
         num_experts_per_tok=1,
@@ -173,6 +180,62 @@ def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
     first_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] <= 3) / sum(1 for r in logs if r["epoch"] <= 3)
     last_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] > 27) / sum(1 for r in logs if r["epoch"] > 27)
     assert last_epochs_avg < first_epochs_avg
+
+
+def test_state_carry_trains_without_crashing(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps"}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
+    train_config = TrainConfig(
+        epochs=2, run_dir=str(tmp_path / "run"), state_carry=True, state_carry_max_group=2, save_every=1000
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+
+
+def test_state_carry_survives_batch_size_change(built_pipeline):
+    # simulates a partial final batch: the pipeline must reset prev_cache instead of crashing
+    # when build_carried_cache would otherwise be asked to sum/select rows out of range
+    real_loader = list(built_pipeline.loader)
+    full_batch = real_loader[0]
+    partial_batch = {k: v[:1] for k, v in full_batch.items()}  # batch size 1 instead of 2
+
+    class _FakeLoader:
+        def __iter__(self):
+            yield full_batch
+            yield partial_batch
+
+        def __len__(self):
+            return 2
+
+    built_pipeline.loader = _FakeLoader()
+    built_pipeline.train_config.state_carry = True
+    built_pipeline.train_config.epochs = 1
+    built_pipeline.train_config.save_every = 1000
+
+    logs = built_pipeline.train(resume=False)  # must not raise
+
+    assert built_pipeline.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+
+
+def test_pack_and_state_carry_combine_without_crashing(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2, pack=True)
+    train_config = TrainConfig(
+        epochs=1, run_dir=str(tmp_path / "run"), state_carry=True, state_carry_max_group=3, save_every=1000
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
 
 
 def test_model_card_renders_from_template(built_pipeline):
