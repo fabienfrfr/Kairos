@@ -1,0 +1,76 @@
+\documentclass[tikz,border=6pt]{standalone}
+\usetikzlibrary{arrows.meta, positioning, fit, backgrounds}
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\sffamily\small,
+  box/.style={draw, rounded corners=3pt, align=center, minimum height=0.9cm},
+  group/.style={draw, rounded corners=6pt, dashed},
+  arr/.style={-{Stealth[length=2.2mm]}, thick},
+  note/.style={font=\sffamily\scriptsize, align=center, text=black!60},
+]
+
+\node[box, fill=blue!8, minimum width=6cm] (input) at (0,14) {input\_ids + modality\_ids};
+
+\node[box, fill=blue!15, minimum width=7cm, minimum height=1.1cm] (embed) at (0,12.4)
+  {\textbf{KairosEmbedding} \\ \footnotesize token\_embed + modality\_embed};
+\draw[arr] (input) -- (embed);
+
+\begin{scope}
+\node[group, minimum width=14cm, minimum height=3.3cm, fill=purple!4] (codecbg) at (0,10) {};
+\node[align=center] at (0,11.4) {\textbf{PyramidalConvCodec (num\_scales)}};
+\node[box, fill=white, minimum width=2.6cm] (s0) at (-4.8,9.6) {scale 0 \\ \footnotesize stride$^0$};
+\node[box, fill=white, minimum width=2.6cm] (s1) at (-1.6,9.6) {scale 1 \\ \footnotesize stride$^1$};
+\node[box, fill=white, minimum width=2.6cm] (s2) at ( 1.6,9.6) {scale 2 \\ \footnotesize stride$^2$};
+\node[box, fill=white, minimum width=2.6cm] (s3) at ( 4.8,9.6) {scale 3 \\ \footnotesize stride$^3$};
+\node[note] at (0,8.7) {modality\_scales routes each modality's tokens to the scales it needs};
+\end{scope}
+\draw[arr] (embed) -- (codecbg.north);
+
+\begin{scope}
+\node[group, minimum width=15cm, minimum height=5.6cm, fill=green!4] (bbbg) at (0,5.2) {};
+\node[align=center] at (0,7.6) {\textbf{KairosDiffusionBackbone $\times$ num\_scales (independent stacks)}};
+
+\node[box, fill=white, minimum width=12.5cm, minimum height=2cm] (block) at (0,6.05)
+  {\vphantom{X}};
+\node[align=center] at (0,6.7) {\textbf{DiffusionBlock} ($\times$ n\_layers, layers\_config e.g. \texttt{"ld"})};
+\node[box, fill=blue!10, minimum width=5.4cm, minimum height=1cm] (attn) at (-3.3,5.55)
+  {LiZAttention2 \\ \footnotesize SWA $\oplus$ DeltaNet (shared QKV/O)};
+\node[box, fill=yellow!12, minimum width=5.4cm, minimum height=1cm] (ffn) at (3.3,5.55)
+  {FFN or MoE \\ \footnotesize DeepseekV3MoE (top-$k$ routed + shared)};
+
+\node[box, fill=white, minimum width=12.5cm] (attnres) at (0,4.15)
+  {\textbf{KairosAttnRes aggregator} \\ \footnotesize blocks of attnres\_block\_size layer outputs, learned weighted sum};
+
+\node[note] at (0,3.15) {gather\_active / scatter\_active (seq-dim only, batch dim preserved)};
+\node[note] at (0,2.85) {KairosCache: per-scale conv\_caches + ssm\_caches (DeltaNet) for streaming/state-carry};
+\node[note] at (0,2.55) {SWA layers keep a separate sliding-window K/V cache, not carried across batches};
+\end{scope}
+\draw[arr] (codecbg.south) -- (bbbg.north);
+
+\node[box, fill=purple!8, minimum width=7cm, minimum height=1.1cm] (fusion) at (0,1.2)
+  {fusion: concat(scales) $\to$ Linear \\ \footnotesize $d_{model}\times$num\_scales $\to d_{model}$};
+\draw[arr] (bbbg.south) -- (fusion);
+
+\node[box, fill=blue!15, minimum width=5cm] (norm) at (0,0) {KairosNorm};
+\draw[arr] (fusion) -- (norm);
+
+\node[box, fill=blue!15, minimum width=7cm, minimum height=1.1cm] (head) at (0,-1.4)
+  {OutputHead (tied weights) \\ \footnotesize token\_head + modality\_head};
+\draw[arr] (norm) -- (head);
+
+\node[box, fill=blue!8, minimum width=6cm] (logits) at (0,-2.7) {logits (vocab $\times$ modality)};
+\draw[arr] (head) -- (logits);
+
+\node[group, minimum width=15cm, minimum height=2.6cm, fill=orange!5] (loss) at (0,-5.1) {};
+\node[align=center] at (0,-4.05) {\textbf{Masked-diffusion training objective (KairosDiffusionTrainer)}};
+\node[note] at (0,-4.5) {sample $t \sim U(0,1)$, noise fraction $p=(1-\epsilon)t+\epsilon$};
+\node[note] at (0,-4.85) {mask $p \cdot L$ random non-prompt tokens $\to$ predict originals back};
+\node[note] at (0,-5.2) {loss $=$ cross\_entropy(logits[mask], $x_0$[mask]) / $p$, averaged};
+\node[note] at (0,-5.55) {non-finite batches skipped + logged (pipe.nan\_log), not backpropped};
+\draw[arr] (logits) -- (loss.north);
+
+\node[align=center, font=\sffamily\bfseries\large] at (0,15) {Kairos --- Diffusion MoE, Multimodal Architecture};
+
+\end{tikzpicture}
+\end{document}

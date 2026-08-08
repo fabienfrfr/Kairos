@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
@@ -48,6 +49,7 @@ class TrainConfig:
     hub_repo_id: str | None = None  # set to also push each periodic checkpoint to this HF repo
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as they're saved
     hub_private: bool = False
+    hub_subfolder: str | None = None  # push checkpoints/model under repo_id/<subfolder> instead of repo root
     state_carry: bool = False  # perturb DeltaNet cache across batches with random zero/carry/sum recipes
     state_carry_max_group: int = 3  # max rows summed into one carried state
 
@@ -138,6 +140,7 @@ class KairosMultimodalPipeline:
         self.tb_dir = run_dir / "tensorboard"
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.tb_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "training_config.json").write_text(json.dumps(self.run_config_dict(), indent=2))
 
         self.hf_trainer = KairosDiffusionTrainer(
             model=self.model, args=TrainingArguments(output_dir=str(run_dir), report_to=tc.report_to)
@@ -379,6 +382,14 @@ class KairosMultimodalPipeline:
 
         return reports
 
+    def run_config_dict(self) -> dict:
+        """model/train/data config as a plain JSON-safe dict — the actual hyperparameters behind a run, since model_config alone (saved in checkpoints) doesn't capture lr/epochs/pack/state_carry/etc."""
+        dc = asdict(self.data_config)
+        for key in ("text_examples", "multimodal_examples"):
+            if dc.get(key) is not None:
+                dc[key] = f"<{len(dc[key])} examples, omitted>"
+        return {"model_config": self.model_config.to_dict(), "train_config": asdict(self.train_config), "data_config": dc}
+
     def _save(self, path: Path, loss_val: float, epoch: int = 1):
         torch.save(
             {
@@ -389,6 +400,7 @@ class KairosMultimodalPipeline:
                 "scheduler_state": self.scheduler.state_dict(),
                 "loss": loss_val,
                 "config": self.model_config.to_dict(),
+                "train_config": asdict(self.train_config),
             },
             path,
         )
@@ -419,8 +431,11 @@ class KairosMultimodalPipeline:
     def _push_checkpoint_to_hub(self, path: Path):
         from huggingface_hub import HfApi
 
+        prefix = f"{self.train_config.hub_subfolder}/" if self.train_config.hub_subfolder else ""
         HfApi().upload_file(
-            path_or_fileobj=str(path), path_in_repo=f"checkpoints/{path.name}", repo_id=self.train_config.hub_repo_id
+            path_or_fileobj=str(path),
+            path_in_repo=f"{prefix}checkpoints/{path.name}",
+            repo_id=self.train_config.hub_repo_id,
         )
 
     def load_checkpoint_from_hub(self, repo_id: str, filename: str = "checkpoints/last.pt"):
@@ -437,27 +452,44 @@ class KairosMultimodalPipeline:
         except Exception:  # noqa: BLE001 — no checkpoint on the hub yet is not an error, just start fresh
             return None
 
-    def push_to_hub(self, repo_id: str, private: bool = False, license: str = "apache-2.0"):
-        """Pushes the model, config, checkpoints, tensorboard logs, and a model card to a HF hub repo."""
+    def push_to_hub(self, repo_id: str, private: bool = False, license: str = "apache-2.0", subfolder: str | None = None):
+        """Pushes model, config, checkpoints, tensorboard logs, training config, and a model card to a HF hub repo — under repo_id/<subfolder> if given, so multiple runs/configs can share one repo."""
         from huggingface_hub import HfApi
 
         self._require_built()
+        subfolder = subfolder or self.train_config.hub_subfolder
+        prefix = f"{subfolder}/" if subfolder else ""
         api = HfApi()
         api.create_repo(repo_id, private=private, exist_ok=True)
 
         self.model_config.register_for_auto_class()
         self.model.register_for_auto_class("AutoModelForCausalLM")
-        self.model.push_to_hub(repo_id, private=private)
-        self.model_config.push_to_hub(repo_id, private=private)
+
+        # save_pretrained + upload_folder (not model.push_to_hub) so the subfolder prefix is honored
+        # consistently across huggingface_hub versions, the same way checkpoints/tensorboard already are
+        export_dir = Path(self.train_config.run_dir) / "hf_export"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        # save_pretrained's tied-weight validation rejects LiZAttention2's intentional SWA/DeltaNet
+        # weight sharing (it expects ties to be declared via _tied_weights_keys, which this
+        # dynamically-shaped architecture doesn't set) - save the state dict directly instead,
+        # a format from_pretrained already loads natively without needing safetensors
+        self.model_config.save_pretrained(str(export_dir))
+        torch.save(self.model.state_dict(), export_dir / "pytorch_model.bin")
+        api.upload_folder(repo_id=repo_id, folder_path=str(export_dir), path_in_repo=subfolder or ".")
 
         if self.ckpt_dir.exists():
-            api.upload_folder(repo_id=repo_id, folder_path=str(self.ckpt_dir), path_in_repo="checkpoints")
+            api.upload_folder(repo_id=repo_id, folder_path=str(self.ckpt_dir), path_in_repo=f"{prefix}checkpoints")
         if self.tb_dir.exists():
-            api.upload_folder(repo_id=repo_id, folder_path=str(self.tb_dir), path_in_repo="tensorboard")
+            api.upload_folder(repo_id=repo_id, folder_path=str(self.tb_dir), path_in_repo=f"{prefix}tensorboard")
 
         api.upload_file(
+            path_or_fileobj=json.dumps(self.run_config_dict(), indent=2).encode("utf-8"),
+            path_in_repo=f"{prefix}training_config.json",
+            repo_id=repo_id,
+        )
+        api.upload_file(
             path_or_fileobj=self._model_card(repo_id, license).encode("utf-8"),
-            path_in_repo="README.md",
+            path_in_repo=f"{prefix}README.md",
             repo_id=repo_id,
         )
         return repo_id

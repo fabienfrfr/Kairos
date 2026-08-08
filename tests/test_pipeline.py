@@ -2,6 +2,8 @@ import copy
 import json
 import math
 import os
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -236,6 +238,59 @@ def test_pack_and_state_carry_combine_without_crashing(tmp_path, model_config):
 
     assert pipe.skipped_nonfinite_steps == 0
     assert all(math.isfinite(row["loss"]) for row in logs)
+
+
+def test_run_config_dict_contains_train_and_data_params(built_pipeline):
+    d = built_pipeline.run_config_dict()
+    assert d["train_config"]["lr"] == built_pipeline.train_config.lr
+    assert d["data_config"]["batch_size"] == built_pipeline.data_config.batch_size
+    assert "model_config" in d
+
+
+def test_run_config_dict_sanitizes_raw_examples(built_pipeline):
+    d = built_pipeline.run_config_dict()
+    json.dumps(d)  # must be JSON-serializable, not raise on raw example content
+    assert "omitted" in str(d["data_config"].get("text_examples") or d["data_config"].get("multimodal_examples"))
+
+
+def test_training_config_json_written_at_build(built_pipeline):
+    p = Path(built_pipeline.train_config.run_dir) / "training_config.json"
+    assert p.exists()
+    d = json.loads(p.read_text())
+    assert "train_config" in d and "model_config" in d
+
+
+def test_checkpoint_embeds_train_config(built_pipeline):
+    built_pipeline.train_config.epochs = 1
+    built_pipeline.train(resume=False)
+    ckpt = built_pipeline.load_checkpoint(str(built_pipeline.ckpt_dir / "best.pt"))
+    assert ckpt["train_config"]["lr"] == built_pipeline.train_config.lr
+
+
+def test_push_to_hub_respects_subfolder(built_pipeline, monkeypatch):
+    mock_api = MagicMock()
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: mock_api)
+
+    built_pipeline.push_to_hub("user/repo", subfolder="run-42")
+
+    paths = [c.kwargs.get("path_in_repo") for c in mock_api.upload_folder.call_args_list]
+    paths += [c.kwargs.get("path_in_repo") for c in mock_api.upload_file.call_args_list]
+    assert "run-42/checkpoints" in paths
+    assert "run-42/tensorboard" in paths
+    assert "run-42/README.md" in paths
+    assert "run-42/training_config.json" in paths
+
+
+def test_push_to_hub_without_subfolder_uses_repo_root(built_pipeline, monkeypatch):
+    mock_api = MagicMock()
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: mock_api)
+
+    built_pipeline.push_to_hub("user/repo")
+
+    paths = [c.kwargs.get("path_in_repo") for c in mock_api.upload_folder.call_args_list]
+    paths += [c.kwargs.get("path_in_repo") for c in mock_api.upload_file.call_args_list]
+    assert "checkpoints" in paths
+    assert "README.md" in paths
 
 
 def test_model_card_renders_from_template(built_pipeline):

@@ -92,7 +92,6 @@ class KairosConfig(PretrainedConfig):
         self.n_group = kwargs.get("n_group", 1)
         self.topk_group = kwargs.get("topk_group", 1)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", False)
-        self.top_k = self.num_experts_per_tok
         self.use_moe = kwargs.get("use_moe", False)
 
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
