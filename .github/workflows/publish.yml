@@ -1,0 +1,77 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  verify-tag-on-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fail if this tag isn't reachable from origin/main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "${{ github.sha }}" origin/main || {
+            echo "::error::Tag ${{ github.ref_name }} is not on main - refusing to publish"
+            exit 1
+          }
+
+  test:
+    needs: verify-tag-on-main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --group dev
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # setuptools_scm reads the tag from history
+      - uses: astral-sh/setup-uv@v4
+      - run: uv build
+      - run: uv run --with twine twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing (OIDC) - no API token secret needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  smoke-test:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Wait for PyPI to serve the new version, then install and import it
+        run: |
+          pip install --retries 10 "kairos-kit==${{ steps.v.outputs.version }}"
+          python -c "
+          import kairos
+          assert kairos.__version__ == '${{ steps.v.outputs.version }}', kairos.__version__
+          kairos.KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259)
+          print('smoke test OK:', kairos.__version__)
+          "

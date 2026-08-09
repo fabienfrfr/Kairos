@@ -17,7 +17,9 @@ build: ## Build sdist + wheel into dist/
 	rm -rf dist/
 	uv build
 
-publish: ## Upload dist/ to PyPI (build first, requires PYPI credentials)
+publish: ## Real publishing happens via CI on tag push (see .github/workflows/publish.yml); this is a manual/local fallback only
+	uv build
+	uv run --with twine twine check dist/*
 	uv publish
 
 notebook: ## Working test

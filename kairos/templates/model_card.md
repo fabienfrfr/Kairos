@@ -80,7 +80,7 @@ Experimental, low-compute-budget training run — expect uneven quality across m
 ```bibtex
 @misc{{kairos,
   title  = {{Kairos: a multimodal MoE diffusion model for edge AI}},
-  author = {{Furfaro Fabien}},
+  author = {{Fabien Furfaro}},
   url    = {{https://github.com/fabienfrfr/Kairos}}
 }}
 ```

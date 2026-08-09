@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kairos"
-version = "1.0.0"
+name = "kairos-kit"
+dynamic = ["version"]
 description = "Hybrid MoE diffusion language model (DeltaNet + sliding-window attention) for multimodal edge AI"
 readme = "README.md"
 license = "Apache-2.0"
-authors = [{ name = "Furfaro Fabien" }]
+authors = [{ name = "Fabien Furfaro" }]
 keywords = ["diffusion", "moe", "multimodal", "deltanet", "edge-ai", "transformers"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -55,6 +55,10 @@ packages = ["kairos", "kairos.templates"]
 
 [tool.setuptools.package-data]
 kairos = ["templates/*.md"]
+
+[tool.setuptools_scm]
+version_file = "kairos/_version.py"
+fallback_version = "0.0.0.dev0"  # editable/no-git-history installs (e.g. this sandbox's rebuilt checkout)
 
 
 [tool.pytest.ini_options]
