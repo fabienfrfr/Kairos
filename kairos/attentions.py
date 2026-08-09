@@ -281,6 +281,7 @@ class KairosGatedDeltaNet(nn.Module):
     def process(self, hidden_states, cache_params=None, attention_mask=None):
         B, L, _ = hidden_states.shape
         has_previous_state = cache_params is not None and cache_params.conv_caches[self.layer_idx] is not None
+        has_ssm_state = cache_params is not None and cache_params.ssm_caches[self.layer_idx] is not None
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
@@ -340,7 +341,7 @@ class KairosGatedDeltaNet(nn.Module):
         v = rearrange(v, "b l (h d) -> b l h d", h=self.n_heads)
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        prev_state = cache_params.ssm_caches[self.layer_idx] if has_previous_state else None
+        prev_state = cache_params.ssm_caches[self.layer_idx] if has_ssm_state else None
         has_padding = attention_mask is not None and not bool(attention_mask.all())
         # With padding + a real fla kernel (supports cu_seqlens): pack every
         # active position across the batch into one flat sequence instead of

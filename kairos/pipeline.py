@@ -21,6 +21,7 @@ from .modeling import (
     KairosDiffusionLLM,
     all_rows_carry_plan,
     build_carried_cache,
+    build_memory_cache,
     random_state_carry_plan,
 )
 from .tokenizer import KairosTokenizer, Modality
@@ -221,6 +222,8 @@ class KairosMultimodalPipeline:
         consecutive_nan = 0
         prev_cache = None
         prev_bsz = None
+        running_memory = {}
+        use_memory_bank = getattr(self.model_config, "use_memory_bank", False)
 
         try:
             for epoch in range(start_epoch, tc.epochs + 1):
@@ -229,26 +232,33 @@ class KairosMultimodalPipeline:
                     batch = {k: v.to(self.device) for k, v in batch.items()}
 
                     cache_params = None
-                    if tc.state_carry:
+                    if use_memory_bank:
+                        cur_bsz = batch["input_ids"].size(0)
+                        cache_params, running_memory = build_memory_cache(
+                            self.model, prev_cache, running_memory, cur_bsz
+                        )
+                    elif tc.state_carry:
                         cur_bsz = batch["input_ids"].size(0)
                         if prev_cache is not None and prev_bsz != cur_bsz:
-                            prev_cache = None  # batch size changed (e.g. last partial batch); start fresh
-                        if tc.state_carry_mode == "random":
-                            plan = random_state_carry_plan(cur_bsz, tc.state_carry_max_group)
-                        else:
-                            plan = all_rows_carry_plan(cur_bsz)
+                            prev_cache = None  # batch size changed; start fresh
+                        plan = (
+                            random_state_carry_plan(cur_bsz, tc.state_carry_max_group)
+                            if tc.state_carry_mode == "random"
+                            else all_rows_carry_plan(cur_bsz)
+                        )
                         cache_params = build_carried_cache(self.model_config, prev_cache, plan, agg=tc.state_carry_agg)
                         prev_bsz = cur_bsz
 
                     self.optimizer.zero_grad()
                     loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
                     loss_val = loss.item()
-                    if tc.state_carry:
+                    if use_memory_bank:
+                        prev_cache = cache_params
+                        running_memory = {k: v.detach() for k, v in running_memory.items()}
+                    elif tc.state_carry:
                         prev_cache = cache_params  # forward wrote this step's final states into it
                     if not math.isfinite(loss_val):
-                        # a corrupted batch (extreme values in some modality) can spike the loss to
-                        # inf/nan; backpropagating it would poison the optimizer's running averages,
-                        # so skip this batch entirely rather than step on garbage
+                        # a corrupted batch can spike the loss to inf/nan; skip it rather than step on garbage
                         skipped_nonfinite += 1
                         consecutive_nan += 1
                         self._last_nonfinite_batch = batch
@@ -429,8 +439,7 @@ class KairosMultimodalPipeline:
         return ckpt
 
     def _safe_resume(self, path: Path) -> int:
-        # a checkpoint saved under a different model_config (layers/experts/d_model changed) can't
-        # be loaded into the current architecture; warn and start fresh rather than crash the run
+        # an incompatible checkpoint (different model_config) starts fresh instead of crashing
         try:
             ckpt = self.load_checkpoint(str(path))
             return ckpt.get("epoch", 1)
@@ -476,14 +485,10 @@ class KairosMultimodalPipeline:
         self.model_config.register_for_auto_class()
         self.model.register_for_auto_class("AutoModelForCausalLM")
 
-        # save_pretrained + upload_folder (not model.push_to_hub) so the subfolder prefix is honored
-        # consistently across huggingface_hub versions, the same way checkpoints/tensorboard already are
+        # save_pretrained + upload_folder honors the subfolder prefix consistently across versions
         export_dir = Path(self.train_config.run_dir) / "hf_export"
         export_dir.mkdir(parents=True, exist_ok=True)
-        # save_pretrained's tied-weight validation rejects LiZAttention2's intentional SWA/DeltaNet
-        # weight sharing (it expects ties to be declared via _tied_weights_keys, which this
-        # dynamically-shaped architecture doesn't set) - save the state dict directly instead,
-        # a format from_pretrained already loads natively without needing safetensors
+        # tied SWA/DeltaNet weights break save_pretrained's tied-weight check; save state_dict directly instead
         self.model_config.save_pretrained(str(export_dir))
         torch.save(self.model.state_dict(), export_dir / "pytorch_model.bin")
         api.upload_folder(repo_id=repo_id, folder_path=str(export_dir), path_in_repo=subfolder or ".")

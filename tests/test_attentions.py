@@ -290,6 +290,25 @@ def test_deltanet_cache_effect():
     assert not torch.allclose(out1, out2)
 
 
+def test_deltanet_ssm_cache_used_even_without_conv_cache():
+    # regression test: has_previous_state used to be gated only on conv_caches, silently ignoring
+    # ssm_caches set without a matching conv_cache (exactly what build_carried_cache/
+    # build_memory_cache do by design). A manually-injected ssm_cache with no conv_cache must
+    # still change the output, or callers carrying state across batches are being ignored.
+    model = get_deltanet_model()
+    x = torch.randn(1, 8, 32)
+
+    cache_empty = KairosCache(model.config)
+    out_empty = model(x, cache_empty)
+
+    cache_with_state = KairosCache(model.config)
+    cache_with_state.ssm_caches[0] = torch.randn(1, 4, 8, 16)  # (B, n_heads, head_dim, 2*head_dim)
+    assert cache_with_state.conv_caches[0] is None  # conv_cache deliberately left unset
+    out_with_state = model(x, cache_with_state)
+
+    assert not torch.allclose(out_empty, out_with_state)
+
+
 def test_deltanet_cache_determinism():
     model = get_deltanet_model()
     x_N = torch.randn(1, 16, 32)

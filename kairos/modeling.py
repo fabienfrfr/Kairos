@@ -93,6 +93,9 @@ class KairosConfig(PretrainedConfig):
         self.topk_group = kwargs.get("topk_group", 1)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", False)
         self.use_moe = kwargs.get("use_moe", False)
+        self.use_memory_bank = kwargs.get("use_memory_bank", False)
+        self.memory_bank_slots = kwargs.get("memory_bank_slots", 16)
+        self.memory_bank_heads = kwargs.get("memory_bank_heads", 4)
 
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
@@ -192,12 +195,12 @@ def random_state_carry_plan(batch_size, max_group=3, rng=None):
 
 
 def all_rows_carry_plan(batch_size):
-    """Every row gets the same recipe: all rows of the previous batch, aggregated (mean or sum) in build_carried_cache. This is the default: every batch t row sees a summary of everything batch t-1 saw at that layer/scale, rather than a random per-row subset."""
+    """Every row gets agg(all rows of the previous batch) — the default: a stable summary rather than a random subset."""
     return [list(range(batch_size))] * batch_size
 
 
 def build_carried_cache(config, prev_cache, plan, agg="mean"):
-    """New KairosMultiCache whose DeltaNet layers' conv/ssm state is, per row, the detached mean or sum (agg="mean"/"sum") of prev_cache's rows named in plan[row] (empty list = zero-state); non-DeltaNet (SWA-only) layers are left unset - carrying stale positional K/V into an unrelated new batch isn't the same as perturbing a compressed recurrent state, so it's out of scope here."""
+    """New cache with each DeltaNet layer's conv/ssm state set to the detached mean/sum of prev_cache's rows in plan[row]; SWA-only layers are left unset."""
     new_cache = KairosMultiCache(config)
     if prev_cache is None:
         return new_cache
@@ -218,6 +221,68 @@ def build_carried_cache(config, prev_cache, plan, agg="mean"):
                         rows.append(combined / len(recipe) if agg == "mean" else combined)
                 getattr(new_scale, attr)[layer_idx] = torch.stack(rows, dim=0)
     return new_cache
+
+
+def build_memory_cache(model, prev_cache, running_memory, batch_size):
+    """Memory-bank counterpart to build_carried_cache: writes prev batch's ssm_cache into each layer's running memory, reads back a fresh initial ssm_cache for the current (any-size) batch. Returns (cache_params, running_memory); caller must .detach() running_memory before the next call."""
+    new_cache = KairosMultiCache(model.config)
+    new_running_memory = {}
+    n_heads = model.config.num_attention_heads
+    head_dim = model.config.hidden_size // n_heads
+    for scale_idx, backbone in enumerate(model.backbones):
+        for layer_idx_str, bank in backbone.memory_banks.items():
+            layer_idx = int(layer_idx_str)
+            key = (scale_idx, layer_idx)
+            memory = (running_memory or {}).get(key)
+            if memory is None:
+                memory = bank.initial_memory()
+            if prev_cache is not None:
+                old_states = prev_cache.caches[scale_idx].ssm_caches[layer_idx]
+                if old_states is not None:
+                    memory = bank.write(memory, old_states.reshape(old_states.size(0), -1))
+            new_running_memory[key] = memory
+            flat_new_state = bank.new_state(memory, batch_size)
+            new_cache.caches[scale_idx].ssm_caches[layer_idx] = flat_new_state.view(
+                batch_size, n_heads, head_dim, 2 * head_dim
+            )
+    return new_cache, new_running_memory
+
+
+class KairosMemoryBank(nn.Module):
+    """Learnable, batch-agnostic memory for one DeltaNet layer: slots (nn.Parameter) is the learned prior, write() cross-attends it over the previous batch's states, read()/new_state() attend back out for any current batch size."""
+
+    def __init__(self, state_dim, num_slots=16, num_heads=4):
+        super().__init__()
+        self.state_dim = state_dim
+        self.slots = nn.Parameter(torch.randn(num_slots, state_dim) * 0.02)
+        self.write_attn = nn.MultiheadAttention(state_dim, num_heads, batch_first=True)
+        self.read_attn = nn.MultiheadAttention(state_dim, num_heads, batch_first=True)
+        self.fuse = nn.Linear(state_dim * 2, state_dim)
+        self.norm_write = nn.LayerNorm(state_dim)
+        self.norm_read = nn.LayerNorm(state_dim)
+
+    def initial_memory(self):
+        """Returns the learnable prior itself (undetached): gives self.slots a real gradient on first use, like a learnable initial hidden state."""
+        return self.slots
+
+    def write(self, memory, prev_states_flat):
+        """memory: (num_slots, D) running state (caller-detached); prev_states_flat: (B_prev, D), detached here."""
+        q = memory.unsqueeze(0)
+        kv = prev_states_flat.detach().unsqueeze(0)
+        updated, _ = self.write_attn(q, kv, kv)
+        return self.norm_write(updated.squeeze(0) + memory)
+
+    def read(self, memory, batch_size):
+        """Returns (batch_size, D): the current batch's rows attending over the memory, independent of batch_size."""
+        device, dtype = memory.device, memory.dtype
+        q = torch.zeros(batch_size, 1, self.state_dim, device=device, dtype=dtype)
+        kv = memory.unsqueeze(0).expand(batch_size, -1, -1)
+        out, _ = self.read_attn(q, kv, kv)
+        return self.norm_read(out.squeeze(1))
+
+    def new_state(self, memory, batch_size):
+        readout = self.read(memory, batch_size)
+        return self.fuse(torch.cat([torch.zeros_like(readout), readout], dim=-1))
 
 
 class KairosFFN(Qwen2MoeMLP):
@@ -284,6 +349,21 @@ class KairosDiffusionBackbone(nn.Module):
         self.norm = KairosNorm(config.hidden_size)
         self.aggregator = KairosAttnRes(config.hidden_size)
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
+        head_dim = config.hidden_size // config.num_attention_heads  # ssm_cache shape: (B, n_heads, head_dim, 2*head_dim)
+        n_heads = config.num_attention_heads
+        self.memory_banks = nn.ModuleDict(
+            {
+                str(i): KairosMemoryBank(
+                    state_dim=n_heads * head_dim * 2 * head_dim,
+                    num_slots=config.memory_bank_slots,
+                    num_heads=config.memory_bank_heads,
+                )
+                for i, layer_type in enumerate(config.layers_config)
+                if "d" in layer_type
+            }
+            if getattr(config, "use_memory_bank", False)
+            else {}
+        )
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         emb = x

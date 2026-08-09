@@ -260,6 +260,38 @@ def test_pack_and_state_carry_combine_without_crashing(tmp_path, model_config):
     assert all(math.isfinite(row["loss"]) for row in logs)
 
 
+def test_memory_bank_trains_without_crashing(tmp_path):
+    model_config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_memory_bank=True, memory_bank_slots=8)
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 5}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2, pack=True)
+    train_config = TrainConfig(epochs=2, run_dir=str(tmp_path / "run"), save_every=1000)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.skipped_nonfinite_steps == 0
+    assert all(math.isfinite(row["loss"]) for row in logs)
+
+
+def test_memory_bank_weights_actually_change_during_training(tmp_path):
+    model_config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_memory_bank=True, memory_bank_slots=8)
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 5}] * 8
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2, pack=True)
+    train_config = TrainConfig(epochs=2, run_dir=str(tmp_path / "run"), save_every=1000)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    bank = pipe.model.backbones[0].memory_banks["0"]
+    slots_before = bank.slots.clone()
+    fuse_before = bank.fuse.weight.clone()
+
+    pipe.train(resume=False)
+
+    assert not torch.equal(slots_before, bank.slots)
+    assert not torch.equal(fuse_before, bank.fuse.weight)
+
+
 def test_run_config_dict_contains_train_and_data_params(built_pipeline):
     d = built_pipeline.run_config_dict()
     assert d["train_config"]["lr"] == built_pipeline.train_config.lr

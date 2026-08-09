@@ -217,17 +217,23 @@ def _():
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
     CFG_INTERMEDIATE = 352
+    CFG_USE_MEMORY_BANK = True  # learnable per-layer memory across batches, replaces the old state_carry hack
+    CFG_MEMORY_BANK_SLOTS = 16
+    CFG_MEMORY_BANK_HEADS = 4
     return (
         CFG_ATTNRES_BLOCK,
         CFG_D_MODEL,
         CFG_EXPERTS,
         CFG_EXPERTS_PER_TOK,
         CFG_INTERMEDIATE,
+        CFG_MEMORY_BANK_HEADS,
+        CFG_MEMORY_BANK_SLOTS,
         CFG_NUM_SCALES,
         CFG_N_HEADS,
         CFG_N_LAYERS,
         CFG_SHARED_EXPERTS,
         CFG_STRIDE,
+        CFG_USE_MEMORY_BANK,
     )
 
 
@@ -254,11 +260,14 @@ def _(
     CFG_EXPERTS,
     CFG_EXPERTS_PER_TOK,
     CFG_INTERMEDIATE,
+    CFG_MEMORY_BANK_HEADS,
+    CFG_MEMORY_BANK_SLOTS,
     CFG_NUM_SCALES,
     CFG_N_HEADS,
     CFG_N_LAYERS,
     CFG_SHARED_EXPERTS,
     CFG_STRIDE,
+    CFG_USE_MEMORY_BANK,
     KairosConfig,
     modality_scales,
     tokenizer,
@@ -282,8 +291,11 @@ def _(
         n_shared_experts=CFG_SHARED_EXPERTS,
         use_moe=use_moe,
         attnres_block_size=CFG_ATTNRES_BLOCK,
+        use_memory_bank=CFG_USE_MEMORY_BANK,
+        memory_bank_slots=CFG_MEMORY_BANK_SLOTS,
+        memory_bank_heads=CFG_MEMORY_BANK_HEADS,
     )
-    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}")
+    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}")
     return (model_config,)
 
 
@@ -300,12 +312,6 @@ def _():
 
     # ---- packing: concatenate samples before chunking so only the last chunk is padded ----
     TRAIN_PACK = True
-
-    # ---- DeltaNet state carry across batches (memory/robustness regularizer) ----
-    TRAIN_STATE_CARRY = True
-    TRAIN_STATE_CARRY_MODE = "all"  # "all": every row gets agg(all prev rows); "random": per-row random recipe
-    TRAIN_STATE_CARRY_AGG = "mean"  # "mean" or "sum"
-    TRAIN_STATE_CARRY_MAX_GROUP = 3  # only used when TRAIN_STATE_CARRY_MODE == "random"
 
     # ---- HF hub push-per-checkpoint (optional) ----
     HUB_REPO_ID = None  # e.g. "ffurfaro/kairos" - set to also push each checkpoint as it's saved
@@ -324,10 +330,6 @@ def _():
         TRAIN_PACK,
         TRAIN_RUN_DIR,
         TRAIN_SAVE_EVERY,
-        TRAIN_STATE_CARRY,
-        TRAIN_STATE_CARRY_AGG,
-        TRAIN_STATE_CARRY_MAX_GROUP,
-        TRAIN_STATE_CARRY_MODE,
         TRAIN_STRIDE,
     )
 
@@ -346,10 +348,6 @@ def _(
     TRAIN_PACK,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
-    TRAIN_STATE_CARRY,
-    TRAIN_STATE_CARRY_AGG,
-    TRAIN_STATE_CARRY_MAX_GROUP,
-    TRAIN_STATE_CARRY_MODE,
     TRAIN_STRIDE,
     TrainConfig,
     eval_examples,
@@ -381,10 +379,6 @@ def _(
         hub_push_every_ckpt=HUB_PUSH_EVERY_CKPT,
         hub_private=HUB_PRIVATE,
         hub_subfolder=HUB_SUBFOLDER,
-        state_carry=TRAIN_STATE_CARRY,
-        state_carry_mode=TRAIN_STATE_CARRY_MODE,
-        state_carry_agg=TRAIN_STATE_CARRY_AGG,
-        state_carry_max_group=TRAIN_STATE_CARRY_MAX_GROUP,
     )
     return data_config, eval_data_config, train_config
 
