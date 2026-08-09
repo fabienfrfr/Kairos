@@ -291,10 +291,7 @@ def test_deltanet_cache_effect():
 
 
 def test_deltanet_ssm_cache_used_even_without_conv_cache():
-    # regression test: has_previous_state used to be gated only on conv_caches, silently ignoring
-    # ssm_caches set without a matching conv_cache (exactly what build_carried_cache/
-    # build_memory_cache do by design). A manually-injected ssm_cache with no conv_cache must
-    # still change the output, or callers carrying state across batches are being ignored.
+    # regression: has_previous_state used to be gated only on conv_caches, silently ignoring ssm_caches set without a matching conv_cache (exactly what build_memory_cache does by design)
     model = get_deltanet_model()
     x = torch.randn(1, 8, 32)
 

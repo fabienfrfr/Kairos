@@ -140,8 +140,7 @@ class KairosPretrainingDataset(Dataset):
         arrays = unpack_multimodal_data(ex["data"])
         for name, arr in arrays.items():
             if np.issubdtype(arr.dtype, np.floating) and not np.isfinite(arr).all():
-                # NaN/Inf in a raw modality array (corrupt sensor/audio capture) silently poisons
-                # embeddings downstream and is a leading cause of loss divergence; reject early
+                # NaN/Inf in a raw modality array (corrupt sensor/audio capture) poisons embeddings downstream and is a leading cause of loss divergence; reject early
                 raise NonFiniteDataError(f"non-finite values in {modality!r} field {name!r}")
         meta = json.loads(ex["meta"]) if ex.get("meta") else {}
         caption = ex.get("caption") or ""
@@ -307,8 +306,7 @@ class KairosDPODataset(Dataset):
         return "".join(f"<{m['role']}>\n{m['content']}\n</{m['role']}>\n" for m in messages)
 
     def _encode_pair(self, prompt_text, response_text):
-        # byte-level tokenizer: encode(A)+encode(B) == encode(A+B), so
-        # encoding prompt alone safely gives prompt_len in token space.
+        # byte-level tokenizer: encode(A)+encode(B) == encode(A+B), so encoding prompt alone safely gives prompt_len in token space
         prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
         response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
         response_ids = response_ids[: self.max_len - len(prompt_ids)]

@@ -1,17 +1,4 @@
-"""
-Builds keep-it-simple-multimodal: mini multimodal dataset (image+caption, audio+caption,
-video+caption, lidar, control state/action), target ~51MB.
-
-Datasets used:
-  - detection-datasets/coco            -> image_caption (bbox serialized as text) (32, 32, 3) uint8
-  - laion/relaion-coco                  -> image_caption (URL download, punsafe-filtered)
-  - OpenSound/AudioCaps                  -> audio_caption
-  - HuggingFaceFV/finevideo (gated)      -> video_caption - video (6, 16, 16, 3) uint8
-  - nvidia/Cosmos-Transfer-LidarGen-Example (gated) -> lidar (300, 4) float32
-  - ffurfaro/PixelBytes-OptimalControl   -> control - stereo
-
-Gated sources: accept terms on the HF page, then `huggingface-cli login` or export HF_TOKEN.
-"""
+"""Builds keep-it-simple-multimodal (~51MB): image/audio/video/lidar/control captions from coco, relaion-coco, AudioCaps, finevideo, Cosmos-Transfer-LidarGen, PixelBytes-OptimalControl — gated sources need `huggingface-cli login`/HF_TOKEN."""
 
 import io
 import json
@@ -67,11 +54,7 @@ def make_row(modality, source, caption=None, **fields):
 
 
 def _iterate_resumable(ds, cache_path: str, fetch, process_row, n: int, desc: str) -> list[dict]:
-    """Streams `ds`, caching the FETCHED raw rows — network payloads included — not the
-    processed results. `fetch(row)` does the network work once (its output is cached, e.g.
-    downloaded image bytes); `process_row(fetched)` is the CPU transform that is RE-RUN on
-    every build, so edits to it take effect without re-hitting the network. Returns the first
-    `n` processed rows. `--force-rebuild` clears the cache to re-fetch from the network."""
+    """Streams `ds`, caching fetched raw rows (network payloads); process_row() is re-run every build, --force-rebuild re-fetches."""
     raw_rows, consumed = [], 0
     if os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
@@ -257,7 +240,7 @@ def build_audio_caption():
             return None
         try:
             arr, _ = _decode_audio_bytes(audio["bytes"], layout="mono", rate=AUDIO_SAMPLE_RATE)
-        except Exception:  # noqa: BLE001, S112 — a handful of malformed/unsupported clips is expected
+        except Exception:  # noqa: BLE001 — a handful of malformed/unsupported clips is expected
             return None
         original_samples = arr.shape[1]
         original_duration_sec = original_samples / AUDIO_SAMPLE_RATE
@@ -316,7 +299,7 @@ def _find_lidar_tar(repo_id: str) -> str:
     files = [f for f in HfApi().list_repo_files(repo_id, repo_type="dataset") if f.startswith("lidar_dataset_release/lidar/") and f.endswith(".tar")]
     if not files:
         raise RuntimeError(f"No lidar .tar files found in {repo_id}")
-    return sorted(files)[0]
+    return min(files)
 
 
 def _load_npz_arrays(raw: bytes) -> dict[str, np.ndarray]:
@@ -362,7 +345,7 @@ def _merge_lidar_frame(tar, components: dict) -> np.ndarray | None:
         try:
             arrays = _load_npz_arrays(f.read())
             stacked = _stack_component_columns(arrays)
-        except Exception:  # noqa: BLE001 — a handful of corrupt npz entries is expected
+        except Exception:  # noqa: BLE001, S112 — a handful of corrupt npz entries is expected
             continue
         if stacked is not None:
             per_component[name] = stacked
@@ -395,11 +378,7 @@ def _subsample_lidar_azimuth(points: np.ndarray, n: int) -> np.ndarray:
 
 
 def build_lidar():
-    """Lidar points. Dataset: nvidia/Cosmos-Transfer-LidarGen-Example (gated, one .tar clip).
-
-    Caches the RAW merged frames (`_merge_lidar_frame` output, before subsampling) so edits to
-    `_subsample_lidar_azimuth` / `make_row` are picked up on every build. `--force-rebuild`
-    clears the cache to re-merge straight from the tar."""
+    """Lidar points from nvidia/Cosmos-Transfer-LidarGen-Example (gated); caches raw merged frames, --force-rebuild re-merges."""
     from huggingface_hub import hf_hub_download
 
     cache_path = os.path.join(CACHE_DIR, f"lidar_v{CACHE_SCHEMA_VERSION}.pkl")
@@ -496,7 +475,7 @@ def build_control():
             return None
         try:
             arr, sample_rate = _decode_audio_bytes(audio["bytes"], layout="stereo")
-        except Exception:  # noqa: BLE001, S112 — skip a handful of malformed/unsupported clips
+        except Exception:  # noqa: BLE001 — skip a handful of malformed/unsupported clips
             return None
         if arr.shape[0] != 2 or arr.shape[1] < 2:
             return None

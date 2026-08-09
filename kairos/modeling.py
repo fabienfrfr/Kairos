@@ -1,4 +1,3 @@
-import random
 from dataclasses import dataclass
 
 import torch
@@ -100,10 +99,7 @@ class KairosConfig(PretrainedConfig):
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
 
-        # v3 Block-AttnRes: window prior layer outputs into blocks of S before
-        # they're summed and handed to the aggregator, so the number of AttnRes
-        # sources stays O(N/S) instead of O(N). S=1 (default) reproduces the
-        # original per-layer AttnRes graph exactly (see KairosDiffusionBackbone).
+        # v3 Block-AttnRes: windows prior layer outputs into blocks of S so AttnRes sources stay O(N/S); S=1 (default) reproduces the original per-layer graph
         self.attnres_block_size = kwargs.get("attnres_block_size", 1)
 
 
@@ -183,48 +179,8 @@ class KairosMultiCache(DynamicCache):
         return out
 
 
-def random_state_carry_plan(batch_size, max_group=3, rng=None):
-    """Per-row recipe for build_carried_cache: each row gets 0 (zero-state), 1 (direct carry), or up to max_group (summed) source rows sampled from a batch of the same size, biased toward zero/single carry so a summed state stays the exception."""
-    rng = rng or random
-    plan = []
-    for _ in range(batch_size):
-        k = rng.choices(range(max_group + 1), weights=[3, 3] + [1] * (max_group - 1))[0]
-        k = min(k, batch_size)
-        plan.append(rng.sample(range(batch_size), k) if k else [])
-    return plan
-
-
-def all_rows_carry_plan(batch_size):
-    """Every row gets agg(all rows of the previous batch) — the default: a stable summary rather than a random subset."""
-    return [list(range(batch_size))] * batch_size
-
-
-def build_carried_cache(config, prev_cache, plan, agg="mean"):
-    """New cache with each DeltaNet layer's conv/ssm state set to the detached mean/sum of prev_cache's rows in plan[row]; SWA-only layers are left unset."""
-    new_cache = KairosMultiCache(config)
-    if prev_cache is None:
-        return new_cache
-    for scale_idx, (old_scale, new_scale) in enumerate(zip(prev_cache.caches, new_cache.caches)):
-        for layer_idx, layer_type in enumerate(config.layers_config):
-            if "d" not in layer_type:
-                continue
-            for attr in ("conv_caches", "ssm_caches"):
-                old_states = getattr(old_scale, attr)[layer_idx]
-                if old_states is None:
-                    continue
-                rows = []
-                for recipe in plan:
-                    if not recipe:
-                        rows.append(torch.zeros_like(old_states[0]))
-                    else:
-                        combined = sum(old_states[r].detach() for r in recipe)
-                        rows.append(combined / len(recipe) if agg == "mean" else combined)
-                getattr(new_scale, attr)[layer_idx] = torch.stack(rows, dim=0)
-    return new_cache
-
-
 def build_memory_cache(model, prev_cache, running_memory, batch_size):
-    """Memory-bank counterpart to build_carried_cache: writes prev batch's ssm_cache into each layer's running memory, reads back a fresh initial ssm_cache for the current (any-size) batch. Returns (cache_params, running_memory); caller must .detach() running_memory before the next call."""
+    """Writes prev batch's ssm_cache into each layer's running memory, reads back a fresh initial ssm_cache for the current (any-size) batch. Returns (cache_params, running_memory); caller must .detach() running_memory before the next call."""
     new_cache = KairosMultiCache(model.config)
     new_running_memory = {}
     n_heads = model.config.num_attention_heads
@@ -573,7 +529,7 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
     ):
         x = decoder_input_ids if decoder_input_ids is not None else input_ids
         if x is None:
-            raise ValueError()
+            raise ValueError("either input_ids or decoder_input_ids must be provided")
         if modality_ids is None:
             modality_ids = torch.full_like(x, self.config.text_modality_id)
         h = self.embedding(token_ids=x, modality_ids=modality_ids)

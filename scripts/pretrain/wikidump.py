@@ -83,10 +83,10 @@ def _wikitext_to_record(title: str, raw: str) -> dict | None:
             if tag.tag.strip_code().lower() == "ref":
                 try:
                     wikicode.remove(tag)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - a single malformed tag must not abort the whole page
                     pass
         text = wikicode.strip_code()
-    except Exception:
+    except Exception:  # noqa: BLE001 - malformed wikitext must not abort the whole corpus build
         return None
 
     # Remove any remaining HTML tags and refs
@@ -131,7 +131,7 @@ def parse_vikidia(zim_path: str) -> list[dict]:
                     continue
                 title = entry.title.strip()
                 content = bytes(item.content).decode("utf-8", errors="ignore")
-            except Exception:
+            except Exception:  # noqa: BLE001 - a single corrupted zim entry must not abort the whole dump
                 skipped += 1
                 bar.update(1)
                 continue
@@ -168,7 +168,7 @@ def parse_vikidia(zim_path: str) -> list[dict]:
 def _html_to_record(title: str, html: str) -> dict | None:
     try:
         soup = BeautifulSoup(html, "lxml")
-    except Exception:
+    except Exception:  # noqa: BLE001 - malformed HTML must not abort the whole corpus build
         return None
 
     for tag in soup.find_all(["script", "style", "sup", "figure", "nav", "footer", "table"]):

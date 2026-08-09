@@ -184,77 +184,30 @@ def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
     assert last_epochs_avg < first_epochs_avg
 
 
-def test_state_carry_trains_without_crashing(tmp_path, model_config):
-    texts = [{"modality": "text", "text": "the quick brown fox jumps"}] * 8
+def test_memory_bank_survives_batch_size_change(tmp_path):
+    # build_memory_cache is batch-size-agnostic by construction (no special-casing needed,
+    # unlike the old carry mechanism) - this proves it holds through the real pipeline too
+    model_config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_memory_bank=True, memory_bank_slots=4)
+    texts = [{"modality": "text", "text": "the quick brown fox jumps"}] * 4
     data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
-    train_config = TrainConfig(
-        epochs=2, run_dir=str(tmp_path / "run"), state_carry=True, save_every=1000
-    )  # default mode="all", agg="mean"
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"), save_every=1000)
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
 
-    logs = pipe.train(resume=False)
-
-    assert pipe.skipped_nonfinite_steps == 0
-    assert all(math.isfinite(row["loss"]) for row in logs)
-
-
-def test_state_carry_random_mode_trains_without_crashing(tmp_path, model_config):
-    texts = [{"modality": "text", "text": "the quick brown fox jumps"}] * 8
-    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
-    train_config = TrainConfig(
-        epochs=2,
-        run_dir=str(tmp_path / "run"),
-        state_carry=True,
-        state_carry_mode="random",
-        state_carry_max_group=2,
-        save_every=1000,
-    )
-    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
-    pipe.build()
-
-    logs = pipe.train(resume=False)
-
-    assert pipe.skipped_nonfinite_steps == 0
-    assert all(math.isfinite(row["loss"]) for row in logs)
-
-
-def test_state_carry_survives_batch_size_change(built_pipeline):
-    # simulates a partial final batch: the pipeline must reset prev_cache instead of crashing
-    # when build_carried_cache would otherwise be asked to sum/select rows out of range
-    real_loader = list(built_pipeline.loader)
-    full_batch = real_loader[0]
-    partial_batch = {k: v[:1] for k, v in full_batch.items()}  # batch size 1 instead of 2
+    real_batch = next(iter(pipe.loader))
+    partial_batch = {k: v[:1] for k, v in real_batch.items()}  # batch size 1 instead of 2
 
     class _FakeLoader:
         def __iter__(self):
-            yield full_batch
+            yield real_batch
             yield partial_batch
 
         def __len__(self):
             return 2
 
-    built_pipeline.loader = _FakeLoader()
-    built_pipeline.train_config.state_carry = True
-    built_pipeline.train_config.epochs = 1
-    built_pipeline.train_config.save_every = 1000
+    pipe.loader = _FakeLoader()
 
-    logs = built_pipeline.train(resume=False)  # must not raise
-
-    assert built_pipeline.skipped_nonfinite_steps == 0
-    assert all(math.isfinite(row["loss"]) for row in logs)
-
-
-def test_pack_and_state_carry_combine_without_crashing(tmp_path, model_config):
-    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
-    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2, pack=True)
-    train_config = TrainConfig(
-        epochs=1, run_dir=str(tmp_path / "run"), state_carry=True, state_carry_max_group=3, save_every=1000
-    )
-    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
-    pipe.build()
-
-    logs = pipe.train(resume=False)
+    logs = pipe.train(resume=False)  # must not raise despite the batch-size change mid-run
 
     assert pipe.skipped_nonfinite_steps == 0
     assert all(math.isfinite(row["loss"]) for row in logs)

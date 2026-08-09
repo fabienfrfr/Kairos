@@ -15,10 +15,7 @@ from kairos.modeling import (
     KairosMemoryBank,
     KairosMultiCache,
     PyramidalConvCodec,
-    all_rows_carry_plan,
-    build_carried_cache,
     build_memory_cache,
-    random_state_carry_plan,
 )
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import KairosDiffusionTrainer
@@ -257,6 +254,30 @@ def test_kairos_model_forward(config):
     assert out.logits.shape == (2, 16, 259)
 
 
+def test_kairos_model_forward_requires_input_ids(config):
+    model = KairosDiffusionLLM(config)
+    with pytest.raises(ValueError, match="input_ids"):
+        model()
+
+
+def test_kairos_model_forward_with_self_conditioning(config):
+    model = KairosDiffusionLLM(config)
+    x = torch.randint(0, 259, (2, 16))
+    logits = torch.randn(2, 16, 259)
+    out = model(input_ids=x, self_conditioning_logits=logits)
+    assert out.logits.shape == (2, 16, 259)
+
+
+def test_kairos_cache_get_ssm_cache_roundtrip(config):
+    model = KairosDiffusionLLM(config)
+    cache = KairosMultiCache(config)
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x, cache_params=cache)
+    conv, ssm = cache.caches[0].get_ssm_cache(0)
+    assert conv is cache.caches[0].conv_caches[0]
+    assert ssm is cache.caches[0].ssm_caches[0]
+
+
 def test_memory_bank_agnostic_to_batch_size(config):
     bank = KairosMemoryBank(state_dim=8, num_slots=4, num_heads=2)
     memory = bank.initial_memory()
@@ -352,59 +373,6 @@ def test_build_memory_cache_gradient_reaches_slots_on_first_use():
     bank = model.backbones[0].memory_banks["0"]
     assert bank.slots.grad is not None
     assert bank.slots.grad.abs().sum() > 0
-
-
-def test_all_rows_carry_plan_targets_every_row(config):
-    plan = all_rows_carry_plan(4)
-    assert plan == [[0, 1, 2, 3]] * 4
-
-
-def test_build_carried_cache_mean_vs_sum(config):
-    cache = KairosMultiCache(config)
-    B = 4
-    for scale in cache.caches:
-        for i, layer_type in enumerate(config.layers_config):
-            if "d" in layer_type:
-                scale.ssm_caches[i] = torch.arange(B).float().view(B, 1, 1, 1).expand(B, 2, 2, 2).clone()
-
-    plan = all_rows_carry_plan(B)  # every row: mean/sum of [0,1,2,3] -> values 0,1,2,3
-    layer_idx = next(i for i, t in enumerate(config.layers_config) if "d" in t)
-
-    sum_cache = build_carried_cache(config, cache, plan, agg="sum")
-    mean_cache = build_carried_cache(config, cache, plan, agg="mean")
-    sum_means = sum_cache.caches[0].ssm_caches[layer_idx].mean(dim=[1, 2, 3])
-    mean_means = mean_cache.caches[0].ssm_caches[layer_idx].mean(dim=[1, 2, 3])
-
-    assert sum_means.tolist() == [6.0, 6.0, 6.0, 6.0]  # 0+1+2+3
-    assert mean_means.tolist() == [1.5, 1.5, 1.5, 1.5]  # (0+1+2+3)/4
-
-
-def test_random_state_carry_plan_respects_batch_size():
-    plan = random_state_carry_plan(batch_size=5, max_group=3)
-    assert len(plan) == 5
-    for recipe in plan:
-        assert all(0 <= r < 5 for r in recipe)
-        assert len(recipe) == len(set(recipe))  # no repeated source row within one recipe
-
-
-def test_build_carried_cache_sums_selected_rows(config):
-    cache = KairosMultiCache(config)
-    B = 4
-    for scale in cache.caches:
-        for i, layer_type in enumerate(config.layers_config):
-            if "d" in layer_type:
-                scale.ssm_caches[i] = torch.arange(B).float().view(B, 1, 1, 1).expand(B, 2, 2, 2).clone()
-
-    plan = [[], [0], [1, 2], [0, 1, 2, 3]]
-    new_cache = build_carried_cache(config, cache, plan, agg="sum")
-    layer_idx = next(i for i, t in enumerate(config.layers_config) if "d" in t)
-    means = new_cache.caches[0].ssm_caches[layer_idx].mean(dim=[1, 2, 3])
-    assert means.tolist() == [0.0, 0.0, 3.0, 6.0]
-
-
-def test_build_carried_cache_none_prev_returns_empty_cache(config):
-    cache = build_carried_cache(config, None, [[], []])
-    assert cache.caches[0].ssm_caches[0] is None
 
 
 def test_no_nan_forward(config):

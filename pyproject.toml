@@ -4,9 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kairos"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "Hybrid MoE diffusion language model (DeltaNet + sliding-window attention) for multimodal edge AI"
 readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Furfaro Fabien" }]
+keywords = ["diffusion", "moe", "multimodal", "deltanet", "edge-ai", "transformers"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 # Adapted for pip list in Kaggle
 requires-python = ">=3.12"
@@ -21,12 +30,14 @@ dependencies = [
     "nbformat>=5.10.4",
     "numpy>=1.26",
     "pathspec>=1.1.1",
-    "pytest>=8.4.2",
-    "ruff>=0.15.20",
     "tensorboard>=2.19.0",
     "torch>=2.10.0",
-    "transformers>=5.12.1", # mandatoy for gemma
+    "transformers>=5.12.1", # mandatory for gemma
 ]
+
+[project.urls]
+Homepage = "https://github.com/fabienfrfr/Kairos"
+Repository = "https://github.com/fabienfrfr/Kairos"
 
 [project.optional-dependencies]
 # `pip install -e ".[notebook]"` — everything notebook/kairos_multimodal_training.py needs on a bare Colab/Kaggle
@@ -40,7 +51,7 @@ notebook = [
 
 
 [tool.setuptools]
-packages = ["kairos"]
+packages = ["kairos", "kairos.templates"]
 
 [tool.setuptools.package-data]
 kairos = ["templates/*.md"]
@@ -60,7 +71,9 @@ dev = [
     "marimo>=0.23.9",
     "matplotlib>=3.10.0",
     "mwparserfromhell>=0.7.2",
+    "pytest>=8.4.2",
     "pytest-cov>=7.1.0",
+    "ruff>=0.15.20",
 ]
 # scripts/ (dataset builders): `uv sync --group scripts` to install
 scripts = [

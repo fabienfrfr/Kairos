@@ -309,5 +309,4 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# len(KairosTokenizer()) == 291  (259 base bytes/pad/eos/unk + 32 special tokens:
-# 8 modality pairs, 5 channel pairs, 4 structural markers, <SEP>, <MASK>)
+# len(KairosTokenizer()) == 291 (259 base bytes/pad/eos/unk + 32 special tokens: 8 modality pairs, 5 channel pairs, 4 structural markers, <SEP>, <MASK>)

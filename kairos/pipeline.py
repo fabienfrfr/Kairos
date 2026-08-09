@@ -16,14 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .dataset import KairosPretrainingDataset
-from .modeling import (
-    KairosConfig,
-    KairosDiffusionLLM,
-    all_rows_carry_plan,
-    build_carried_cache,
-    build_memory_cache,
-    random_state_carry_plan,
-)
+from .modeling import KairosConfig, KairosDiffusionLLM, build_memory_cache
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
@@ -57,10 +50,6 @@ class TrainConfig:
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as they're saved
     hub_private: bool = False
     hub_subfolder: str | None = None  # push checkpoints/model under repo_id/<subfolder> instead of repo root
-    state_carry: bool = False  # carry DeltaNet cache across batches (memory/robustness regularizer)
-    state_carry_mode: str = "all"  # "all": every row gets agg(all prev rows); "random": per-row random recipe
-    state_carry_agg: str = "mean"  # "mean" or "sum", used by both modes
-    state_carry_max_group: int = 3  # only used when state_carry_mode == "random"
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
@@ -221,7 +210,6 @@ class KairosMultimodalPipeline:
         skipped_nonfinite = 0
         consecutive_nan = 0
         prev_cache = None
-        prev_bsz = None
         running_memory = {}
         use_memory_bank = getattr(self.model_config, "use_memory_bank", False)
 
@@ -237,17 +225,6 @@ class KairosMultimodalPipeline:
                         cache_params, running_memory = build_memory_cache(
                             self.model, prev_cache, running_memory, cur_bsz
                         )
-                    elif tc.state_carry:
-                        cur_bsz = batch["input_ids"].size(0)
-                        if prev_cache is not None and prev_bsz != cur_bsz:
-                            prev_cache = None  # batch size changed; start fresh
-                        plan = (
-                            random_state_carry_plan(cur_bsz, tc.state_carry_max_group)
-                            if tc.state_carry_mode == "random"
-                            else all_rows_carry_plan(cur_bsz)
-                        )
-                        cache_params = build_carried_cache(self.model_config, prev_cache, plan, agg=tc.state_carry_agg)
-                        prev_bsz = cur_bsz
 
                     self.optimizer.zero_grad()
                     loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
@@ -255,8 +232,6 @@ class KairosMultimodalPipeline:
                     if use_memory_bank:
                         prev_cache = cache_params
                         running_memory = {k: v.detach() for k, v in running_memory.items()}
-                    elif tc.state_carry:
-                        prev_cache = cache_params  # forward wrote this step's final states into it
                     if not math.isfinite(loss_val):
                         # a corrupted batch can spike the loss to inf/nan; skip it rather than step on garbage
                         skipped_nonfinite += 1
@@ -371,9 +346,7 @@ class KairosMultimodalPipeline:
                     values, counts = row_modality.unique(return_counts=True)
                     modality_counts = dict(zip(values.tolist(), counts.tolist()))
 
-                # numeric anomaly signals: a long run of the exact same token id (degenerate/
-                # corrupted example) is a stronger red flag than any single-value stat — but
-                # exclude the padding tail, where a long run of pad_token_id is normal, not a bug
+                # a long run of the same token id is a stronger corruption signal than any single-value stat; excludes the padding tail, where a long run of pad_token_id is normal
                 real_len = int(pad_mask[row].sum()) if pad_mask is not None else row_ids.size(0)
                 run_lengths = _consecutive_run_lengths(row_ids[:real_len])
                 max_run_id, max_run_len = max(run_lengths.items(), key=lambda kv: kv[1]) if run_lengths else (None, 0)
@@ -404,7 +377,7 @@ class KairosMultimodalPipeline:
         return reports
 
     def run_config_dict(self) -> dict:
-        """model/train/data config as a plain JSON-safe dict — the actual hyperparameters behind a run, since model_config alone (saved in checkpoints) doesn't capture lr/epochs/pack/state_carry/etc."""
+        """model/train/data config as a plain JSON-safe dict — the actual hyperparameters behind a run, since model_config alone (saved in checkpoints) doesn't capture lr/epochs/pack/etc."""
         dc = asdict(self.data_config)
         for key in ("text_examples", "multimodal_examples"):
             if dc.get(key) is not None:

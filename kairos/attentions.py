@@ -343,10 +343,7 @@ class KairosGatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         prev_state = cache_params.ssm_caches[self.layer_idx] if has_ssm_state else None
         has_padding = attention_mask is not None and not bool(attention_mask.all())
-        # With padding + a real fla kernel (supports cu_seqlens): pack every
-        # active position across the batch into one flat sequence instead of
-        # wasting compute on padded steps. Falls back to zeroing beta/g at
-        # padded steps if only the torch reference kernel is available.
+        # With padding + a real fla kernel (cu_seqlens support): pack active positions across the batch into one flat sequence instead of wasting compute on padding; falls back to zeroing beta/g if only the torch reference kernel is available
         use_varlen = has_padding and not (has_previous_state and L == 1) and self._chunk_supports_varlen
         if use_varlen:
             flat_idx = attention_mask.nonzero(as_tuple=False)

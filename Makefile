@@ -5,13 +5,26 @@ ENV_FILE=.env
 # --- Feature ---
 
 coverage: ## prod-level > 95%
-	uv run pytest --cov=src --cov-report=term-missing
+	uv run pytest --cov=kairos --cov-report=term-missing
+
+test: ## Run the test suite
+	uv run pytest -q
+
+lint: ## Check code style
+	uv run ruff check .
+
+build: ## Build sdist + wheel into dist/
+	rm -rf dist/
+	uv build
+
+publish: ## Upload dist/ to PyPI (build first, requires PYPI credentials)
+	uv publish
 
 notebook: ## Working test
-	uv run marimo edit notebook/playground.py
+	uv run marimo edit notebook/kairos_pretraining.py
 
 jupyter: ## If you want to use Kaggle T4x2
-	uv run marimo export ipynb notebook/playground.py -o notebook.ipynb
+	uv run marimo export ipynb notebook/kairos_pretraining.py -o notebook.ipynb
 
 mapper: ## Export full project structure to JSON
 	uv run python3 mapper.py --to-json
