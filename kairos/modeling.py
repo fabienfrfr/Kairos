@@ -82,10 +82,11 @@ class KairosConfig(PretrainedConfig):
 
         self.intermediate_size = intermediate_size
 
-        self.num_local_experts = kwargs.get("num_local_experts", 8)
+        # num_local_experts is the only one transformers' DeepseekV3Experts actually reads;
+        # n_routed_experts is a property alias below so setting either one can't silently diverge
+        self.num_local_experts = kwargs.get("num_local_experts", kwargs.get("n_routed_experts", 8))
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 2)
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", intermediate_size)
-        self.n_routed_experts = kwargs.get("n_routed_experts", 8)
         self.n_shared_experts = kwargs.get("n_shared_experts", 1)
         self.routed_scaling_factor = kwargs.get("routed_scaling_factor", 1.0)
         self.n_group = kwargs.get("n_group", 1)
@@ -101,6 +102,15 @@ class KairosConfig(PretrainedConfig):
 
         # v3 Block-AttnRes: windows prior layer outputs into blocks of S so AttnRes sources stay O(N/S); S=1 (default) reproduces the original per-layer graph
         self.attnres_block_size = kwargs.get("attnres_block_size", 1)
+
+    @property
+    def n_routed_experts(self):
+        """Alias for num_local_experts (the field transformers' DeepseekV3Experts actually reads) so the two names can never silently diverge."""
+        return self.num_local_experts
+
+    @n_routed_experts.setter
+    def n_routed_experts(self, value):
+        self.num_local_experts = value
 
 
 class KairosCache(DynamicCache):

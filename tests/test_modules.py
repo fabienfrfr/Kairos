@@ -92,6 +92,18 @@ def test_kairos_config(config):
     assert config.num_attention_heads == 4
 
 
+def test_n_routed_experts_stays_synced_with_num_local_experts():
+    via_old_name = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, n_routed_experts=16)
+    assert via_old_name.num_local_experts == 16
+
+    via_new_name = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_local_experts=12)
+    assert via_new_name.n_routed_experts == 12
+
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259)
+    cfg.n_routed_experts = 20
+    assert cfg.num_local_experts == 20
+
+
 def test_diffusion_block(config):
     block = DiffusionBlock(config, 0)
     x = torch.randn(2, 8, 32)
