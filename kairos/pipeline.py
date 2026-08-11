@@ -221,9 +221,8 @@ class KairosMultimodalPipeline:
 
                     cache_params = None
                     if use_memory_bank:
-                        cur_bsz = batch["input_ids"].size(0)
                         cache_params, running_memory = build_memory_cache(
-                            self.model, prev_cache, running_memory, cur_bsz
+                            self.model, prev_cache, running_memory, batch["input_ids"]
                         )
 
                     self.optimizer.zero_grad()

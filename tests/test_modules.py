@@ -210,6 +210,19 @@ def test_token_embedding():
     assert y.shape[0] == 2
 
 
+def test_token_embedding_concat_fusion():
+    emb = KairosEmbedding(vocab_size=100, num_modalities=7, d_model=32, fusion="concat")
+    x = torch.randint(0, 100, (2, 16))
+    m = torch.zeros_like(x)
+    y = emb(token_ids=x, modality_ids=m)
+    assert y.shape == (2, 16, 32)
+
+
+def test_token_embedding_rejects_unknown_fusion():
+    with pytest.raises(ValueError, match="fusion"):
+        KairosEmbedding(vocab_size=100, num_modalities=7, d_model=32, fusion="bogus")
+
+
 def test_codec_roundtrip():
     codec = PyramidalConvCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
@@ -291,28 +304,38 @@ def test_kairos_cache_get_ssm_cache_roundtrip(config):
 
 
 def test_memory_bank_agnostic_to_batch_size(config):
-    bank = KairosMemoryBank(state_dim=8, num_slots=4, num_heads=2)
+    bank = KairosMemoryBank(state_dim=8, d_model=6, num_slots=4, num_heads=2)
     memory = bank.initial_memory()
     memory = bank.write(memory, torch.randn(5, 8))
-    out_a = bank.new_state(memory, batch_size=3)
-    out_b = bank.new_state(memory, batch_size=9)
+    out_a = bank.new_state(memory, torch.randn(3, 6))
+    out_b = bank.new_state(memory, torch.randn(9, 6))
     assert out_a.shape == (3, 8)
     assert out_b.shape == (9, 8)
 
 
-def test_memory_bank_gradient_reaches_slots(config):
-    bank = KairosMemoryBank(state_dim=8, num_slots=4, num_heads=2)
+def test_memory_bank_read_depends_on_context_not_constant(config):
+    # regression test: read() used to query with a fixed all-zero tensor, so every row got the
+    # identical readout regardless of content - context must now actually change the result
+    bank = KairosMemoryBank(state_dim=8, d_model=6, num_slots=4, num_heads=2)
     memory = bank.write(bank.initial_memory(), torch.randn(5, 8))
-    bank.new_state(memory, batch_size=3).sum().backward()
+    context = torch.randn(2, 6)
+    out = bank.new_state(memory, context)
+    assert not torch.allclose(out[0], out[1])  # two different rows -> two different readouts
+
+
+def test_memory_bank_gradient_reaches_slots(config):
+    bank = KairosMemoryBank(state_dim=8, d_model=6, num_slots=4, num_heads=2)
+    memory = bank.write(bank.initial_memory(), torch.randn(5, 8))
+    bank.new_state(memory, torch.randn(3, 6)).sum().backward()
     assert bank.slots.grad is not None
     assert bank.slots.grad.abs().sum() > 0
 
 
 def test_memory_bank_write_does_not_backprop_into_prev_states(config):
-    bank = KairosMemoryBank(state_dim=8, num_slots=4, num_heads=2)
+    bank = KairosMemoryBank(state_dim=8, d_model=6, num_slots=4, num_heads=2)
     prev_states = torch.randn(5, 8, requires_grad=True)
     memory = bank.write(bank.initial_memory(), prev_states)
-    bank.new_state(memory, batch_size=2).sum().backward()
+    bank.new_state(memory, torch.randn(2, 6)).sum().backward()
     assert prev_states.grad is None  # write() detaches its input - can't backprop into a freed batch
 
 
@@ -367,11 +390,13 @@ def test_build_memory_cache_is_batch_size_agnostic_across_steps():
     config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_memory_bank=True, memory_bank_slots=4)
     model = KairosDiffusionLLM(config)
 
-    cache1, mem1 = build_memory_cache(model, None, {}, batch_size=3)
+    ids3 = torch.randint(0, 259, (3, 8))
+    cache1, mem1 = build_memory_cache(model, None, {}, ids3)
     assert cache1.caches[0].ssm_caches[0].shape[0] == 3
 
     mem1_detached = {k: v.detach() for k, v in mem1.items()}
-    cache2, _ = build_memory_cache(model, cache1, mem1_detached, batch_size=5)
+    ids5 = torch.randint(0, 259, (5, 8))
+    cache2, _ = build_memory_cache(model, cache1, mem1_detached, ids5)
     assert cache2.caches[0].ssm_caches[0].shape[0] == 5
 
 
@@ -379,12 +404,25 @@ def test_build_memory_cache_gradient_reaches_slots_on_first_use():
     config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_memory_bank=True, memory_bank_slots=4)
     model = KairosDiffusionLLM(config)
 
-    cache1, _ = build_memory_cache(model, None, {}, batch_size=3)
+    ids = torch.randint(0, 259, (3, 8))
+    cache1, _ = build_memory_cache(model, None, {}, ids)
     cache1.caches[0].ssm_caches[0].sum().backward()
 
     bank = model.backbones[0].memory_banks["0"]
     assert bank.slots.grad is not None
     assert bank.slots.grad.abs().sum() > 0
+
+
+def test_build_memory_cache_different_rows_get_different_states():
+    # end-to-end regression test for the fixed read() bug, through the real pipeline entry point
+    config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_memory_bank=True, memory_bank_slots=4)
+    model = KairosDiffusionLLM(config)
+
+    ids = torch.stack([torch.full((8,), 5, dtype=torch.long), torch.full((8,), 200, dtype=torch.long)])
+    cache, _ = build_memory_cache(model, None, {}, ids)
+    row0 = cache.caches[0].ssm_caches[0][0]
+    row1 = cache.caches[0].ssm_caches[0][1]
+    assert not torch.allclose(row0, row1)
 
 
 def test_no_nan_forward(config):

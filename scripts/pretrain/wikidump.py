@@ -94,8 +94,8 @@ def _wikitext_to_record(title: str, raw: str) -> dict | None:
     text = re.sub(r"<[^>]+>", "", text)
 
     lines = []
-    for l in text.splitlines():
-        s = l.strip()
+    for line in text.splitlines():
+        s = line.strip()
         if "Category:" in s:
             break
         if len(s) >= 20 and not s.startswith(SKIP_PREFIXES):

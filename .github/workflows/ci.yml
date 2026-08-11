@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-  pull_request:
+    branches: ["**"] # every branch, not just main
+  pull_request: # also covers fork PRs, which "push" alone can't see
 
 jobs:
   lint:

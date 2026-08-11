@@ -1,5 +1,5 @@
 <h1 align="center">
-<p>🌀 Kairos</p>
+<p>🌀 KairosFM</p>
 </h1>
 
 <p align="center">
@@ -12,8 +12,10 @@
 </p>
 
 <h3 align="center">
-<p>Universal multimodal MoE built from scratch for efficient edge AI</p>
+<p>KairosFM — less parameters, more signal.</p>
 </h3>
+
+> **Status**: pre-1.0, architecture not yet validated by a full training run. Expect breaking changes until v1.0.0 (reserved for the first checkpoint that has actually proven itself).
 
 <p align="center">
 <b>200M parameters</b> • <b>25M active</b> • DeltaNet • Sliding Window Attention • MoE • AttnRes • Multimodal Conv-Byte Tokenizer

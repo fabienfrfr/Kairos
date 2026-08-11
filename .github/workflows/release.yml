@@ -1,19 +1,20 @@
 name: Release (auto-tag)
 
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches: [main]
 
 jobs:
   tag:
     runs-on: ubuntu-latest
-    # skip commits that only bumped the tag itself, to avoid a self-triggering loop
-    if: "!contains(github.event.head_commit.message, 'chore(release)')"
+    if: github.event.pull_request.merged == true
     outputs:
       new_tag: ${{ steps.tag.outputs.new_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Compute next version from conventional commits since the last tag
