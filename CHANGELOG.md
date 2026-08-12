@@ -7,7 +7,6 @@ All notable changes to this project are documented here. Format loosely follows 
 Pre-release baseline. Architecture not yet validated by a full training run — `v1.0.0` is reserved for the first checkpoint that has actually proven itself; a `BREAKING CHANGE` commit will trigger that bump once training results back the design.
 
 ### Added
-- `KairosMemoryBank`: learnable, batch-size-agnostic per-layer memory for DeltaNet, updated via cross-attention (`write`/`read`). Enabled with `KairosConfig(use_memory_bank=True)`, inert (zero effect) unless a caller explicitly builds and passes a memory-carrying cache via `build_memory_cache()` — normal inference and generation are unaffected.
 - `DataConfig(pack=True)`: concatenates samples before chunking so only the final chunk is padded, instead of padding every short example individually.
 - `TrainConfig.hub_subfolder`: push checkpoints/model/logs under `repo_id/<subfolder>` so multiple runs or configs can share one Hub repo.
 - `pipe.run_config_dict()` / `training_config.json`: the full model/train/data hyperparameters behind a run, persisted at `build()` time and embedded in every checkpoint — previously only `model_config` was saved.
@@ -21,7 +20,6 @@ Pre-release baseline. Architecture not yet validated by a full training run — 
 - `KairosEmbedding(fusion="concat")`: optional concat+projection fusion of token/modality embeddings as an alternative to the default addition — opt-in, untested by ablation yet, for experimentation.
 
 ### Fixed
-- **`KairosMemoryBank.read()` used a constant all-zero query**: every row of a batch got the *identical* memory readout regardless of its own content, and retrieval couldn't be content-conditioned at all. Fixed to derive a real per-row query from a cheap mean-pooled token-embedding summary of the current batch (available before running the full backbone forward). Verified: different rows now produce different readouts.
 - **DeltaNet cache bug**: `has_previous_state` was gated only on `conv_caches`, so an `ssm_cache` set without a matching `conv_cache` (exactly what state-carrying mechanisms do) was silently ignored — any carried/injected state was never actually used by the model.
 - **MoE weight initialization**: `KairosDiffusionLLM` never called `self.post_init()`, so `DeepseekV3Experts`' raw `nn.Parameter(torch.empty(...))` weights were left as uninitialized memory (occasionally NaN/Inf at construction, before any data or training). Fixed in `KairosMoE.__init__` directly (not via fragile `isinstance` checks on internal `transformers` class names, which differ across versions).
 - `KairosConfig.top_k` collided with `GenerationConfig.top_k` (sampling parameter), silently producing an invalid generation config. Removed the dead alias.

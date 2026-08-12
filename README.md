@@ -52,20 +52,6 @@ Our conviction: AGI will emerge from a generalist, multimodal, causal model capa
 
 The choice of linear attention, specifically **DeltaNet**, is also driven by its ability to compress long-range history into a fixed-size state, enabling a continuous information flow. Unlike quadratic attention, this allows the model to maintain persistent context across sessions with constant memory usage, effectively bypassing the bottleneck of expanding KV caches while preserving architectural efficiency.
 
-### Learnable Memory (`KairosMemoryBank`)
-
-Beyond a single sequence, `KairosConfig(use_memory_bank=True)` attaches one learnable memory bank per DeltaNet layer/scale: a fixed set of slot vectors (`memory_bank_slots`) that cross-attend over a batch's final DeltaNet state (`write`) and get read back out to seed the next batch's initial state (`read`), independent of batch size in either direction. During pretraining this is what makes the model learn to use (or ignore) incoming memory at all — random cross-batch pairing has no exploitable signal on its own, but the write/read/fuse attention weights and the slots themselves are ordinary parameters trained by the same loss as everything else, and persist across checkpoints.
-
-At inference, the mechanism is available but never triggered implicitly — a plain `generate()`/`forward()` call is completely unaffected by `use_memory_bank`. To carry memory across an exchange, call `build_memory_cache(model, prev_cache, prev_memory, batch_size)` before the next call and pass its `cache_params` in:
-
-```python
-cache, memory = build_memory_cache(model, None, {}, batch_size=1)
-out1 = model(input_ids=turn1_ids, cache_params=cache)
-
-memory = {k: v.detach() for k, v in memory.items()}  # cross a real boundary between calls
-cache2, memory2 = build_memory_cache(model, cache, memory, batch_size=1)
-out2 = model(input_ids=turn2_ids, cache_params=cache2)  # carries turn1's memory into turn2
-```
 
 ## Code Structure
 

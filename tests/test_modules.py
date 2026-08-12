@@ -301,21 +301,6 @@ def test_kairos_cache_get_ssm_cache_roundtrip(config):
     assert ssm is cache.caches[0].ssm_caches[0]
 
 
-
-def test_kairos_cache_unaffected_by_memory_bank_flag(config):
-    # a plain KairosCache/KairosMultiCache carries no memory-bank state regardless of the config flag
-    memory_config = KairosConfig(**{**config.to_dict(), "d_model": 32, "n_heads": 4, "n_layers": 2, "use_memory_bank": True})
-    model = KairosDiffusionLLM(memory_config)
-    cache = KairosMultiCache(memory_config)
-    x = torch.randint(0, memory_config.vocab_size, (2, 12))
-    model(input_ids=x, cache_params=cache)  # ordinary streaming/generation-style cache usage
-    for scale in cache.caches:
-        assert all(m is None for m in scale.ssm_caches) or all(
-            s.shape[0] == 2 for s in scale.ssm_caches if s is not None
-        )  # populated by the ordinary forward pass, never touched by any memory bank
-
-
-
 def test_no_nan_forward(config):
     model = KairosDiffusionLLM(config)
     x = torch.randint(0, 259, (2, 8))

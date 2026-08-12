@@ -217,23 +217,17 @@ def _():
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
     CFG_INTERMEDIATE = 352
-    CFG_USE_MEMORY_BANK = True  # learnable per-layer memory across batches, replaces the old state_carry hack
-    CFG_MEMORY_BANK_SLOTS = 16
-    CFG_MEMORY_BANK_HEADS = 4
     return (
         CFG_ATTNRES_BLOCK,
         CFG_D_MODEL,
         CFG_EXPERTS,
         CFG_EXPERTS_PER_TOK,
         CFG_INTERMEDIATE,
-        CFG_MEMORY_BANK_HEADS,
-        CFG_MEMORY_BANK_SLOTS,
         CFG_NUM_SCALES,
         CFG_N_HEADS,
         CFG_N_LAYERS,
         CFG_SHARED_EXPERTS,
         CFG_STRIDE,
-        CFG_USE_MEMORY_BANK,
     )
 
 
@@ -260,14 +254,11 @@ def _(
     CFG_EXPERTS,
     CFG_EXPERTS_PER_TOK,
     CFG_INTERMEDIATE,
-    CFG_MEMORY_BANK_HEADS,
-    CFG_MEMORY_BANK_SLOTS,
     CFG_NUM_SCALES,
     CFG_N_HEADS,
     CFG_N_LAYERS,
     CFG_SHARED_EXPERTS,
     CFG_STRIDE,
-    CFG_USE_MEMORY_BANK,
     KairosConfig,
     modality_scales,
     tokenizer,
@@ -291,9 +282,6 @@ def _(
         n_shared_experts=CFG_SHARED_EXPERTS,
         use_moe=use_moe,
         attnres_block_size=CFG_ATTNRES_BLOCK,
-        use_memory_bank=CFG_USE_MEMORY_BANK,
-        memory_bank_slots=CFG_MEMORY_BANK_SLOTS,
-        memory_bank_heads=CFG_MEMORY_BANK_HEADS,
     )
     print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}")
     return (model_config,)
