@@ -17,7 +17,6 @@ Pre-release baseline. Architecture not yet validated by a full training run — 
 - Package metadata completed for a real PyPI release: license, authors, classifiers, urls; `pytest`/`ruff` moved out of runtime dependencies into the `dev` group.
 - CI: lint + test on every push/PR to `main`; version-tag-triggered publish workflow (build, `twine check`, PyPI trusted publishing, post-publish install smoke test); auto-tagging workflow that bumps and pushes a semver tag from Conventional Commits on `main`.
 
-- `KairosEmbedding(fusion="concat")`: optional concat+projection fusion of token/modality embeddings as an alternative to the default addition — opt-in, untested by ablation yet, for experimentation.
 
 ### Fixed
 - **DeltaNet cache bug**: `has_previous_state` was gated only on `conv_caches`, so an `ssm_cache` set without a matching `conv_cache` (exactly what state-carrying mechanisms do) was silently ignored — any carried/injected state was never actually used by the model.

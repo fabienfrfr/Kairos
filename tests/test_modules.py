@@ -208,19 +208,6 @@ def test_token_embedding():
     assert y.shape[0] == 2
 
 
-def test_token_embedding_concat_fusion():
-    emb = KairosEmbedding(vocab_size=100, num_modalities=7, d_model=32, fusion="concat")
-    x = torch.randint(0, 100, (2, 16))
-    m = torch.zeros_like(x)
-    y = emb(token_ids=x, modality_ids=m)
-    assert y.shape == (2, 16, 32)
-
-
-def test_token_embedding_rejects_unknown_fusion():
-    with pytest.raises(ValueError, match="fusion"):
-        KairosEmbedding(vocab_size=100, num_modalities=7, d_model=32, fusion="bogus")
-
-
 def test_codec_roundtrip():
     codec = PyramidalConvCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
