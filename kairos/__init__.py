@@ -1,6 +1,6 @@
 """KairosFM: less parameters, more signal. A hybrid MoE diffusion language model (DeltaNet + sliding-window attention) for multimodal edge AI."""
 
-from .modeling import KairosConfig, KairosDiffusionLLM, KairosMemoryBank
+from .modeling import KairosConfig, KairosDiffusionLLM, KairosStateCombiner
 from .pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 from .tokenizer import KairosTokenizer, Modality
 
@@ -13,7 +13,7 @@ __all__ = [
     "DataConfig",
     "KairosConfig",
     "KairosDiffusionLLM",
-    "KairosMemoryBank",
+    "KairosStateCombiner",
     "KairosMultimodalPipeline",
     "KairosTokenizer",
     "Modality",

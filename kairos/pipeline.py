@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .dataset import KairosPretrainingDataset
-from .modeling import KairosConfig, KairosDiffusionLLM, build_memory_cache
+from .modeling import KairosConfig, KairosDiffusionLLM, KairosMultiCache, pool_batch_states
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
@@ -210,8 +210,7 @@ class KairosMultimodalPipeline:
         skipped_nonfinite = 0
         consecutive_nan = 0
         prev_cache = None
-        running_memory = {}
-        use_memory_bank = getattr(self.model_config, "use_memory_bank", False)
+        use_state_combiner = getattr(self.model_config, "use_state_combiner", False)
 
         try:
             for epoch in range(start_epoch, tc.epochs + 1):
@@ -220,17 +219,31 @@ class KairosMultimodalPipeline:
                     batch = {k: v.to(self.device) for k, v in batch.items()}
 
                     cache_params = None
-                    if use_memory_bank:
-                        cache_params, running_memory = build_memory_cache(
-                            self.model, prev_cache, running_memory, batch["input_ids"]
-                        )
+                    if use_state_combiner:
+                        cur_bsz = batch["input_ids"].size(0)
+                        cache_params = KairosMultiCache(self.model_config)
+                        if prev_cache is not None:
+                            # pool every row of batch t-1 (same layer) into one state, broadcast to batch t
+                            pooled = pool_batch_states(self.model, prev_cache)
+                            for scale_idx, scale_cache in enumerate(cache_params.caches):
+                                for layer_idx_str in self.model.backbones[scale_idx].state_combiners:
+                                    layer_idx = int(layer_idx_str)
+                                    one_row = pooled.caches[scale_idx].ssm_caches[layer_idx]
+                                    if one_row is not None:
+                                        expanded = one_row.expand(cur_bsz, *one_row.shape[1:]).contiguous()
+                                        scale_cache.ssm_caches[layer_idx] = expanded
+                        # else: nothing to combine yet (first step) - cache stays empty, no perturbation
 
                     self.optimizer.zero_grad()
                     loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
                     loss_val = loss.item()
-                    if use_memory_bank:
+                    if use_state_combiner:
+                        # cache_params now holds this step's own final states, written by the forward pass
+                        for scale_cache in cache_params.caches:
+                            for layer_idx, s in enumerate(scale_cache.ssm_caches):
+                                if s is not None:
+                                    scale_cache.ssm_caches[layer_idx] = s.detach()
                         prev_cache = cache_params
-                        running_memory = {k: v.detach() for k, v in running_memory.items()}
                     if not math.isfinite(loss_val):
                         # a corrupted batch can spike the loss to inf/nan; skip it rather than step on garbage
                         skipped_nonfinite += 1

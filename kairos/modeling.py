@@ -93,10 +93,7 @@ class KairosConfig(PretrainedConfig):
         self.topk_group = kwargs.get("topk_group", 1)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", False)
         self.use_moe = kwargs.get("use_moe", False)
-        self.use_memory_bank = kwargs.get("use_memory_bank", False)
-        self.embedding_fusion = kwargs.get("embedding_fusion", "add")  # "add" (default) or "concat"
-        self.memory_bank_slots = kwargs.get("memory_bank_slots", 16)
-        self.memory_bank_heads = kwargs.get("memory_bank_heads", 4)
+        self.use_state_combiner = kwargs.get("use_state_combiner", False)  # combine_deltanet_caches()
 
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
@@ -190,68 +187,59 @@ class KairosMultiCache(DynamicCache):
         return out
 
 
-def build_memory_cache(model, prev_cache, running_memory, input_ids):
-    """Writes prev batch's ssm_cache into each layer's running memory, reads back a fresh initial ssm_cache for the current (any-size) batch. input_ids: (B, L) the CURRENT batch's tokens, mean-pooled into a per-row content summary so different rows can retrieve differently from memory (cheap: no full backbone forward needed). Returns (cache_params, running_memory); caller must .detach() running_memory before the next call."""
-    new_cache = KairosMultiCache(model.config)
-    new_running_memory = {}
-    n_heads = model.config.num_attention_heads
-    head_dim = model.config.hidden_size // n_heads
-    batch_size = input_ids.size(0)
-    context = model.embedding.token_embed(input_ids).mean(dim=1)  # (B, d_model), cheap per-row content signal
-    for scale_idx, backbone in enumerate(model.backbones):
-        for layer_idx_str, bank in backbone.memory_banks.items():
-            layer_idx = int(layer_idx_str)
-            key = (scale_idx, layer_idx)
-            memory = (running_memory or {}).get(key)
-            if memory is None:
-                memory = bank.initial_memory()
-            if prev_cache is not None:
-                old_states = prev_cache.caches[scale_idx].ssm_caches[layer_idx]
-                if old_states is not None:
-                    memory = bank.write(memory, old_states.reshape(old_states.size(0), -1))
-            new_running_memory[key] = memory
-            flat_new_state = bank.new_state(memory, context)
-            new_cache.caches[scale_idx].ssm_caches[layer_idx] = flat_new_state.view(
-                batch_size, n_heads, head_dim, 2 * head_dim
-            )
-    return new_cache, new_running_memory
+class KairosStateCombiner(nn.Module):
+    """Learned, size-unbounded combination of K DeltaNet ssm_cache states via self-attention over the set (so scores reflect how states relate, not each in isolation), pooled by weighting the raw states themselves - K=1 is an exact identity, so a lone resumed session is never perturbed."""
 
-
-class KairosMemoryBank(nn.Module):
-    """Learnable, batch-agnostic memory for one DeltaNet layer: slots (nn.Parameter) is the learned prior, write() cross-attends it over the previous batch's states, read()/new_state() attend back out using a real per-row query so different rows can retrieve differently."""
-
-    def __init__(self, state_dim, d_model, num_slots=16, num_heads=4):
+    def __init__(self, state_dim, num_heads=4):
         super().__init__()
-        self.state_dim = state_dim
-        self.slots = nn.Parameter(torch.randn(num_slots, state_dim) * 0.02)
-        self.write_attn = nn.MultiheadAttention(state_dim, num_heads, batch_first=True)
-        self.read_attn = nn.MultiheadAttention(state_dim, num_heads, batch_first=True)
-        self.query_proj = nn.Linear(d_model, state_dim)  # maps a per-row content summary into query space
-        self.fuse = nn.Linear(state_dim * 2, state_dim)
-        self.norm_write = nn.LayerNorm(state_dim)
-        self.norm_read = nn.LayerNorm(state_dim)
+        self.context_attn = nn.MultiheadAttention(state_dim, num_heads, batch_first=True)
+        self.score = nn.Sequential(nn.Linear(state_dim, state_dim), nn.Tanh(), nn.Linear(state_dim, 1))
 
-    def initial_memory(self):
-        """Returns the learnable prior itself (undetached): gives self.slots a real gradient on first use, like a learnable initial hidden state."""
-        return self.slots
+    def forward(self, states):
+        """states: (K, state_dim), K unbounded (including 1). Returns (state_dim,)."""
+        if states.size(0) == 1:
+            return states[0]
+        context, _ = self.context_attn(states.unsqueeze(0), states.unsqueeze(0), states.unsqueeze(0))
+        weights = torch.softmax(self.score(context.squeeze(0)).squeeze(-1), dim=0)
+        return (weights.unsqueeze(-1) * states).sum(dim=0)
 
-    def write(self, memory, prev_states_flat):
-        """memory: (num_slots, D) running state (caller-detached); prev_states_flat: (B_prev, D), detached here."""
-        q = memory.unsqueeze(0)
-        kv = prev_states_flat.detach().unsqueeze(0)
-        updated, _ = self.write_attn(q, kv, kv)
-        return self.norm_write(updated.squeeze(0) + memory)
 
-    def read(self, memory, context):
-        """context: (batch_size, d_model) a real per-row content summary (e.g. mean-pooled token embeddings) - NOT a constant, so different rows can retrieve different memory. Returns (batch_size, state_dim)."""
-        q = self.query_proj(context).unsqueeze(1)
-        kv = memory.unsqueeze(0).expand(context.size(0), -1, -1)
-        out, _ = self.read_attn(q, kv, kv)
-        return self.norm_read(out.squeeze(1))
+def combine_deltanet_caches(model, caches: list) -> "KairosMultiCache":
+    """Combines multiple per-session caches (same batch layout, typically batch_size=1 each) via a learned combiner per (scale, layer), row-by-row; len(caches)==1 leaves that cache unchanged; conv_caches are reset."""
+    if not caches:
+        raise ValueError("combine_deltanet_caches needs at least one cache")
+    new_cache = KairosMultiCache(model.config)
+    for scale_idx, backbone in enumerate(model.backbones):
+        for layer_idx_str, combiner in backbone.state_combiners.items():
+            layer_idx = int(layer_idx_str)
+            states = [c.caches[scale_idx].ssm_caches[layer_idx] for c in caches]
+            states = [s for s in states if s is not None]
+            if not states:
+                continue
+            batch_size = states[0].shape[0]
+            per_row_shape = states[0].shape[1:]
+            combined_rows = [
+                combiner(torch.stack([s[row].reshape(-1) for s in states], dim=0)) for row in range(batch_size)
+            ]
+            new_cache.caches[scale_idx].ssm_caches[layer_idx] = torch.stack(combined_rows, dim=0).view(
+                batch_size, *per_row_shape
+            )
+    return new_cache
 
-    def new_state(self, memory, context):
-        readout = self.read(memory, context)
-        return self.fuse(torch.cat([torch.zeros_like(readout), readout], dim=-1))
+
+def pool_batch_states(model, cache) -> "KairosMultiCache":
+    """Pools every row of ONE cache (e.g. a training batch's final states) into a single state per (scale, layer), via the same learned combiner; returns a batch_size=1 cache; batch_size==1 leaves it unchanged."""
+    new_cache = KairosMultiCache(model.config)
+    for scale_idx, backbone in enumerate(model.backbones):
+        for layer_idx_str, combiner in backbone.state_combiners.items():
+            layer_idx = int(layer_idx_str)
+            states = cache.caches[scale_idx].ssm_caches[layer_idx]
+            if states is None:
+                continue
+            per_row_shape = states.shape[1:]
+            combined = combiner(states.reshape(states.shape[0], -1))
+            new_cache.caches[scale_idx].ssm_caches[layer_idx] = combined.view(1, *per_row_shape)
+    return new_cache
 
 
 class KairosFFN(Qwen2MoeMLP):
@@ -320,18 +308,13 @@ class KairosDiffusionBackbone(nn.Module):
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
         head_dim = config.hidden_size // config.num_attention_heads  # ssm_cache shape: (B, n_heads, head_dim, 2*head_dim)
         n_heads = config.num_attention_heads
-        self.memory_banks = nn.ModuleDict(
+        self.state_combiners = nn.ModuleDict(
             {
-                str(i): KairosMemoryBank(
-                    state_dim=n_heads * head_dim * 2 * head_dim,
-                    d_model=config.hidden_size,
-                    num_slots=config.memory_bank_slots,
-                    num_heads=config.memory_bank_heads,
-                )
+                str(i): KairosStateCombiner(state_dim=n_heads * head_dim * 2 * head_dim)
                 for i, layer_type in enumerate(config.layers_config)
                 if "d" in layer_type
             }
-            if getattr(config, "use_memory_bank", False)
+            if getattr(config, "use_state_combiner", False)
             else {}
         )
 
@@ -365,21 +348,17 @@ class KairosDiffusionBackbone(nn.Module):
 
 
 class KairosEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, num_modalities: int, d_model: int, fusion: str = "add"):
+    def __init__(self, vocab_size: int, num_modalities: int, d_model: int):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.modality_embed = nn.Embedding(num_modalities, d_model)
-        self.fusion = fusion
-        if fusion == "concat":
-            self.fusion_proj = nn.Linear(d_model * 2, d_model)
-        elif fusion != "add":
-            raise ValueError(f"fusion must be 'add' or 'concat', got {fusion!r}")
+        self.fusion_proj = nn.Linear(d_model * 2, d_model)
         self.scale = d_model**0.5
 
     def forward(self, token_ids, modality_ids):
         tok = self.token_embed(token_ids)
         mod = self.modality_embed(modality_ids)
-        h = self.fusion_proj(torch.cat([tok, mod], dim=-1)) if self.fusion == "concat" else tok + mod
+        h = self.fusion_proj(torch.cat([tok, mod], dim=-1))
         h = h * self.scale
         return h
 
@@ -517,10 +496,7 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         if vocab_size is None:
             vocab_size = config.vocab_size
         self.embedding = KairosEmbedding(
-            vocab_size=vocab_size,
-            num_modalities=config.num_modalities,
-            d_model=config.hidden_size,
-            fusion=getattr(config, "embedding_fusion", "add"),
+            vocab_size=vocab_size, num_modalities=config.num_modalities, d_model=config.hidden_size
         )
         self.backbones = nn.ModuleList(
             [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
