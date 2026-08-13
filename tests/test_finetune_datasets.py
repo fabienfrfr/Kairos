@@ -10,9 +10,7 @@ def tokenizer():
     return KairosTokenizer()
 
 
-# =========================
-# SFT
-# =========================
+# ========================= SFT =========================
 
 
 @pytest.fixture
@@ -111,9 +109,7 @@ def test_sft_alpaca_dispatch_uses_load_dataset(tokenizer, monkeypatch):
     assert len(ds) == 1
 
 
-# =========================
-# DPO
-# =========================
+# ========================= DPO =========================
 
 
 @pytest.fixture
@@ -152,9 +148,7 @@ def test_dpo_response_is_masked_as_generation(tokenizer, dpo_examples):
     assert item["rejected_mask"][plen:].sum() > 0
 
 
-# =========================
-# RL
-# =========================
+# ========================= RL =========================
 
 
 @pytest.fixture

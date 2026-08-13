@@ -222,14 +222,7 @@ def test_kairos_model_init(config):
 
 
 def test_post_init_is_called_and_initializes_all_parameters():
-    # regression test for the actual NaN
-    # self.post_init(), so DeepseekV3Experts' raw nn.Parameter(torch.empty(...)) weights
-    # (gate_up_proj/down_proj) were left as uninitialized memory
-    # construction alone, before any forward pass.
-    # finite immediately after construction, with no
-    # Uses num_modalities=8 (the real default) deliberately:
-    # `config` fixture) triggers an unrelated pre-existing
-    # construction with use_moe=True, which is a
+    # regression test for the actual NaN self.post_init(), so DeepseekV3Experts' raw nn.Parameter(torch.empty(...)) weights (gate_up_proj/down_proj) were left as uninitialized memory construction alone, before any forward pass. finite immediately after construction, with no Uses num_modalities=8 (the real default) deliberately: `config` fixture) triggers an unrelated pre-existing construction with use_moe=True, which is a
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -240,9 +233,7 @@ def test_post_init_is_called_and_initializes_all_parameters():
 
 
 def test_moe_expert_weights_are_not_uninitialized_memory():
-    # more targeted than the finite-check above:
-    # exactly 0.0 (freshly-allocated/zeroed pages), which would
-    # still being wrong (an all-zero expert
+    # more targeted than the finite-check above: exactly 0.0 (freshly-allocated/zeroed pages), which would still being wrong (an all-zero expert
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )

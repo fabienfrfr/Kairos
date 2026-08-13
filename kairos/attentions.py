@@ -176,6 +176,7 @@ class KairosAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
         self.out = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         if ATTN_IMPL == "flex":
+            assert self.head_dim & (self.head_dim - 1) == 0, "head_dim must be a power of 2 for flex_attention"
             self.block_mask = build_flex_mask(config.max_position_embeddings, self.window)
         self.rope = KairosRotaryEmbedding(config, self.head_dim)
 

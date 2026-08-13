@@ -207,7 +207,7 @@ def _():
     # ---- model settings ----
     # modality_scales routes each modality to a
     # the v3 Block-AttnRes window (1 =
-    CFG_D_MODEL = 88
+    CFG_D_MODEL = 64  # head_dim = 64/4 = 16, power of 2 for flex_attention
     CFG_N_HEADS = 4
     CFG_N_LAYERS = 4
     CFG_STRIDE = 3
@@ -216,7 +216,7 @@ def _():
     CFG_EXPERTS = 7  # 0 = dense FFN
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
-    CFG_INTERMEDIATE = 352
+    CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
     CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     return (
         CFG_ATTNRES_BLOCK,

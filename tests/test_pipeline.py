@@ -76,10 +76,7 @@ def built_pipeline(tmp_path, model_config, text_examples, multimodal_examples):
 
 
 def test_training_converges_with_moe_enabled(tmp_path):
-    # use_moe=True was never covered by any
-    # NaN or blocks convergence, this must
-    # num_local_experts/num_experts_per_tok kept small: MoE checkpoints are
-    # copies) and this test writes a
+    # use_moe=True was never covered by any NaN or blocks convergence, this must num_local_experts/num_experts_per_tok kept small: MoE checkpoints are copies) and this test writes a
     model_config = KairosConfig(
         d_model=64, n_heads=4, n_layers=3, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -99,8 +96,7 @@ def test_training_converges_with_moe_enabled(tmp_path):
 
 
 def test_training_converges_with_attnres_block_size_four(tmp_path):
-    # attnres_block_size defaults to 1 everywhere else
-    # aggregator to sum 4 layer outputs
+    # attnres_block_size defaults to 1 everywhere else aggregator to sum 4 layer outputs
     model_config = KairosConfig(d_model=64, n_heads=4, n_layers=3, attnres_block_size=4)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
     data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
@@ -115,10 +111,7 @@ def test_training_converges_with_attnres_block_size_four(tmp_path):
 
 
 def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
-    # the exact combination the user reported
-    # at real depth (12 layers). Width
-    # if this passes but the real
-    # test's job is to at least
+    # the exact combination the user reported at real depth (12 layers). Width if this passes but the real test's job is to at least
     model_config = KairosConfig(
         d_model=64,
         n_heads=4,
@@ -144,8 +137,7 @@ def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
 
 
 def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
-    # full-width (d_model=768, matching the real KairosConfig
-    # so it stays fast in CI;
+    # full-width (d_model=768, matching the real KairosConfig so it stays fast in CI;
     model_config = KairosConfig(d_model=768, n_heads=12, n_layers=2)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
     data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
@@ -253,8 +245,7 @@ def test_memory_gate_blends_state_t_with_external_bank(tmp_path):
 
 
 def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
-    # a small, highly repetitive corpus should
-    # doesn't trend down (or any batch
+    # a small, highly repetitive corpus should doesn't trend down (or any batch
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 8
     data_config = DataConfig(text_examples=texts, max_len=32, batch_size=4)
     train_config = TrainConfig(
@@ -644,8 +635,7 @@ def test_nan_log_captures_diagnostics(built_pipeline, monkeypatch):
 
 
 def test_nan_log_includes_trainer_diagnostics_for_real_forward_pass(built_pipeline, monkeypatch):
-    # don't mock compute_loss: corrupt the model's
-    # non-finite check fires naturally and populates
+    # don't mock compute_loss: corrupt the model's non-finite check fires naturally and populates
     real_forward = built_pipeline.model.forward
 
     def _nan_forward(*args, **kw):
@@ -784,8 +774,7 @@ def test_inspect_batch_flags_a_degenerate_repeated_run(built_pipeline):
 
 
 def test_inspect_batch_ignores_padding_tail_in_repeat_run(built_pipeline):
-    # a short example padded out to
-    # that must NOT be reported as
+    # a short example padded out to that must NOT be reported as
     real_batch = next(iter(built_pipeline.loader))
     seq_len = real_batch["input_ids"].size(1)
     real_len = 8
@@ -833,8 +822,7 @@ def test_last_ckpt_not_written_every_step(built_pipeline, monkeypatch):
     built_pipeline.train_config.last_ckpt_every = 1000  # higher than total steps in
     built_pipeline.train(resume=False)
 
-    # last.pt should only be written at
-    # not on every single training step
+    # last.pt should only be written at not on every single training step
     last_pt_saves = save_calls.count("last.pt")
     assert last_pt_saves <= built_pipeline.train_config.epochs
 

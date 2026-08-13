@@ -83,8 +83,7 @@ class KairosConfig(PretrainedConfig):
 
         self.intermediate_size = intermediate_size
 
-        # num_local_experts is the only one transformers'
-        # n_routed_experts is a property alias below
+        # num_local_experts is the only one transformers' n_routed_experts is a property alias below
         self.num_local_experts = kwargs.get("num_local_experts", kwargs.get("n_routed_experts", 8))
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 2)
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", intermediate_size)

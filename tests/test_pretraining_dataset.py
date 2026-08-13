@@ -55,9 +55,7 @@ def all_kinds_examples(rng):
     ]
 
 
-# =========================
-# text-only path unchanged
-# =========================
+# ========================= text-only path unchanged =========================
 def test_text_only_schema(tokenizer):
     ds = KairosPretrainingDataset(texts=["hello world"], tokenizer=tokenizer, max_len=64, stride=1)
     item = ds[0]
@@ -71,9 +69,7 @@ def test_text_only_mask_matches_padding(tokenizer):
     assert torch.equal(item["mask"] == 0, item["input_ids"] == tokenizer.pad_token_id)
 
 
-# =========================
-# multimodal path: all 6 kinds
-# =========================
+# ========================= multimodal path: all 6 kinds =========================
 def test_all_kinds_build_without_error(tokenizer, all_kinds_examples):
     ds = KairosPretrainingDataset(multimodal_examples=all_kinds_examples, tokenizer=tokenizer, max_len=4096, stride=1)
     assert len(ds) >= len(all_kinds_examples)

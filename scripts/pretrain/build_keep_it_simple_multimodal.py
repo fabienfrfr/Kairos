@@ -11,8 +11,7 @@ from tqdm import tqdm
 
 from kairos.dataset import pack_multimodal_data
 
-# a stalled read otherwise hangs forever;
-# surfaces as a normal exception instead
+# a stalled read otherwise hangs forever; surfaces as a normal exception instead
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 CACHE_DIR = "data/cache"
@@ -128,8 +127,7 @@ def _decode_video_bytes(raw_bytes: bytes) -> tuple[list, dict] | None:
     for frame in container.decode(stream):
         t = float(frame.time or 0.0)
         arr = frame.to_ndarray(format="rgb24")
-        # proper resize (not a strided crop)
-        # top-left corner after a coarse stride
+        # proper resize (not a strided crop) top-left corner after a coarse stride
         resized = np.array(Image.fromarray(arr).resize((VIDEO_SIZE, VIDEO_SIZE), Image.BILINEAR))
         buffer.append((t, resized))
         if t >= window:

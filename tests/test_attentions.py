@@ -515,6 +515,5 @@ def test_attention_without_layer_idx_warns_but_still_works(capsys):
 
 
 def test_current_backend_is_eager_on_cpu():
-    # documents/locks the CPU fallback this test
-    # the flex_attention path requires CUDA and
+    # documents/locks the CPU fallback this test the flex_attention path requires CUDA and
     assert ATTN_IMPL == "eager"
