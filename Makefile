@@ -26,7 +26,7 @@ notebook: ## Working test
 	uv run marimo edit notebook/kairos_pretraining.py
 
 jupyter: ## If you want to use Kaggle T4x2
-	uv run marimo export ipynb notebook/kairos_pretraining.py -o notebook.ipynb
+	uv run marimo export ipynb notebook/kairos_pretraining.py -o notebook/notebook.ipynb
 
 mapper: ## Export full project structure to JSON
 	uv run python3 mapper.py --to-json
