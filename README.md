@@ -3,6 +3,9 @@
 </h1>
 
 <p align="center">
+<a href="https://pypi.org/project/kairos-fm/">
+<img alt="PyPI" src="https://img.shields.io/pypi/v/kairos-fm?color=orange&logo=pypi">
+</a>
 <a href="https://github.com/fabienfrfr/kairos">
 <img alt="GitHub" src="https://img.shields.io/badge/github-fabienfrfr%2Fkairos-black?logo=github">
 </a>
@@ -12,7 +15,7 @@
 </p>
 
 <h3 align="center">
-<p>KairosFM — less parameters, more signal.</p>
+<p>Kairos Foundation Model — less parameters, more signal.</p>
 </h3>
 
 > **Status**: pre-1.0, architecture not yet validated by a full training run. Expect breaking changes until v1.0.0 (reserved for the first checkpoint that has actually proven itself).
