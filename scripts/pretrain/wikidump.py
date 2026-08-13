@@ -14,7 +14,7 @@ from tqdm import tqdm
 # CONFIG
 # -------------------------
 DEBUG = True
-MAX_ARTICLES = None  # 10    # set to None to process all
+MAX_ARTICLES = None  # 10  # set to None to process
 
 NOISE_FR = re.compile(
     r"^(une maintenance|cet article est|si tu cherches|cette page d.homonymie"
@@ -64,7 +64,7 @@ def parse_simplewiki(xml_bz2: str) -> list[dict]:
                     if record:
                         data.append(record)
                         if DEBUG and len(data) <= 3:
-                            print(f"  [en #{len(data)}] prompt={record['prompt'][:100]!r}")
+                            print(f"  [en  # {len(data)}] prompt={record['prompt'][:100]!r}")
                             print(f"              text={record['text'][:120]!r}")
                         if MAX_ARTICLES and len(data) >= MAX_ARTICLES:
                             break
@@ -89,7 +89,7 @@ def _wikitext_to_record(title: str, raw: str) -> dict | None:
     except Exception:  # noqa: BLE001 - malformed wikitext must not abort the whole corpus build
         return None
 
-    # Remove any remaining HTML tags and refs
+    # Remove any remaining HTML tags and
     text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)
 
@@ -153,7 +153,7 @@ def parse_vikidia(zim_path: str) -> list[dict]:
             if record:
                 data.append(record)
                 if DEBUG and len(data) <= 3:
-                    print(f"  [fr #{len(data)}] prompt={record['prompt'][:100]!r}")
+                    print(f"  [fr  # {len(data)}] prompt={record['prompt'][:100]!r}")
                     print(f"             text={record['text'][:120]!r}")
                 if MAX_ARTICLES and len(data) >= MAX_ARTICLES:
                     break

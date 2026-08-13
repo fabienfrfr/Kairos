@@ -4,7 +4,7 @@ from transformers import Trainer
 
 
 class KairosDiffusionTrainer(Trainer):
-    """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and predict the originals back."""
+    """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and."""
 
     last_loss_diagnostics: dict | None = None
 
@@ -26,7 +26,7 @@ class KairosDiffusionTrainer(Trainer):
             noise_mask &= pad_mask.bool()  # never noise/score padding
 
         if not noise_mask.any():
-            # exceedingly rare (short sequence + low sampled p): force one position per row so cross_entropy never sees an empty tensor
+            # exceedingly rare (short sequence + low
             eligible = pad_mask.bool() if pad_mask is not None else torch.ones_like(noise_mask)
             for i in range(x0.size(0)):
                 row_idx = eligible[i].nonzero(as_tuple=True)[0]
@@ -43,7 +43,7 @@ class KairosDiffusionTrainer(Trainer):
         loss = (loss / p[noise_mask]).mean()
 
         if not torch.isfinite(loss):
-            # capture context here (access to logits/inputs) so the caller can print an actionable report instead of a bare "loss=nan"
+            # capture context here (access to logits/inputs)
             self.last_loss_diagnostics = self._build_nan_diagnostics(x0, modality_ids, pad_mask, prompt_len, logits)
 
         return loss

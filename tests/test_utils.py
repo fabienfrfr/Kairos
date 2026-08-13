@@ -58,7 +58,7 @@ def test_format_duration(seconds, expected):
 
 # ------------------------------------------------------------- count_parameters
 def test_count_parameters_all_trainable():
-    model = nn.Linear(4, 2)  # 4*2 + 2 = 10 params
+    model = nn.Linear(4, 2)  # 4*2 + 2 = 10
     total, trainable = count_parameters(model)
     assert total == 10
     assert trainable == 10
@@ -96,7 +96,7 @@ def test_benchmark_step_time_returns_positive_average():
 
 
 def test_benchmark_step_time_returns_none_when_iterator_exhausted():
-    values = iter([1, 2])  # only 2 values: warmup=1 consumes one, then n_steps=5 runs out
+    values = iter([1, 2])  # only 2 values: warmup=1 consumes
 
     def step_fn():
         return next(values)
@@ -106,7 +106,7 @@ def test_benchmark_step_time_returns_none_when_iterator_exhausted():
 
 # ------------------------------------------------------------- training_summary
 class _TinyLoader(list):
-    """A list is already sized and iterable, which is all training_summary needs from `loader`."""
+    """A list is already sized and iterable, which is all training_summary needs."""
 
 
 def test_training_summary_without_benchmark():
@@ -154,7 +154,7 @@ class _MoEModule(nn.Module):
     def __init__(self, n_experts=4, dim=4):
         super().__init__()
         self.mlp = nn.Module()
-        self.mlp.shared = nn.Linear(dim, dim)  # always active, not counted as "expert"
+        self.mlp.shared = nn.Linear(dim, dim)  # always active, not counted as
         self.mlp.experts = nn.ModuleList([nn.Linear(dim, dim) for _ in range(n_experts)])
 
 

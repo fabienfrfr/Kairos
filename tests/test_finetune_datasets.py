@@ -70,7 +70,7 @@ def test_sft_truncates_to_max_len(tokenizer):
 
 
 def test_sft_alpaca_style_example(tokenizer):
-    # _process_alpaca is exercised directly to avoid a network dataset download
+    # _process_alpaca is exercised directly to avoid
     raw = KairosSFTDataset(tokenizer, max_len=64, examples=[{"conversations": []}])
     processed = raw._process_alpaca({"instruction": "Say hi", "input": "", "output": "Hi there"})
     assert processed["prompt_len"] > 0
@@ -79,9 +79,7 @@ def test_sft_alpaca_style_example(tokenizer):
 
 def test_sft_alpaca_style_example_with_input(tokenizer):
     raw = KairosSFTDataset(tokenizer, max_len=64, examples=[{"conversations": []}])
-    processed = raw._process_alpaca(
-        {"instruction": "Translate to French", "input": "Hello", "output": "Bonjour"}
-    )
+    processed = raw._process_alpaca({"instruction": "Translate to French", "input": "Hello", "output": "Bonjour"})
     assert processed["prompt_len"] > 0
     assert sum(processed["gen_mask"]) > 0
 

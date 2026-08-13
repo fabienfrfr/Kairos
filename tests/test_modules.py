@@ -139,14 +139,14 @@ def test_backbone_block_size_default_is_one():
 
 
 def test_backbone_block_size_one_matches_original_graph():
-    # S=1 must reproduce the pre-blocking AttnRes graph term for term.
+    # S=1 must reproduce the pre-blocking AttnRes
     torch.manual_seed(0)
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=4, vocab_size=259, num_modalities=2, attnres_block_size=1)
     torch.manual_seed(42)
     model = KairosDiffusionBackbone(cfg)
     x = torch.randn(2, 6, 16)
 
-    # Reference: the original states=[x]; h=agg(states); x=layer(h); states.append(x) graph.
+    # Reference: the original states=[x]; h=agg(states); x=layer(h);
     states = [x]
     xr = x
     for layer in model.layers:
@@ -191,7 +191,7 @@ def test_backbone_block_size_backward():
 
 
 def test_backbone_block_size_uneven_layers_no_nan():
-    # n_layers not a multiple of attnres_block_size => trailing partial block.
+    # n_layers not a multiple of attnres_block_size
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=5, vocab_size=259, num_modalities=2, attnres_block_size=3)
     model = KairosDiffusionBackbone(cfg)
     x = torch.randn(1, 4, 16)
@@ -222,14 +222,14 @@ def test_kairos_model_init(config):
 
 
 def test_post_init_is_called_and_initializes_all_parameters():
-    # regression test for the actual NaN root cause: KairosDiffusionLLM used to skip
+    # regression test for the actual NaN
     # self.post_init(), so DeepseekV3Experts' raw nn.Parameter(torch.empty(...)) weights
-    # (gate_up_proj/down_proj) were left as uninitialized memory - which can be NaN/Inf on
-    # construction alone, before any forward pass. Every parameter in the model must be
-    # finite immediately after construction, with no training and no data involved.
-    # Uses num_modalities=8 (the real default) deliberately: num_modalities=2 (the shared
-    # `config` fixture) triggers an unrelated pre-existing memory-growth issue during
-    # construction with use_moe=True, which is a separate bug from the one this test targets.
+    # (gate_up_proj/down_proj) were left as uninitialized memory
+    # construction alone, before any forward pass.
+    # finite immediately after construction, with no
+    # Uses num_modalities=8 (the real default) deliberately:
+    # `config` fixture) triggers an unrelated pre-existing
+    # construction with use_moe=True, which is a
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -240,9 +240,9 @@ def test_post_init_is_called_and_initializes_all_parameters():
 
 
 def test_moe_expert_weights_are_not_uninitialized_memory():
-    # more targeted than the finite-check above: torch.empty() garbage happens to often be
-    # exactly 0.0 (freshly-allocated/zeroed pages), which would pass a finite-only check while
-    # still being wrong (an all-zero expert can never learn). Confirm the actual init call ran.
+    # more targeted than the finite-check above:
+    # exactly 0.0 (freshly-allocated/zeroed pages), which would
+    # still being wrong (an all-zero expert
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )

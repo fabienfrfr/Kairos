@@ -24,7 +24,7 @@ from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
 
 
 class KairosConfig(PretrainedConfig):
-    """modality_scales defaults every modality id up to num_modalities to scale 0 so none get silently dropped."""
+    """modality_scales defaults every modality id up to num_modalities to scale 0 so."""
 
     model_type = "kairos"
 
@@ -82,8 +82,8 @@ class KairosConfig(PretrainedConfig):
 
         self.intermediate_size = intermediate_size
 
-        # num_local_experts is the only one transformers' DeepseekV3Experts actually reads;
-        # n_routed_experts is a property alias below so setting either one can't silently diverge
+        # num_local_experts is the only one transformers'
+        # n_routed_experts is a property alias below
         self.num_local_experts = kwargs.get("num_local_experts", kwargs.get("n_routed_experts", 8))
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 2)
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", intermediate_size)
@@ -98,12 +98,12 @@ class KairosConfig(PretrainedConfig):
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
 
-        # v3 Block-AttnRes: windows prior layer outputs into blocks of S so AttnRes sources stay O(N/S); S=1 (default) reproduces the original per-layer graph
+        # v3 Block-AttnRes: windows prior layer outputs
         self.attnres_block_size = kwargs.get("attnres_block_size", 1)
 
     @property
     def n_routed_experts(self):
-        """Alias for num_local_experts (the field transformers' DeepseekV3Experts actually reads) so the two names can never silently diverge."""
+        """Alias for num_local_experts (the field transformers' DeepseekV3Experts actually reads) so the two."""
         return self.num_local_experts
 
     @n_routed_experts.setter
@@ -112,7 +112,7 @@ class KairosConfig(PretrainedConfig):
 
 
 class KairosCache(DynamicCache):
-    """Cache for block-diffusion inference: `.clone()` before each denoising step to avoid state leaking across steps."""
+    """Cache for block-diffusion inference: `.clone()` before each denoising step to avoid state."""
 
     def __init__(self, config):
         super().__init__()
@@ -188,7 +188,7 @@ class KairosMultiCache(DynamicCache):
 
 
 class KairosStateCombiner(nn.Module):
-    """Learned, size-unbounded combination of K DeltaNet ssm_cache states via self-attention over the set (so scores reflect how states relate, not each in isolation), pooled by weighting the raw states themselves - K=1 is an exact identity, so a lone resumed session is never perturbed."""
+    """Learned, size-unbounded combination of K DeltaNet ssm_cache states via self-attention over the."""
 
     def __init__(self, state_dim, num_heads=4):
         super().__init__()
@@ -196,7 +196,7 @@ class KairosStateCombiner(nn.Module):
         self.score = nn.Sequential(nn.Linear(state_dim, state_dim), nn.Tanh(), nn.Linear(state_dim, 1))
 
     def forward(self, states):
-        """states: (K, state_dim), K unbounded (including 1). Returns (state_dim,)."""
+        """states: (K, state_dim), K unbounded (including 1)."""
         if states.size(0) == 1:
             return states[0]
         context, _ = self.context_attn(states.unsqueeze(0), states.unsqueeze(0), states.unsqueeze(0))
@@ -205,7 +205,7 @@ class KairosStateCombiner(nn.Module):
 
 
 def combine_deltanet_caches(model, caches: list) -> "KairosMultiCache":
-    """Combines multiple per-session caches (same batch layout, typically batch_size=1 each) via a learned combiner per (scale, layer), row-by-row; len(caches)==1 leaves that cache unchanged; conv_caches are reset."""
+    """Combines multiple per-session caches (same batch layout, typically batch_size=1 each) via a."""
     if not caches:
         raise ValueError("combine_deltanet_caches needs at least one cache")
     new_cache = KairosMultiCache(model.config)
@@ -228,7 +228,7 @@ def combine_deltanet_caches(model, caches: list) -> "KairosMultiCache":
 
 
 def pool_batch_states(model, cache) -> "KairosMultiCache":
-    """Pools every row of ONE cache (e.g. a training batch's final states) into a single state per (scale, layer), via the same learned combiner; returns a batch_size=1 cache; batch_size==1 leaves it unchanged."""
+    """Pools every row of ONE cache (e.g."""
     new_cache = KairosMultiCache(model.config)
     for scale_idx, backbone in enumerate(model.backbones):
         for layer_idx_str, combiner in backbone.state_combiners.items():
@@ -247,14 +247,14 @@ class KairosFFN(Qwen2MoeMLP):
 
 
 class KairosMoE(DeepseekV3MoE):
-    """DeepseekV3MoE's expert weights are raw torch.empty() tensors, never initialized by default; fixed here on self.experts/self.gate (version-stable) instead of via fragile isinstance checks on internal class names."""
+    """DeepseekV3MoE's expert weights are raw torch.empty() tensors, never initialized by default; fixed."""
 
     def __init__(self, config):
         super().__init__(config)
         std = getattr(config, "initializer_range", 0.02)
         self.experts.gate_up_proj.data.normal_(mean=0.0, std=std)
         self.experts.down_proj.data.normal_(mean=0.0, std=std)
-        self.gate.weight.data.normal_(mean=0.0, std=std)  # was torch.zeros() at construction; fine either way
+        self.gate.weight.data.normal_(mean=0.0, std=std)  # was torch.zeros() at construction; fine
 
 
 class DiffusionBlock(nn.Module):
@@ -298,7 +298,7 @@ class KairosAttnRes(nn.Module):
 
 
 class KairosDiffusionBackbone(nn.Module):
-    """v3 Block-AttnRes: prior layer outputs are windowed into blocks of `attnres_block_size` before aggregation, cost O(N/S)."""
+    """v3 Block-AttnRes: prior layer outputs are windowed into blocks of `attnres_block_size` before."""
 
     def __init__(self, config, use_moe=False):
         super().__init__()
@@ -306,7 +306,7 @@ class KairosDiffusionBackbone(nn.Module):
         self.norm = KairosNorm(config.hidden_size)
         self.aggregator = KairosAttnRes(config.hidden_size)
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
-        head_dim = config.hidden_size // config.num_attention_heads  # ssm_cache shape: (B, n_heads, head_dim, 2*head_dim)
+        head_dim = config.hidden_size // config.num_attention_heads  # ssm_cache shape: (B, n_heads, head_dim,
         n_heads = config.num_attention_heads
         self.state_combiners = nn.ModuleDict(
             {
@@ -320,8 +320,8 @@ class KairosDiffusionBackbone(nn.Module):
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         emb = x
-        completed = []  # finalized block-sums of prior layer outputs
-        partial = None  # running sum of the current (unfinished) block
+        completed = []  # finalized block-sums of prior layer
+        partial = None  # running sum of the current
         in_block = 0
         S = self.attnres_block_size
 
@@ -379,7 +379,7 @@ class OutputHead(nn.Module):
 
 
 class KairosScaleRouter(nn.Module):
-    """Gathers active positions per scale into a padded batch, runs the backbone once per scale, and scatters back."""
+    """Gathers active positions per scale into a padded batch, runs the backbone."""
 
     def __init__(self, modality_scales):
         super().__init__()
@@ -504,10 +504,10 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         self.rotary = KairosRotaryEmbedding(config, config.head_dim)
         self.norm = KairosNorm(config.hidden_size)
         self.lm_head = OutputHead(self.embedding)
-        self.post_init()  # triggers _init_weights on every submodule/parameter below
+        self.post_init()  # triggers _init_weights on every submodule/parameter
 
     def _init_weights(self, module):
-        """Every PreTrainedModel subclass must define this (the base class default is a no-op). MoE expert/router weights are handled separately in KairosMoE.__init__ itself, not here - see that class for why."""
+        """Every PreTrainedModel subclass must define this (the base class default is a."""
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)

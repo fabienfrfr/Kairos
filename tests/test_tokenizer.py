@@ -43,7 +43,7 @@ def sample_lidar():
 # Vocab / backward compatibility
 # =========================
 def test_vocab_size_is_291(tokenizer):
-    """Regression: KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens to the 259-token byte vocab."""
+    """Regression: KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens to the."""
     assert len(tokenizer) == 291
 
 
@@ -93,7 +93,7 @@ def test_image_roundtrip(tokenizer, sample_image):
 
 
 def test_image_endline_every_row(tokenizer, sample_image):
-    """The whole point of the design: <ENDLINE> recurs locally, every W*C tokens, not once at the end."""
+    """The whole point of the design: <ENDLINE> recurs locally, every W*C tokens,."""
     markers = KairosTokenizer.encode_image(sample_image)
     ids = tokenizer._resolve_markers(markers)
     endline_positions = [i for i, tid in enumerate(ids) if tid == tokenizer._endline_id]
@@ -102,7 +102,7 @@ def test_image_endline_every_row(tokenizer, sample_image):
     gaps = [endline_positions[0] + 1] + [
         endline_positions[i] - endline_positions[i - 1] for i in range(1, len(endline_positions))
     ]
-    assert all(g == w * c + 1 for g in gaps)  # w*c bytes + the marker itself
+    assert all(g == w * c + 1 for g in gaps)  # w*c bytes + the marker
 
 
 def test_image_rejects_bad_dtype():
@@ -111,7 +111,7 @@ def test_image_rejects_bad_dtype():
 
 
 def test_image_decode_detects_truncated_row(tokenizer, sample_image):
-    """Simulates a drifted generation with a short last row; must raise a clear error, not silently misreshape."""
+    """Simulates a drifted generation with a short last row; must raise a."""
     markers = KairosTokenizer.encode_image(sample_image)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
     truncated = torch.tensor(out["input_ids"].tolist()[:-5])  # cut mid last row
@@ -121,7 +121,7 @@ def test_image_decode_detects_truncated_row(tokenizer, sample_image):
 
 
 # =========================
-# VIDEO: rows + <ENDFRAME>, fps supplied at decode time
+# VIDEO: rows + <ENDFRAME>, fps supplied
 # =========================
 def test_video_roundtrip_with_stride(tokenizer, sample_video):
     markers = KairosTokenizer.encode_video(sample_video, stride=2)
@@ -140,7 +140,7 @@ def test_video_endframe_count_matches_num_frames(tokenizer, sample_video):
 
 
 def test_video_rejects_inconsistent_frame_shapes(tokenizer):
-    """Frames of different H can be *encoded* independently, but decode_video must reject the mismatch."""
+    """Frames of different H can be *encoded* independently, but decode_video must reject."""
     frame1 = np.zeros((2, 3, 3), dtype=np.uint8)
     frame2 = np.zeros((4, 3, 3), dtype=np.uint8)
     markers = (
@@ -156,7 +156,7 @@ def test_video_rejects_inconsistent_frame_shapes(tokenizer):
 
 
 # =========================
-# AUDIO: periodic <TICK>, duration from tick count, not stored metadata
+# AUDIO: periodic <TICK>, duration from tick
 # =========================
 def test_audio_roundtrip_and_duration(tokenizer, sample_audio):
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
@@ -176,7 +176,7 @@ def test_audio_tick_count(tokenizer, sample_audio):
 
 
 # =========================
-# LIDAR: periodic <PTSEP>, fixed quantization bounds (no stored min/max)
+# LIDAR: periodic <PTSEP>, fixed quantization bounds
 # =========================
 def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     markers = KairosTokenizer.encode_lidar(sample_lidar)
@@ -184,7 +184,7 @@ def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     decoded = tokenizer.decode_multimodal(out["input_ids"])
     recon = tokenizer.decode_lidar(decoded[0].data)
     assert recon.shape == sample_lidar.shape
-    # quantization step over the FIXED xyz range, not the data's actual range
+    # quantization step over the FIXED xyz
     xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
     max_step = (xyz_hi - xyz_lo) / 255
     assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
@@ -284,7 +284,7 @@ def test_audio_decode_keeps_trailing_samples_without_final_tick_marker(tokenizer
 
 
 def test_decode_lidar_rejects_payload_not_multiple_of_four(tokenizer):
-    ids = tokenizer._bytes_to_ids(b"\x00\x01\x02")  # 3 bytes, not a multiple of 4
+    ids = tokenizer._bytes_to_ids(b"\x00\x01\x02")  # 3 bytes, not a multiple
     with pytest.raises(ValueError, match="not a multiple of 4"):
         tokenizer.decode_lidar(ids)
 

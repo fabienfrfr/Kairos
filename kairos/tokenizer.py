@@ -34,7 +34,7 @@ _MODALITY_TAGS: dict[Modality, tuple[str, str]] = {
     Modality.META: ("<META>", "</META>"),
 }
 
-# sub-channel tags, e.g. RGB planes or stereo audio
+# sub-channel tags, e.g. RGB planes or
 _CHANNEL_TAGS: dict[str, tuple[str, str]] = {
     "R": ("<R>", "</R>"),
     "G": ("<G>", "</G>"),
@@ -55,7 +55,7 @@ ALL_SPECIAL_TOKENS = (
 
 @dataclass
 class MultimodalSegment:
-    """One typed chunk of a sequence: UTF-8 bytes for TEXT, or an encode_*'s marker-list otherwise."""
+    """One typed chunk of a sequence: UTF-8 bytes for TEXT, or an."""
 
     modality: Modality
     data: object
@@ -63,13 +63,13 @@ class MultimodalSegment:
 
 
 class KairosTokenizer(ByT5Tokenizer):
-    """Byte-level multimodal tokenizer, ByT5-compatible for text; `encode_multimodal` is the entry point for mixed sequences."""
+    """Byte-level multimodal tokenizer, ByT5-compatible for text; `encode_multimodal` is the entry point for."""
 
-    # pipeline-level constants — not stored per-instance in the stream
+    # pipeline-level constants — not stored per-instance
     IMAGE_CHANNELS = 3
     VIDEO_CHANNELS = 3
     AUDIO_SAMPLE_RATE = 16_000
-    AUDIO_TICK_SAMPLES = 16_000  # one <TICK> per second of audio
+    AUDIO_TICK_SAMPLES = 16_000  # one <TICK> per second of
     LIDAR_POINTS_PER_GROUP = 32  # one <PTSEP> every N points
     LIDAR_XYZ_RANGE = (-100.0, 100.0)
     LIDAR_INTENSITY_RANGE = (0.0, 1.0)
@@ -79,7 +79,7 @@ class KairosTokenizer(ByT5Tokenizer):
         super().__init__(*args, **kwargs)
         self.add_special_tokens({"additional_special_tokens": ALL_SPECIAL_TOKENS})
 
-        # byte -> id offset, calibrated empirically (id = byte + offset)
+        # byte -> id offset, calibrated empirically
         self._byte_offset = self.convert_tokens_to_ids(chr(0))
         assert self.convert_tokens_to_ids(chr(255)) == self._byte_offset + 255, (
             "byte->id mapping is not contiguous — review _byte_offset calibration"
@@ -156,7 +156,7 @@ class KairosTokenizer(ByT5Tokenizer):
         return out
 
     def decode_video(self, ids: list[int], channels: int | None = None, fps: float = 1.0):
-        """Returns (frames, duration_seconds); fps is supplied at decode time, not stored in the stream."""
+        """Returns (frames, duration_seconds); fps is supplied at decode time, not stored in."""
         channels = channels or self.VIDEO_CHANNELS
         frame_lists, current = [], []
         for i in ids:
@@ -177,7 +177,7 @@ class KairosTokenizer(ByT5Tokenizer):
         duration = stacked.shape[0] / fps if fps > 0 else float("nan")
         return stacked, duration
 
-    # ---------------- AUDIO: flat PCM + periodic <TICK> ----------------
+    # ---------------- AUDIO: flat PCM + periodic
     @classmethod
     def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None) -> list:
         if waveform.dtype != np.float32:
@@ -205,7 +205,7 @@ class KairosTokenizer(ByT5Tokenizer):
         waveform = (pcm.astype(np.float32) - 127.5) / 127.5
         return waveform, len(waveform) / self.AUDIO_SAMPLE_RATE
 
-    # ---------------- LIDAR: point groups + fixed quant bounds ----------------
+    # ---------------- LIDAR: point groups + fixed
     @classmethod
     def encode_lidar(cls, points: np.ndarray, points_per_group: int | None = None) -> list:
         if points.dtype != np.float32 or points.ndim != 2 or points.shape[-1] != 4:
@@ -281,7 +281,7 @@ class KairosTokenizer(ByT5Tokenizer):
         }
 
     def decode_multimodal(self, input_ids: torch.Tensor) -> list[MultimodalSegment]:
-        """Splits on modality delimiters; non-text `.data` is the raw id list, feed it to the matching decode_* method."""
+        """Splits on modality delimiters; non-text `.data` is the raw id list, feed."""
         ids = input_ids.tolist()
         tokens = self.convert_ids_to_tokens(ids)
         open_to_modality = {tags[0]: m for m, tags in _MODALITY_TAGS.items()}
@@ -309,4 +309,4 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# len(KairosTokenizer()) == 291 (259 base bytes/pad/eos/unk + 32 special tokens: 8 modality pairs, 5 channel pairs, 4 structural markers, <SEP>, <MASK>)
+# len(KairosTokenizer()) == 291 (259 base bytes/pad/eos/unk

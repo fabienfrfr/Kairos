@@ -1,4 +1,4 @@
-"""Thin, declarative wrapper: tokenizer -> dataset -> model -> optimizer/scheduler -> train loop -> per-modality check."""
+"""Thin, declarative wrapper: tokenizer -> dataset -> model -> optimizer/scheduler -> train."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class DataConfig:
     batch_size: int = 8
     shuffle: bool = True
     drop_last: bool = True
-    pack: bool = False  # concatenate samples before chunking so only the last chunk is padded
+    pack: bool = False  # concatenate samples before chunking so
 
 
 @dataclass
@@ -40,20 +40,20 @@ class TrainConfig:
     lr: float = 3e-4
     epochs: int = 3
     save_every: int = 200
-    last_ckpt_every: int = 20  # how often last.pt (resume point) is overwritten; was every step, too slow
+    last_ckpt_every: int = 20  # how often last.pt (resume point)
     grad_clip: float = 1.0
-    max_consecutive_nan: int = 50  # abort with a diagnosis instead of silently looping through a dead run
+    max_consecutive_nan: int = 50  # abort with a diagnosis instead
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
     report_to: list = field(default_factory=list)
-    hub_repo_id: str | None = None  # set to also push each periodic checkpoint to this HF repo
-    hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as they're saved
+    hub_repo_id: str | None = None  # set to also push each
+    hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as
     hub_private: bool = False
-    hub_subfolder: str | None = None  # push checkpoints/model under repo_id/<subfolder> instead of repo root
+    hub_subfolder: str | None = None  # push checkpoints/model under repo_id/<subfolder> instead
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
-    """Maps each distinct id to the length of its longest run of consecutive occurrences. A single id repeating for hundreds of positions in a row is a classic sign of a corrupted or degenerate example (e.g. a modality encoder producing a constant/clipped output)."""
+    """Maps each distinct id to the length of its longest run of."""
     if ids.numel() == 0:
         return {}
     values = ids.tolist()
@@ -122,7 +122,7 @@ class KairosMultimodalPipeline:
         raise ValueError("DataConfig needs multimodal_examples, text_examples, and/or multimodal_path")
 
     def build(self) -> KairosMultimodalPipeline:
-        """Wires up dataset, model, optimizer, scheduler, and (if resuming later) the checkpoint dirs."""
+        """Wires up dataset, model, optimizer, scheduler, and (if resuming later) the checkpoint."""
         dc, tc = self.data_config, self.train_config
 
         self.dataset = self._build_dataset()
@@ -192,7 +192,7 @@ class KairosMultimodalPipeline:
             raise RuntimeError("call .build() before .train()/.check_per_modality_loss()")
 
     def train(self, progress_callback=None, resume: bool = True) -> list[dict]:
-        """Runs the training loop; resumes from local last.pt or, failing that, the hub repo, if resume=True."""
+        """Runs the training loop; resumes from local last.pt or, failing that, the."""
         self._require_built()
         tc = self.train_config
         self.model.train()
@@ -223,7 +223,7 @@ class KairosMultimodalPipeline:
                         cur_bsz = batch["input_ids"].size(0)
                         cache_params = KairosMultiCache(self.model_config)
                         if prev_cache is not None:
-                            # pool every row of batch t-1 (same layer) into one state, broadcast to batch t
+                            # pool every row of batch t-1
                             pooled = pool_batch_states(self.model, prev_cache)
                             for scale_idx, scale_cache in enumerate(cache_params.caches):
                                 for layer_idx_str in self.model.backbones[scale_idx].state_combiners:
@@ -232,20 +232,20 @@ class KairosMultimodalPipeline:
                                     if one_row is not None:
                                         expanded = one_row.expand(cur_bsz, *one_row.shape[1:]).contiguous()
                                         scale_cache.ssm_caches[layer_idx] = expanded
-                        # else: nothing to combine yet (first step) - cache stays empty, no perturbation
+                        # else: nothing to combine yet (first
 
                     self.optimizer.zero_grad()
                     loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
                     loss_val = loss.item()
                     if use_state_combiner:
-                        # cache_params now holds this step's own final states, written by the forward pass
+                        # cache_params now holds this step's own
                         for scale_cache in cache_params.caches:
                             for layer_idx, s in enumerate(scale_cache.ssm_caches):
                                 if s is not None:
                                     scale_cache.ssm_caches[layer_idx] = s.detach()
                         prev_cache = cache_params
                     if not math.isfinite(loss_val):
-                        # a corrupted batch can spike the loss to inf/nan; skip it rather than step on garbage
+                        # a corrupted batch can spike the
                         skipped_nonfinite += 1
                         consecutive_nan += 1
                         self._last_nonfinite_batch = batch
@@ -285,7 +285,7 @@ class KairosMultimodalPipeline:
                         progress_callback(self.global_step, total_steps, loss_val)
 
                     if self.global_step % tc.last_ckpt_every == 0:
-                        self._save(last_ckpt, loss_val, epoch)  # overwritten periodically: resumable, not every step
+                        self._save(last_ckpt, loss_val, epoch)  # overwritten periodically: resumable, not every
                     if self.global_step % tc.save_every == 0:
                         step_ckpt = self.ckpt_dir / f"step_{self.global_step:06d}.pt"
                         self._save(step_ckpt, loss_val, epoch)
@@ -303,7 +303,7 @@ class KairosMultimodalPipeline:
                     if tc.hub_repo_id and tc.hub_push_every_ckpt:
                         self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
 
-            last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume from anymore
+            last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume
         finally:
             self.skipped_nonfinite_steps = skipped_nonfinite
             self.writer.flush()
@@ -312,7 +312,7 @@ class KairosMultimodalPipeline:
         return self.log_rows
 
     def locate_nan_source(self) -> dict | None:
-        """Re-runs the last non-finite batch with hooks to find which module first outputs NaN/Inf."""
+        """Re-runs the last non-finite batch with hooks to find which module first."""
         if self._last_nonfinite_batch is None:
             return None
         return locate_first_nonfinite_module(
@@ -320,7 +320,7 @@ class KairosMultimodalPipeline:
         )
 
     def inspect_batch(self, n: int = 1, from_loader: bool = True) -> list[dict]:
-        """Pulls `n` real post-tokenization batches and reports per row: text, modalities, id bounds."""
+        """Pulls `n` real post-tokenization batches and reports per row: text, modalities, id."""
         self._require_built()
         vocab_size = len(self.tokenizer)
         num_modalities = self.model_config.num_modalities
@@ -358,7 +358,7 @@ class KairosMultimodalPipeline:
                     values, counts = row_modality.unique(return_counts=True)
                     modality_counts = dict(zip(values.tolist(), counts.tolist()))
 
-                # a long run of the same token id is a stronger corruption signal than any single-value stat; excludes the padding tail, where a long run of pad_token_id is normal
+                # a long run of the same
                 real_len = int(pad_mask[row].sum()) if pad_mask is not None else row_ids.size(0)
                 run_lengths = _consecutive_run_lengths(row_ids[:real_len])
                 max_run_id, max_run_len = max(run_lengths.items(), key=lambda kv: kv[1]) if run_lengths else (None, 0)
@@ -375,13 +375,13 @@ class KairosMultimodalPipeline:
                         "modality_counts": modality_counts,
                         "token_id_range": (int(row_ids.min()), int(row_ids.max())),
                         "out_of_bounds": {
-                            "token_ids": oob_token.tolist(),  # positions with id outside [0, vocab_size)
-                            "modality_ids": oob_modality.tolist(),  # positions with id outside [0, num_modalities)
+                            "token_ids": oob_token.tolist(),  # positions with id outside [0,
+                            "modality_ids": oob_modality.tolist(),  # positions with id outside [0,
                         },
                         "text_preview": text_preview,
-                        "input_ids": row_ids.tolist(),  # raw ids, exactly what the embedding layer indexes with
+                        "input_ids": row_ids.tolist(),  # raw ids, exactly what the
                         "modality_ids": row_modality.tolist() if row_modality is not None else None,
-                        "top_token_ids": top_ids,  # [(id, count), ...] most frequent ids in this row
+                        "top_token_ids": top_ids,  # [(id, count), ...] most frequent
                         "max_repeat_run": {"id": max_run_id, "length": max_run_len},
                     }
                 )
@@ -389,12 +389,16 @@ class KairosMultimodalPipeline:
         return reports
 
     def run_config_dict(self) -> dict:
-        """model/train/data config as a plain JSON-safe dict — the actual hyperparameters behind a run, since model_config alone (saved in checkpoints) doesn't capture lr/epochs/pack/etc."""
+        """model/train/data config as a plain JSON-safe dict — the actual hyperparameters behind."""
         dc = asdict(self.data_config)
         for key in ("text_examples", "multimodal_examples"):
             if dc.get(key) is not None:
                 dc[key] = f"<{len(dc[key])} examples, omitted>"
-        return {"model_config": self.model_config.to_dict(), "train_config": asdict(self.train_config), "data_config": dc}
+        return {
+            "model_config": self.model_config.to_dict(),
+            "train_config": asdict(self.train_config),
+            "data_config": dc,
+        }
 
     def _save(self, path: Path, loss_val: float, epoch: int = 1):
         torch.save(
@@ -424,7 +428,7 @@ class KairosMultimodalPipeline:
         return ckpt
 
     def _safe_resume(self, path: Path) -> int:
-        # an incompatible checkpoint (different model_config) starts fresh instead of crashing
+        # an incompatible checkpoint (different model_config) starts
         try:
             ckpt = self.load_checkpoint(str(path))
             return ckpt.get("epoch", 1)
@@ -444,21 +448,23 @@ class KairosMultimodalPipeline:
         )
 
     def load_checkpoint_from_hub(self, repo_id: str, filename: str = "checkpoints/last.pt"):
-        """Downloads a checkpoint from a HF hub repo and loads it, same as load_checkpoint."""
+        """Downloads a checkpoint from a HF hub repo and loads it, same."""
         from huggingface_hub import hf_hub_download
 
         path = hf_hub_download(repo_id, filename)
         return self.load_checkpoint(path)
 
     def _try_resume_from_hub(self, repo_id: str):
-        # best-effort: no checkpoint on the repo yet (fresh run) is not an error
+        # best-effort: no checkpoint on the repo
         try:
             return self.load_checkpoint_from_hub(repo_id)
         except Exception:  # noqa: BLE001 — no checkpoint on the hub yet is not an error, just start fresh
             return None
 
-    def push_to_hub(self, repo_id: str, private: bool = False, license: str = "apache-2.0", subfolder: str | None = None):
-        """Pushes model, config, checkpoints, tensorboard logs, training config, and a model card to a HF hub repo — under repo_id/<subfolder> if given, so multiple runs/configs can share one repo."""
+    def push_to_hub(
+        self, repo_id: str, private: bool = False, license: str = "apache-2.0", subfolder: str | None = None
+    ):
+        """Pushes model, config, checkpoints, tensorboard logs, training config, and a model card."""
         from huggingface_hub import HfApi
 
         self._require_built()
@@ -470,10 +476,10 @@ class KairosMultimodalPipeline:
         self.model_config.register_for_auto_class()
         self.model.register_for_auto_class("AutoModelForCausalLM")
 
-        # save_pretrained + upload_folder honors the subfolder prefix consistently across versions
+        # save_pretrained + upload_folder honors the subfolder
         export_dir = Path(self.train_config.run_dir) / "hf_export"
         export_dir.mkdir(parents=True, exist_ok=True)
-        # tied SWA/DeltaNet weights break save_pretrained's tied-weight check; save state_dict directly instead
+        # tied SWA/DeltaNet weights break save_pretrained's tied-weight
         self.model_config.save_pretrained(str(export_dir))
         torch.save(self.model.state_dict(), export_dir / "pytorch_model.bin")
         api.upload_folder(repo_id=repo_id, folder_path=str(export_dir), path_in_repo=subfolder or ".")
@@ -515,7 +521,7 @@ class KairosMultimodalPipeline:
 
     # ------------------------------------------------------------- checks
     def check_per_modality_loss(self, n_batches: int = 1) -> dict[str, float]:
-        """Diffusion loss averaged per modality over n_batches, so a router-ignored modality can't hide in the global mean."""
+        """Diffusion loss averaged per modality over n_batches, so a router-ignored modality can't."""
         self._require_built()
         self.model.eval()
         losses_by_modality: dict[str, list[float]] = defaultdict(list)

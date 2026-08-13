@@ -23,10 +23,10 @@ def config(tokenizer):
         num_modalities=8,
         stride=1,
         num_scales=2,
-        # kept in sync: some transformers versions' DeepseekV3 MoE backend
-        # reads n_routed_experts, others read num_local_experts — set both
-        # to the same value or the router's top-k index space and the
-        # experts weight tensor size can disagree ("Class values must be
+        # kept in sync: some transformers versions'
+        # reads n_routed_experts, others read num_local_experts —
+        # to the same value or the
+        # experts weight tensor size can disagree
         # smaller than num_classes").
         num_local_experts=7,
         n_routed_experts=7,
@@ -56,7 +56,7 @@ def dense_model(dense_config, tokenizer):
 
 
 def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
-    """Regression: the trainer used to default every token to Modality.TEXT, ignoring modality_ids/mask from the batch."""
+    """Regression: the trainer used to default every token to Modality.TEXT, ignoring modality_ids/mask."""
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     examples = [
@@ -87,7 +87,7 @@ def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
 
 
 def test_moe_plumbing_does_not_crash(model, tokenizer):
-    """Looser MoE-path check: tiny random inits can occasionally give non-finite logits, so this only logs that case."""
+    """Looser MoE-path check: tiny random inits can occasionally give non-finite logits, so."""
     torch.manual_seed(0)
     ids = tokenizer.encode("hello world", add_special_tokens=False)
     ids = ids + [tokenizer.pad_token_id] * (32 - len(ids))
@@ -119,8 +119,8 @@ def test_compute_loss_never_noises_padding(model, tokenizer):
     trainer = KairosDiffusionTrainer(model=model)
     trainer.compute_loss(model, batch)
 
-    # compute_loss builds xt internally from a clone of input_ids; padding
-    # positions in the original batch tensor must never be touched.
+    # compute_loss builds xt internally from a
+    # positions in the original batch tensor
     assert torch.equal(batch["input_ids"], x0_before)
 
 
@@ -142,7 +142,7 @@ def test_compute_loss_backward_compatible_without_modality_or_mask(tokenizer):
 
 
 def test_compute_loss_forces_one_position_when_noise_mask_is_empty(dense_model, tokenizer, monkeypatch):
-    """When no token gets noised, compute_loss must still score exactly one position instead of an empty tensor."""
+    """When no token gets noised, compute_loss must still score exactly one position."""
     ids = tokenizer.encode("hello world", add_special_tokens=False)
     pad_len = 16 - len(ids)
     ids = ids + [tokenizer.pad_token_id] * pad_len
@@ -159,7 +159,7 @@ def test_compute_loss_forces_one_position_when_noise_mask_is_empty(dense_model, 
 
 
 def test_compute_loss_forces_one_position_without_pad_mask(dense_model, tokenizer, monkeypatch):
-    """Same fallback as above, but with no `mask` key: `eligible` must fall back to torch.ones_like(noise_mask)."""
+    """Same fallback as above, but with no `mask` key: `eligible` must fall."""
     ids = tokenizer.encode("hello world", add_special_tokens=False)
     ids = ids + [tokenizer.pad_token_id] * (16 - len(ids))
     batch = {

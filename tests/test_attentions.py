@@ -291,7 +291,7 @@ def test_deltanet_cache_effect():
 
 
 def test_deltanet_ssm_cache_used_even_without_conv_cache():
-    # regression: has_previous_state used to be gated only on conv_caches, silently ignoring ssm_caches set without a matching conv_cache (exactly what build_memory_cache does by design)
+    # regression: has_previous_state used to be gated
     model = get_deltanet_model()
     x = torch.randn(1, 8, 32)
 
@@ -487,7 +487,7 @@ def test_supports_cu_seqlens_returns_false_for_none():
 
 
 def test_supports_cu_seqlens_returns_false_when_signature_unavailable():
-    # builtins raise ValueError from inspect.signature; must degrade to False
+    # builtins raise ValueError from inspect.signature; must
     assert _supports_cu_seqlens(int) is False
 
 
@@ -515,6 +515,6 @@ def test_attention_without_layer_idx_warns_but_still_works(capsys):
 
 
 def test_current_backend_is_eager_on_cpu():
-    # documents/locks the CPU fallback this test suite actually exercises;
-    # the flex_attention path requires CUDA and is not covered here.
+    # documents/locks the CPU fallback this test
+    # the flex_attention path requires CUDA and
     assert ATTN_IMPL == "eager"

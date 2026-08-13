@@ -15,11 +15,11 @@ MAX_LEN = 3 * 2048
 
 
 class NonFiniteDataError(ValueError):
-    """Raised when a multimodal example contains NaN/Inf — a data-quality issue to skip, not a schema error."""
+    """Raised when a multimodal example contains NaN/Inf — a data-quality issue to."""
 
 
 def pack_multimodal_data(arrays: dict) -> bytes:
-    """Serialize named numpy arrays into one self-describing blob — shape/dtype travel with the data (via .npz), so no per-modality shape assumptions are needed to read it back."""
+    """Serialize named numpy arrays into one self-describing blob — shape/dtype travel with."""
     buf = io.BytesIO()
     np.savez(buf, **arrays)
     return buf.getvalue()
@@ -32,7 +32,7 @@ def unpack_multimodal_data(data: bytes) -> dict:
 
 
 def _pad_and_gen_mask(ids, prompt_len, max_len, pad_token_id):
-    """Pad `ids` to max_len and build a gen_mask that's 0 on the prompt, 1 on the rest, 0 on padding."""
+    """Pad `ids` to max_len and build a gen_mask that's 0 on the."""
     pad_len = max_len - len(ids)
     gen_len = len(ids) - prompt_len
     ids = ids + [pad_token_id] * pad_len
@@ -41,7 +41,7 @@ def _pad_and_gen_mask(ids, prompt_len, max_len, pad_token_id):
 
 
 class KairosPretrainingDataset(Dataset):
-    """Full diffusion pretraining dataset: text or multimodal, chunked to {input_ids, modality_ids, mask, prompt_len}."""
+    """Full diffusion pretraining dataset: text or multimodal, chunked to {input_ids, modality_ids, mask,."""
 
     def __init__(
         self,
@@ -87,7 +87,7 @@ class KairosPretrainingDataset(Dataset):
             yield ids_chunk, mod_chunk, mask
 
     def _collect_chunks(self, chunk_sources):
-        """Run each (ids, modality_ids) pair through self._chunk and flatten into three lists; if self.pack, concatenate all sources into one continuous stream first so only the final chunk is padded."""
+        """Run each (ids, modality_ids) pair through self._chunk and flatten into three lists;."""
         all_input_ids, all_modality_ids, all_masks = [], [], []
         if self.pack:
             packed_ids, packed_mods = [], []
@@ -111,7 +111,7 @@ class KairosPretrainingDataset(Dataset):
                 # anti-Reversal Curse: randomize prompt/text order
                 merged = " ".join([prompt, text] if random.random() < 0.5 else [text, prompt]).strip()
                 if not merged:
-                    continue  # empty example: nothing to learn, wastes a padded-only chunk
+                    continue  # empty example: nothing to learn,
                 tokens = self.tokenizer.encode(merged, add_special_tokens=False)
                 if not tokens:
                     continue
@@ -125,10 +125,12 @@ class KairosPretrainingDataset(Dataset):
             "prompt_len": [0] * len(all_input_ids),
         }
 
-    _KNOWN_MULTIMODAL_MODALITIES = frozenset({"image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"})
+    _KNOWN_MULTIMODAL_MODALITIES = frozenset(
+        {"image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"}
+    )
 
     def _segments_for(self, ex):
-        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py). `data` is a pack_multimodal_data() blob — arrays come back in whatever shape they were stored in, nothing here assumes a fixed image/lidar/etc. size."""
+        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py)."""
         modality = ex["modality"]
 
         if modality == "text":
@@ -140,7 +142,7 @@ class KairosPretrainingDataset(Dataset):
         arrays = unpack_multimodal_data(ex["data"])
         for name, arr in arrays.items():
             if np.issubdtype(arr.dtype, np.floating) and not np.isfinite(arr).all():
-                # NaN/Inf in a raw modality array (corrupt sensor/audio capture) poisons embeddings downstream and is a leading cause of loss divergence; reject early
+                # NaN/Inf in a raw modality array
                 raise NonFiniteDataError(f"non-finite values in {modality!r} field {name!r}")
         meta = json.loads(ex["meta"]) if ex.get("meta") else {}
         caption = ex.get("caption") or ""
@@ -171,7 +173,7 @@ class KairosPretrainingDataset(Dataset):
             return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"]))]
 
         if modality == "imu":
-            # flattened 1D signal, reuses the audio quantizer/tick markers
+            # flattened 1D signal, reuses the audio
             flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
             return [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_audio(flat))]
 
@@ -221,7 +223,7 @@ class KairosPretrainingDataset(Dataset):
 
 
 class KairosSFTDataset(Dataset):
-    """SFT dataset: flattens a conversation to tags and diffuses only the last assistant turn (gen_mask=1)."""
+    """SFT dataset: flattens a conversation to tags and diffuses only the last."""
 
     def __init__(self, tokenizer, max_len=512, examples=None, source="toolace"):
         self.tokenizer = tokenizer
@@ -306,7 +308,7 @@ class KairosDPODataset(Dataset):
         return "".join(f"<{m['role']}>\n{m['content']}\n</{m['role']}>\n" for m in messages)
 
     def _encode_pair(self, prompt_text, response_text):
-        # byte-level tokenizer: encode(A)+encode(B) == encode(A+B), so encoding prompt alone safely gives prompt_len in token space
+        # byte-level tokenizer: encode(A)+encode(B) == encode(A+B), so
         prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
         response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
         response_ids = response_ids[: self.max_len - len(prompt_ids)]
@@ -344,7 +346,7 @@ class KairosDPODataset(Dataset):
 
 
 class KairosRLDataset(Dataset):
-    """RL dataset for reasoning via masked diffusion: prompt tokens are never noised (gen_mask=0)."""
+    """RL dataset for reasoning via masked diffusion: prompt tokens are never noised."""
 
     def __init__(self, tokenizer, max_len=2048, split="train", max_samples=None, examples=None):
         self.tokenizer = tokenizer
