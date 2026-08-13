@@ -14,7 +14,7 @@ from tqdm import tqdm
 # CONFIG
 # -------------------------
 DEBUG = True
-MAX_ARTICLES = None  # 10    # set to None to process all
+MAX_ARTICLES = None  # 10  # set to None to process
 
 NOISE_FR = re.compile(
     r"^(une maintenance|cet article est|si tu cherches|cette page d.homonymie"
@@ -64,7 +64,7 @@ def parse_simplewiki(xml_bz2: str) -> list[dict]:
                     if record:
                         data.append(record)
                         if DEBUG and len(data) <= 3:
-                            print(f"  [en #{len(data)}] prompt={record['prompt'][:100]!r}")
+                            print(f"  [en  # {len(data)}] prompt={record['prompt'][:100]!r}")
                             print(f"              text={record['text'][:120]!r}")
                         if MAX_ARTICLES and len(data) >= MAX_ARTICLES:
                             break
@@ -83,19 +83,19 @@ def _wikitext_to_record(title: str, raw: str) -> dict | None:
             if tag.tag.strip_code().lower() == "ref":
                 try:
                     wikicode.remove(tag)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - a single malformed tag must not abort the whole page
                     pass
         text = wikicode.strip_code()
-    except Exception:
+    except Exception:  # noqa: BLE001 - malformed wikitext must not abort the whole corpus build
         return None
 
-    # Remove any remaining HTML tags and refs
+    # Remove any remaining HTML tags and
     text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)
 
     lines = []
-    for l in text.splitlines():
-        s = l.strip()
+    for line in text.splitlines():
+        s = line.strip()
         if "Category:" in s:
             break
         if len(s) >= 20 and not s.startswith(SKIP_PREFIXES):
@@ -131,7 +131,7 @@ def parse_vikidia(zim_path: str) -> list[dict]:
                     continue
                 title = entry.title.strip()
                 content = bytes(item.content).decode("utf-8", errors="ignore")
-            except Exception:
+            except Exception:  # noqa: BLE001 - a single corrupted zim entry must not abort the whole dump
                 skipped += 1
                 bar.update(1)
                 continue
@@ -153,7 +153,7 @@ def parse_vikidia(zim_path: str) -> list[dict]:
             if record:
                 data.append(record)
                 if DEBUG and len(data) <= 3:
-                    print(f"  [fr #{len(data)}] prompt={record['prompt'][:100]!r}")
+                    print(f"  [fr  # {len(data)}] prompt={record['prompt'][:100]!r}")
                     print(f"             text={record['text'][:120]!r}")
                 if MAX_ARTICLES and len(data) >= MAX_ARTICLES:
                     break
@@ -168,7 +168,7 @@ def parse_vikidia(zim_path: str) -> list[dict]:
 def _html_to_record(title: str, html: str) -> dict | None:
     try:
         soup = BeautifulSoup(html, "lxml")
-    except Exception:
+    except Exception:  # noqa: BLE001 - malformed HTML must not abort the whole corpus build
         return None
 
     for tag in soup.find_all(["script", "style", "sup", "figure", "nav", "footer", "table"]):

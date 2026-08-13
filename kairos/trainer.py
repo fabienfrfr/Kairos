@@ -4,11 +4,11 @@ from transformers import Trainer
 
 
 class KairosDiffusionTrainer(Trainer):
-    """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and predict the originals back."""
+    """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and."""
 
     last_loss_diagnostics: dict | None = None
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, cache_params=None):
         x0 = inputs["input_ids"]
         prompt_len = inputs["prompt_len"]
         modality_ids = inputs.get("modality_ids")
@@ -26,8 +26,7 @@ class KairosDiffusionTrainer(Trainer):
             noise_mask &= pad_mask.bool()  # never noise/score padding
 
         if not noise_mask.any():
-            # exceedingly rare (short sequence + low sampled p): force one
-            # position per row so cross_entropy never sees an empty tensor
+            # exceedingly rare (short sequence + low
             eligible = pad_mask.bool() if pad_mask is not None else torch.ones_like(noise_mask)
             for i in range(x0.size(0)):
                 row_idx = eligible[i].nonzero(as_tuple=True)[0]
@@ -38,14 +37,13 @@ class KairosDiffusionTrainer(Trainer):
         noise = torch.randint_like(x0, model.lm_head.vocab_size)
         xt[noise_mask] = noise[noise_mask]
 
-        logits = model(decoder_input_ids=xt, modality_ids=modality_ids).logits
+        logits = model(decoder_input_ids=xt, modality_ids=modality_ids, cache_params=cache_params).logits
 
         loss = F.cross_entropy(logits[noise_mask], x0[noise_mask], reduction="none")
         loss = (loss / p[noise_mask]).mean()
 
         if not torch.isfinite(loss):
-            # capture enough context here (with access to logits/inputs) for the caller to
-            # print an actionable report instead of a bare "loss=nan"
+            # capture context here (access to logits/inputs)
             self.last_loss_diagnostics = self._build_nan_diagnostics(x0, modality_ids, pad_mask, prompt_len, logits)
 
         return loss

@@ -25,9 +25,9 @@ datasets:
 </a>
 </p>
 
-<h3 align="center"><p>Universal multimodal MoE trained from scratch for efficient edge AI</p></h3>
+<h3 align="center"><p>KairosFM — less parameters, more signal.</p></h3>
 
-Kairos is a hybrid MoE diffusion language model combining **DeltaNet** (linear attention),
+KairosFM is a hybrid MoE diffusion language model combining **DeltaNet** (linear attention),
 **Sliding Window Attention**, and **Attention Residuals (AttnRes)**, trained on text, image,
 video, audio, lidar, and control (state/action) modalities through a shared multimodal
 conv-byte tokenizer. See [github.com/fabienfrfr/Kairos](https://github.com/fabienfrfr/Kairos)
@@ -79,8 +79,8 @@ Experimental, low-compute-budget training run — expect uneven quality across m
 
 ```bibtex
 @misc{{kairos,
-  title  = {{Kairos: a multimodal MoE diffusion model for edge AI}},
-  author = {{Furfaro Fabien}},
+  title  = {{KairosFM: less parameters, more signal — a multimodal MoE diffusion model for edge AI}},
+  author = {{Fabien Furfaro}},
   url    = {{https://github.com/fabienfrfr/Kairos}}
 }}
 ```

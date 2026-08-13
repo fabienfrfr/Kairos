@@ -18,7 +18,7 @@ for _, dst in datasets:
     try:
         api.delete_repo(repo_id=dst, repo_type="dataset")
         print(f"Deleted: {dst}")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - repo may not exist yet on first run, that's fine
         pass
 
 # clean upload

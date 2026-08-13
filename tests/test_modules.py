@@ -90,6 +90,18 @@ def test_kairos_config(config):
     assert config.num_attention_heads == 4
 
 
+def test_n_routed_experts_stays_synced_with_num_local_experts():
+    via_old_name = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, n_routed_experts=16)
+    assert via_old_name.num_local_experts == 16
+
+    via_new_name = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_local_experts=12)
+    assert via_new_name.n_routed_experts == 12
+
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259)
+    cfg.n_routed_experts = 20
+    assert cfg.num_local_experts == 20
+
+
 def test_diffusion_block(config):
     block = DiffusionBlock(config, 0)
     x = torch.randn(2, 8, 32)
@@ -127,14 +139,14 @@ def test_backbone_block_size_default_is_one():
 
 
 def test_backbone_block_size_one_matches_original_graph():
-    # S=1 must reproduce the pre-blocking AttnRes graph term for term.
+    # S=1 must reproduce the pre-blocking AttnRes
     torch.manual_seed(0)
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=4, vocab_size=259, num_modalities=2, attnres_block_size=1)
     torch.manual_seed(42)
     model = KairosDiffusionBackbone(cfg)
     x = torch.randn(2, 6, 16)
 
-    # Reference: the original states=[x]; h=agg(states); x=layer(h); states.append(x) graph.
+    # Reference: the original states=[x]; h=agg(states); x=layer(h);
     states = [x]
     xr = x
     for layer in model.layers:
@@ -179,7 +191,7 @@ def test_backbone_block_size_backward():
 
 
 def test_backbone_block_size_uneven_layers_no_nan():
-    # n_layers not a multiple of attnres_block_size => trailing partial block.
+    # n_layers not a multiple of attnres_block_size
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=5, vocab_size=259, num_modalities=2, attnres_block_size=3)
     model = KairosDiffusionBackbone(cfg)
     x = torch.randn(1, 4, 16)
@@ -210,7 +222,14 @@ def test_kairos_model_init(config):
 
 
 def test_post_init_is_called_and_initializes_all_parameters():
-    # regression test for the actual NaN root cause: KairosDiffusionLLM used to skip self.post_init() (DeepseekV3Experts')
+    # regression test for the actual NaN
+    # self.post_init(), so DeepseekV3Experts' raw nn.Parameter(torch.empty(...)) weights
+    # (gate_up_proj/down_proj) were left as uninitialized memory
+    # construction alone, before any forward pass.
+    # finite immediately after construction, with no
+    # Uses num_modalities=8 (the real default) deliberately:
+    # `config` fixture) triggers an unrelated pre-existing
+    # construction with use_moe=True, which is a
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -221,7 +240,9 @@ def test_post_init_is_called_and_initializes_all_parameters():
 
 
 def test_moe_expert_weights_are_not_uninitialized_memory():
-    # more targeted than the finite-check above: torch.empty() garbage happens to often be xactly 0.0 (freshly-allocated/zeroed pages)
+    # more targeted than the finite-check above:
+    # exactly 0.0 (freshly-allocated/zeroed pages), which would
+    # still being wrong (an all-zero expert
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -241,6 +262,30 @@ def test_kairos_model_forward(config):
     x = torch.randint(0, 259, (2, 16))
     out = model(input_ids=x)
     assert out.logits.shape == (2, 16, 259)
+
+
+def test_kairos_model_forward_requires_input_ids(config):
+    model = KairosDiffusionLLM(config)
+    with pytest.raises(ValueError, match="input_ids"):
+        model()
+
+
+def test_kairos_model_forward_with_self_conditioning(config):
+    model = KairosDiffusionLLM(config)
+    x = torch.randint(0, 259, (2, 16))
+    logits = torch.randn(2, 16, 259)
+    out = model(input_ids=x, self_conditioning_logits=logits)
+    assert out.logits.shape == (2, 16, 259)
+
+
+def test_kairos_cache_get_ssm_cache_roundtrip(config):
+    model = KairosDiffusionLLM(config)
+    cache = KairosMultiCache(config)
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x, cache_params=cache)
+    conv, ssm = cache.caches[0].get_ssm_cache(0)
+    assert conv is cache.caches[0].conv_caches[0]
+    assert ssm is cache.caches[0].ssm_caches[0]
 
 
 def test_no_nan_forward(config):

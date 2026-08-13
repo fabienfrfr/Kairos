@@ -9,7 +9,7 @@ from kairos.tokenizer import KairosTokenizer, Modality
 
 
 def make_example(modality, caption=None, source="test", **fields):
-    """Build a generic-schema row: numpy-array fields go into `data`, everything else into `meta`."""
+    """Build a generic-schema row: numpy-array fields go into `data`, everything else into."""
     arrays = {k: v for k, v in fields.items() if isinstance(v, np.ndarray)}
     meta = {k: v for k, v in fields.items() if not isinstance(v, np.ndarray)}
     return {
@@ -42,9 +42,7 @@ def all_kinds_examples(rng):
             audio=rng.uniform(-1, 1, 4000).astype(np.float32),
             sample_rate=8000,
         ),
-        make_example(
-            "video_caption", caption="running", video=rng.integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)
-        ),
+        make_example("video_caption", caption="running", video=rng.integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)),
         make_example("lidar", points=rng.uniform(-10, 10, (50, 4)).astype(np.float32)),
         make_example("imu", signal=rng.uniform(-5, 5, (50, 6)).astype(np.float32)),
         make_example(
@@ -148,9 +146,7 @@ def test_multimodal_padding_uses_text_modality(tokenizer, all_kinds_examples):
 
 def test_unknown_modality_raises(tokenizer):
     with pytest.raises(ValueError, match="unknown example modality"):
-        KairosPretrainingDataset(
-            multimodal_examples=[{"modality": "bogus"}], tokenizer=tokenizer, max_len=64, stride=1
-        )
+        KairosPretrainingDataset(multimodal_examples=[{"modality": "bogus"}], tokenizer=tokenizer, max_len=64, stride=1)
 
 
 def test_multimodal_path_from_pt_file(tmp_path, tokenizer, all_kinds_examples):
@@ -166,11 +162,23 @@ def test_multimodal_dataset_creates_default_tokenizer_when_none_given(all_kinds_
     assert len(ds) > 0
 
 
+def test_pack_concatenates_sources_before_chunking(tokenizer):
+    examples = [{"modality": "text", "text": "short one"}, {"modality": "text", "text": "another short bit"}]
+    unpacked = KairosPretrainingDataset(multimodal_examples=examples, tokenizer=tokenizer, max_len=64, stride=1)
+    packed = KairosPretrainingDataset(
+        multimodal_examples=examples, tokenizer=tokenizer, max_len=64, stride=1, pack=True
+    )
+    assert len(packed) < len(unpacked)  # fewer, fuller chunks
+    packed_pad_frac = 1 - packed[0]["mask"].float().mean().item()
+    unpacked_pad_frac = 1 - unpacked[0]["mask"].float().mean().item()
+    assert packed_pad_frac < unpacked_pad_frac
+
+
 def test_empty_text_examples_are_skipped(tokenizer):
     ds = KairosPretrainingDataset(
         texts=["", "   ", "Paris is the capital of France."], tokenizer=tokenizer, max_len=64, stride=1
     )
-    assert len(ds) > 0  # only the non-empty text produced chunks, but it shouldn't crash or hang
+    assert len(ds) > 0  # only the non-empty text produced
 
 
 def test_nonfinite_multimodal_array_is_skipped_not_raised(tokenizer, rng):
@@ -180,7 +188,7 @@ def test_nonfinite_multimodal_array_is_skipped_not_raised(tokenizer, rng):
     with pytest.warns(UserWarning, match="skipping corrupt example"):
         ds = KairosPretrainingDataset(multimodal_examples=[bad, good], tokenizer=tokenizer, max_len=128, stride=1)
 
-    assert len(ds) > 0  # the good example still produced chunks despite the corrupt one
+    assert len(ds) > 0  # the good example still produced
 
 
 def test_all_nonfinite_multimodal_examples_yields_empty_dataset(tokenizer):

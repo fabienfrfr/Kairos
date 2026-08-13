@@ -36,11 +36,14 @@ try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn = None
-    from transformers.models.qwen3_next.modeling_qwen3_next import (
-        torch_causal_conv1d_update,
-    )
-
-    causal_conv1d_update = torch_causal_conv1d_update
+    try:
+        from transformers.models.qwen3_next.modeling_qwen3_next import (
+            torch_causal_conv1d_update as causal_conv1d_update,
+        )
+    except ImportError:
+        from transformers.models.qwen3_next.modeling_qwen3_next import (
+            causal_conv1d_update,
+        )
 
 
 def _supports_cu_seqlens(fn):
@@ -57,7 +60,7 @@ class KairosNorm(LlamaRMSNorm):
 
 
 class KairosRotaryEmbedding(nn.Module):
-    """cos/sin cache grows on demand (amortized doubling) so generation past max_position_embeddings never indexes out of bounds."""
+    """cos/sin cache grows on demand (amortized doubling) so generation past max_position_embeddings never."""
 
     def __init__(self, config, head_dim):
         super().__init__()
@@ -262,9 +265,7 @@ class KairosGatedDeltaNet(nn.Module):
             padding=self.conv_size - 1,
         )
         self.causal_conv1d_fn = causal_conv1d_fn
-        self.causal_conv1d_update = (
-            causal_conv1d_update if causal_conv1d_update is not None else torch_causal_conv1d_update
-        )
+        self.causal_conv1d_update = causal_conv1d_update
         self.chunk_gated_delta_rule = (
             chunk_gated_delta_rule if chunk_gated_delta_rule is not None else torch_chunk_gated_delta_rule
         )
@@ -281,6 +282,7 @@ class KairosGatedDeltaNet(nn.Module):
     def process(self, hidden_states, cache_params=None, attention_mask=None):
         B, L, _ = hidden_states.shape
         has_previous_state = cache_params is not None and cache_params.conv_caches[self.layer_idx] is not None
+        has_ssm_state = cache_params is not None and cache_params.ssm_caches[self.layer_idx] is not None
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
@@ -340,12 +342,9 @@ class KairosGatedDeltaNet(nn.Module):
         v = rearrange(v, "b l (h d) -> b l h d", h=self.n_heads)
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        prev_state = cache_params.ssm_caches[self.layer_idx] if has_previous_state else None
+        prev_state = cache_params.ssm_caches[self.layer_idx] if has_ssm_state else None
         has_padding = attention_mask is not None and not bool(attention_mask.all())
-        # With padding + a real fla kernel (supports cu_seqlens): pack every
-        # active position across the batch into one flat sequence instead of
-        # wasting compute on padded steps. Falls back to zeroing beta/g at
-        # padded steps if only the torch reference kernel is available.
+        # With padding + a real fla
         use_varlen = has_padding and not (has_previous_state and L == 1) and self._chunk_supports_varlen
         if use_varlen:
             flat_idx = attention_mask.nonzero(as_tuple=False)

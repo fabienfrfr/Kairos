@@ -9,7 +9,7 @@ import torch
 
 
 def locate_first_nonfinite_module(model, forward_fn) -> dict | None:
-    """Runs forward_fn() with hooks on every submodule and returns diagnostics for the first one whose output contains NaN/Inf, or None if all finite."""
+    """Runs forward_fn() with hooks on every submodule and returns diagnostics for the."""
     found: dict | None = None
     handles = []
 
@@ -32,7 +32,7 @@ def locate_first_nonfinite_module(model, forward_fn) -> dict | None:
         return _hook
 
     for name, module in model.named_modules():
-        if name:  # skip the root module itself, only leaf/inner submodules are informative
+        if name:  # skip the root module itself,
             handles.append(module.register_forward_hook(_make_hook(name)))
 
     try:
@@ -45,7 +45,7 @@ def locate_first_nonfinite_module(model, forward_fn) -> dict | None:
 
 
 def format_duration(seconds: float | None) -> str:
-    """Formats seconds as e.g. "1h 2m 5s"; returns "n/a" for None."""
+    """Formats seconds as e.g."""
     if seconds is None:
         return "n/a"
     seconds = round(seconds)
@@ -68,7 +68,7 @@ def count_parameters(model) -> tuple[int, int]:
 
 
 def count_active_parameters(model, num_experts_per_tok: int | None = None, num_local_experts: int | None = None) -> int:
-    """MoE-aware param count actually touched per forward pass: dense params unchanged if not MoE."""
+    """MoE-aware param count actually touched per forward pass: dense params unchanged if."""
     total = sum(p.numel() for p in model.parameters())
     if not num_experts_per_tok or not num_local_experts:
         return total
@@ -88,7 +88,7 @@ def estimate_optimizer_memory_mb(trainable_params: int, optimizer_states: int = 
 
 
 def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
-    """Average seconds/step over n_steps calls to step_fn(), or None if step_fn runs out of batches."""
+    """Average seconds/step over n_steps calls to step_fn(), or None if step_fn runs."""
     try:
         for _ in range(warmup):
             step_fn()
@@ -102,7 +102,7 @@ def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | N
 
 
 def make_progress_callback(desc: str = "training"):
-    """Returns a (step, total, loss) -> None callback for pipeline.train(), backed by a tqdm/marimo bar."""
+    """Returns a (step, total, loss) -> None callback for pipeline.train(), backed by."""
     from tqdm.auto import tqdm
 
     state = {"bar": None}
@@ -121,7 +121,7 @@ def make_progress_callback(desc: str = "training"):
 
 @dataclass
 class TrainingSummary:
-    """Snapshot of a run's compute cost: param counts, memory footprint, and (optional) timing."""
+    """Snapshot of a run's compute cost: param counts, memory footprint, and (optional)."""
 
     total_params: int
     trainable_params: int
@@ -166,7 +166,7 @@ def training_summary(
     num_experts_per_tok: int | None = None,
     num_local_experts: int | None = None,
 ) -> TrainingSummary:
-    """Builds a TrainingSummary from a model and sized loader; pass step_fn to also time+extrapolate total time."""
+    """Builds a TrainingSummary from a model and sized loader; pass step_fn to."""
     total_params, trainable_params = count_parameters(model)
     active_params = count_active_parameters(model, num_experts_per_tok, num_local_experts)
     param_memory_mb = estimate_param_memory_mb(total_params)

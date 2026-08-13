@@ -1,5 +1,5 @@
 <h1 align="center">
-<p>🌀 Kairos</p>
+<p>🌀 KairosFM</p>
 </h1>
 
 <p align="center">
@@ -12,8 +12,10 @@
 </p>
 
 <h3 align="center">
-<p>Universal multimodal MoE built from scratch for efficient edge AI</p>
+<p>KairosFM — less parameters, more signal.</p>
 </h3>
+
+> **Status**: pre-1.0, architecture not yet validated by a full training run. Expect breaking changes until v1.0.0 (reserved for the first checkpoint that has actually proven itself).
 
 <p align="center">
 <b>200M parameters</b> • <b>25M active</b> • DeltaNet • Sliding Window Attention • MoE • AttnRes • Multimodal Conv-Byte Tokenizer
@@ -55,7 +57,7 @@ The choice of linear attention, specifically **DeltaNet**, is also driven by its
 
 | File | Role |
 |---|---|
-| `kairos/modeling.py` | `KairosConfig`, `KairosDiffusionLLM` (top-level model), DeltaNet/SWA blocks, MoE wiring |
+| `kairos/modeling.py` | `KairosConfig`, `KairosDiffusionLLM` (top-level model), DeltaNet/SWA blocks, MoE wiring, `KairosMemoryBank` |
 | `kairos/attentions.py` | LiZAttention2 (shared QKV/O between SWA and DeltaNet), sliding-window kernel |
 | `kairos/tokenizer.py` | `KairosTokenizer` — shared byte-level codec for text/image/video/audio/lidar |
 | `kairos/dataset.py` | Pretraining/SFT/RL dataset builders, multimodal packing |
@@ -63,9 +65,6 @@ The choice of linear attention, specifically **DeltaNet**, is also driven by its
 | `kairos/trainer.py` | Masked-diffusion loss (`KairosDiffusionTrainer`) |
 | `kairos/utils.py` | Param counts, memory/step-time estimates, NaN-source localization |
 | `kairos/templates/model_card.md` | Hub model card template, filled in by `pipeline.py` on push |
-
-MoE config: `use_moe`, `n_routed_experts`, and `num_local_experts` must be set together
-(`num_local_experts` is what the DeepSeek-V3 backend actually reads for expert count).
 
 ## Roadmap: Toward Universal Intelligence
 

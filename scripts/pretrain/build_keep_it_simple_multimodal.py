@@ -1,17 +1,4 @@
-"""
-Builds keep-it-simple-multimodal: mini multimodal dataset (image+caption, audio+caption,
-video+caption, lidar, control state/action), target ~51MB.
-
-Datasets used:
-  - detection-datasets/coco            -> image_caption (bbox serialized as text) (32, 32, 3) uint8
-  - laion/relaion-coco                  -> image_caption (URL download, punsafe-filtered)
-  - OpenSound/AudioCaps                  -> audio_caption
-  - HuggingFaceFV/finevideo (gated)      -> video_caption - video (6, 16, 16, 3) uint8
-  - nvidia/Cosmos-Transfer-LidarGen-Example (gated) -> lidar (300, 4) float32
-  - ffurfaro/PixelBytes-OptimalControl   -> control - stereo
-
-Gated sources: accept terms on the HF page, then `huggingface-cli login` or export HF_TOKEN.
-"""
+"""Builds keep-it-simple-multimodal (~51MB): image/audio/video/lidar/control captions from coco, relaion-coco, AudioCaps, finevideo, Cosmos-Transfer-LidarGen, PixelBytes-OptimalControl."""
 
 import io
 import json
@@ -24,15 +11,15 @@ from tqdm import tqdm
 
 from kairos.dataset import pack_multimodal_data
 
-# a stalled read otherwise hangs forever; bound it so a slow/dead connection
-# surfaces as a normal exception instead of an unkillable-looking freeze.
+# a stalled read otherwise hangs forever;
+# surfaces as a normal exception instead
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 CACHE_DIR = "data/cache"
-CACHE_SCHEMA_VERSION = 5  # bumped: caches now store RAW source rows; processing is re-run every build
-CHECKPOINT_EVERY = 10  # rows between checkpoint saves for streaming sources
+CACHE_SCHEMA_VERSION = 5  # bumped: caches now store RAW
+CHECKPOINT_EVERY = 10  # rows between checkpoint saves for
 
-# per-source example count, sized so each modality lands around ~10MB (~51MB total across 5 sources)
+# per-source example count, sized so each
 N_PER_SOURCE = {
     "image_bbox": 2700,
     "image_caption": 1800,
@@ -46,15 +33,15 @@ AUDIO_SECONDS = 1.0
 AUDIO_SAMPLE_RATE = 8000
 VIDEO_FRAMES = 6
 VIDEO_SIZE = 16
-VIDEO_MAX_DURATION_SEC = 1.0  # only sample within this window so frames capture short-term dynamics
+VIDEO_MAX_DURATION_SEC = 1.0  # only sample within this window
 LIDAR_POINTS = 300
 LIDAR_REPO_ID = "nvidia/Cosmos-Transfer-LidarGen-Example"
-LIDAR_TAR_FILENAME = None  # None = auto-pick the first .tar under lidar/ in the repo
+LIDAR_TAR_FILENAME = None  # None = auto-pick the first
 HF_REPO_ID = "ffurfaro/keep-it-simple-multimodal"
 
 
 def make_row(modality, source, caption=None, **fields):
-    """Generic {modality, caption, source, data, meta} row: arrays -> data, rest -> meta."""
+    """Generic {modality, caption, source, data, meta} row: arrays -> data, rest ->."""
     arrays = {k: v for k, v in fields.items() if isinstance(v, np.ndarray)}
     meta = {k: v for k, v in fields.items() if not isinstance(v, np.ndarray)}
     return {
@@ -67,11 +54,7 @@ def make_row(modality, source, caption=None, **fields):
 
 
 def _iterate_resumable(ds, cache_path: str, fetch, process_row, n: int, desc: str) -> list[dict]:
-    """Streams `ds`, caching the FETCHED raw rows — network payloads included — not the
-    processed results. `fetch(row)` does the network work once (its output is cached, e.g.
-    downloaded image bytes); `process_row(fetched)` is the CPU transform that is RE-RUN on
-    every build, so edits to it take effect without re-hitting the network. Returns the first
-    `n` processed rows. `--force-rebuild` clears the cache to re-fetch from the network."""
+    """Streams `ds`, caching fetched raw rows (network payloads); process_row() is re-run every."""
     raw_rows, consumed = [], 0
     if os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
@@ -79,7 +62,7 @@ def _iterate_resumable(ds, cache_path: str, fetch, process_row, n: int, desc: st
         raw_rows, consumed = state["raw_rows"], state["consumed"]
         print(f"[{desc}] resuming: {len(raw_rows)} raw rows cached, {consumed} source rows consumed")
 
-    # always recompute from the raw rows, so processing changes take effect
+    # always recompute from the raw rows,
     results = [r for r in (process_row(r) for r in raw_rows) if r is not None]
 
     def save_checkpoint():
@@ -91,7 +74,7 @@ def _iterate_resumable(ds, cache_path: str, fetch, process_row, n: int, desc: st
             for row in ds.skip(consumed):
                 consumed += 1
                 fetched = fetch(row)
-                if fetched is None:  # unfetchable row: count as consumed, don't cache, don't retry
+                if fetched is None:  # unfetchable row: count as consumed,
                     continue
                 raw_rows.append(fetched)
                 result = process_row(fetched)
@@ -117,7 +100,7 @@ def _peak_normalize(arr: np.ndarray, target_peak: float = 0.95) -> tuple[np.ndar
 
 
 def _decode_audio_bytes(raw_bytes: bytes, layout: str = "mono", rate: int | None = None) -> tuple[np.ndarray, int]:
-    """Decode audio bytes via PyAV. Returns (channels, samples) float32 in [-1, 1]."""
+    """Decode audio bytes via PyAV."""
     import av
 
     container = av.open(io.BytesIO(raw_bytes))
@@ -145,7 +128,7 @@ def _decode_video_bytes(raw_bytes: bytes) -> tuple[list, dict] | None:
     for frame in container.decode(stream):
         t = float(frame.time or 0.0)
         arr = frame.to_ndarray(format="rgb24")
-        # proper resize (not a strided crop) so the whole frame is represented, not just its
+        # proper resize (not a strided crop)
         # top-left corner after a coarse stride
         resized = np.array(Image.fromarray(arr).resize((VIDEO_SIZE, VIDEO_SIZE), Image.BILINEAR))
         buffer.append((t, resized))
@@ -163,7 +146,7 @@ def _decode_video_bytes(raw_bytes: bytes) -> tuple[list, dict] | None:
 
 
 def build_image_bbox():
-    """Image + bbox-as-text. Dataset: detection-datasets/coco. Bbox stored as plain text."""
+    """Image + bbox-as-text."""
     from datasets import load_dataset
     from PIL import Image
 
@@ -191,7 +174,7 @@ def build_image_bbox():
 
 
 def build_image_caption():
-    """Image + caption. Dataset: laion/relaion-coco."""
+    """Image + caption."""
     import requests
     from datasets import load_dataset
     from PIL import Image
@@ -200,7 +183,7 @@ def build_image_caption():
     PUNSAFE_MAX = 0.1
 
     def fetch(row):
-        """Download the image once; the bytes are cached as raw, so rebuilds don't re-hit URLs."""
+        """Download the image once; the bytes are cached as raw, so rebuilds."""
         url, punsafe = row.get("URL"), row.get("punsafe")
         if not url or (punsafe is not None and punsafe > PUNSAFE_MAX):
             return None
@@ -235,7 +218,7 @@ def build_image_caption():
 
 
 def _time_stretch_to_fixed_length(signal: np.ndarray, out_samples: int) -> np.ndarray:
-    """Resamples the whole clip (not just its start) to exactly `out_samples` via linear interpolation over time"""
+    """Resamples the whole clip (not just its start) to exactly `out_samples` via."""
     if signal.shape[0] == out_samples:
         return signal
     x_old = np.linspace(0.0, 1.0, signal.shape[0])
@@ -244,7 +227,7 @@ def _time_stretch_to_fixed_length(signal: np.ndarray, out_samples: int) -> np.nd
 
 
 def build_audio_caption():
-    """Audio + caption. Dataset: OpenSound/AudioCaps (real audio bytes embedded)."""
+    """Audio + caption."""
     from datasets import Audio, load_dataset
 
     ds = load_dataset("OpenSound/AudioCaps", split="train", streaming=True)
@@ -257,7 +240,7 @@ def build_audio_caption():
             return None
         try:
             arr, _ = _decode_audio_bytes(audio["bytes"], layout="mono", rate=AUDIO_SAMPLE_RATE)
-        except Exception:  # noqa: BLE001, S112 — a handful of malformed/unsupported clips is expected
+        except Exception:  # noqa: BLE001 — a handful of malformed/unsupported clips is expected
             return None
         original_samples = arr.shape[1]
         original_duration_sec = original_samples / AUDIO_SAMPLE_RATE
@@ -268,10 +251,10 @@ def build_audio_caption():
             "audiocaps",
             caption=str(caption),
             audio=arr,
-            stretch_factor=original_samples / out_samples,  # divide output's time axis by this to undo
+            stretch_factor=original_samples / out_samples,  # divide output's time axis by
             sample_rate=AUDIO_SAMPLE_RATE,
             original_duration_sec=original_duration_sec,
-            peak_scale=peak,  # multiply by this / 0.95 to approximately undo the normalization
+            peak_scale=peak,  # multiply by this / 0.95
         )
 
     cache_path = os.path.join(CACHE_DIR, f"audio_caption_v{CACHE_SCHEMA_VERSION}.pkl")
@@ -279,7 +262,7 @@ def build_audio_caption():
 
 
 def build_video_caption():
-    """Video + caption. Dataset: HuggingFaceFV/finevideo (mp4 bytes + JSON metadata embedded, gated)."""
+    """Video + caption."""
     from datasets import load_dataset
 
     ds = load_dataset("HuggingFaceFV/finevideo", split="train", streaming=True)
@@ -310,17 +293,21 @@ def build_video_caption():
 
 
 def _find_lidar_tar(repo_id: str) -> str:
-    """Picks one lidar .tar file from the repo (10 available, one per clip)."""
+    """Picks one lidar .tar file from the repo (10 available, one per."""
     from huggingface_hub import HfApi
 
-    files = [f for f in HfApi().list_repo_files(repo_id, repo_type="dataset") if f.startswith("lidar_dataset_release/lidar/") and f.endswith(".tar")]
+    files = [
+        f
+        for f in HfApi().list_repo_files(repo_id, repo_type="dataset")
+        if f.startswith("lidar_dataset_release/lidar/") and f.endswith(".tar")
+    ]
     if not files:
         raise RuntimeError(f"No lidar .tar files found in {repo_id}")
-    return sorted(files)[0]
+    return min(files)
 
 
 def _load_npz_arrays(raw: bytes) -> dict[str, np.ndarray]:
-    """Loads ALL arrays out of an .npz file's bytes, keyed by name — a single component file."""
+    """Loads ALL arrays out of an .npz file's bytes, keyed by name."""
     with np.load(io.BytesIO(raw)) as npz:
         return {k: npz[k] for k in npz.files if npz[k].size > 0}
 
@@ -341,7 +328,7 @@ def _stack_component_columns(arrays: dict[str, np.ndarray]) -> np.ndarray | None
 
 
 def _group_lidar_members(members: list) -> dict[str, dict[str, "tarfile.TarInfo"]]:
-    """Groups tar members by frame stem """
+    """Groups tar members by frame stem"""
     groups: dict[str, dict[str, object]] = {}
     for m in members:
         if ".lidar_" not in m.name or not m.name.endswith(".npz"):
@@ -362,7 +349,7 @@ def _merge_lidar_frame(tar, components: dict) -> np.ndarray | None:
         try:
             arrays = _load_npz_arrays(f.read())
             stacked = _stack_component_columns(arrays)
-        except Exception:  # noqa: BLE001 — a handful of corrupt npz entries is expected
+        except Exception:  # noqa: BLE001, S112 — a handful of corrupt npz entries is expected
             continue
         if stacked is not None:
             per_component[name] = stacked
@@ -380,12 +367,12 @@ def _merge_lidar_frame(tar, components: dict) -> np.ndarray | None:
     points = np.concatenate([geometry] + others, axis=1) if others else geometry
 
     if points.shape[1] < 4:
-        return None  # not enough columns to form (x, y, z, intensity) — caller logs & skips
+        return None  # not enough columns to form
     return points if np.isfinite(points).all() and points.shape[0] > 0 else None
 
 
 def _subsample_lidar_azimuth(points: np.ndarray, n: int) -> np.ndarray:
-    """Subsamples to `n` points uniformly spread across the full 360° azimuth """
+    """Subsamples to `n` points uniformly spread across the full 360° azimuth"""
     if points.shape[0] <= n:
         return points
     azimuth = np.arctan2(points[:, 1], points[:, 0])
@@ -395,11 +382,7 @@ def _subsample_lidar_azimuth(points: np.ndarray, n: int) -> np.ndarray:
 
 
 def build_lidar():
-    """Lidar points. Dataset: nvidia/Cosmos-Transfer-LidarGen-Example (gated, one .tar clip).
-
-    Caches the RAW merged frames (`_merge_lidar_frame` output, before subsampling) so edits to
-    `_subsample_lidar_azimuth` / `make_row` are picked up on every build. `--force-rebuild`
-    clears the cache to re-merge straight from the tar."""
+    """Lidar points from nvidia/Cosmos-Transfer-LidarGen-Example (gated); caches raw merged frames, --force-rebuild re-merges."""
     from huggingface_hub import hf_hub_download
 
     cache_path = os.path.join(CACHE_DIR, f"lidar_v{CACHE_SCHEMA_VERSION}.pkl")
@@ -426,7 +409,9 @@ def build_lidar():
             members = [m for m in tar.getmembers() if m.isfile()]
             groups = _group_lidar_members(members)
             if not groups:
-                print(f"[lidar] no '<stem>.lidar_<component>.npz' members found; example names: {[m.name for m in members[:5]]}")
+                print(
+                    f"[lidar] no '<stem>.lidar_<component>.npz' members found; example names: {[m.name for m in members[:5]]}"
+                )
                 return []
 
             for stem, components in tqdm(list(groups.items()), total=min(n, len(groups)), desc="lidar"):
@@ -435,12 +420,14 @@ def build_lidar():
                 points = _merge_lidar_frame(tar, components)
                 if points is None:
                     if not warned:
-                        # dump npz internals once so a real failure is debuggable, not just "0 examples"
+                        # dump npz internals once so a
                         for name, member in components.items():
                             f = tar.extractfile(member)
                             try:
                                 with np.load(io.BytesIO(f.read())) as npz:
-                                    print(f"[lidar] debug {name}: keys={npz.files} shapes={[npz[k].shape for k in npz.files]}")
+                                    print(
+                                        f"[lidar] debug {name}: keys={npz.files} shapes={[npz[k].shape for k in npz.files]}"
+                                    )
                             except Exception as e:  # noqa: BLE001
                                 print(f"[lidar] debug {name}: failed to inspect ({e})")
                         warn_once(f"couldn't merge frame '{stem}' from components {list(components)}; skipping")
@@ -484,7 +471,7 @@ def _parse_control_params(text: str) -> dict:
 
 
 def build_control():
-    """Control state + action. Dataset: ffurfaro/PixelBytes-OptimalControl (channel 1 = state, 0 = action)."""
+    """Control state + action."""
     from datasets import Audio, load_dataset
 
     ds = load_dataset("ffurfaro/PixelBytes-OptimalControl", split="train", streaming=True)
@@ -496,13 +483,13 @@ def build_control():
             return None
         try:
             arr, sample_rate = _decode_audio_bytes(audio["bytes"], layout="stereo")
-        except Exception:  # noqa: BLE001, S112 — skip a handful of malformed/unsupported clips
+        except Exception:  # noqa: BLE001 — skip a handful of malformed/unsupported clips
             return None
         if arr.shape[0] != 2 or arr.shape[1] < 2:
             return None
         state, state_peak = _peak_normalize(arr[1])
         action, action_peak = _peak_normalize(arr[0])
-        # stereo layout: channel 0 (left) = state, channel 1 (right) = action
+        # stereo layout: channel 0 (left) =
         return make_row(
             "control",
             "pixelbytes-optimalcontrol",
@@ -519,7 +506,7 @@ def build_control():
 
 
 def push_to_hub(examples: list[dict], repo_id: str = HF_REPO_ID):
-    """Push the built examples as a HF dataset, with the README alongside it."""
+    """Push the built examples as a HF dataset, with the README alongside."""
     from datasets import Dataset, Features, Value
     from huggingface_hub import HfApi
 

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch
@@ -24,7 +25,7 @@ from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
 
 
 class KairosConfig(PretrainedConfig):
-    """modality_scales defaults every modality id up to num_modalities to scale 0 so none get silently dropped."""
+    """modality_scales defaults every modality id up to num_modalities to scale 0 so."""
 
     model_type = "kairos"
 
@@ -82,30 +83,37 @@ class KairosConfig(PretrainedConfig):
 
         self.intermediate_size = intermediate_size
 
-        self.num_local_experts = kwargs.get("num_local_experts", 8)
+        # num_local_experts is the only one transformers'
+        # n_routed_experts is a property alias below
+        self.num_local_experts = kwargs.get("num_local_experts", kwargs.get("n_routed_experts", 8))
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 2)
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", intermediate_size)
-        self.n_routed_experts = kwargs.get("n_routed_experts", 8)
         self.n_shared_experts = kwargs.get("n_shared_experts", 1)
         self.routed_scaling_factor = kwargs.get("routed_scaling_factor", 1.0)
         self.n_group = kwargs.get("n_group", 1)
         self.topk_group = kwargs.get("topk_group", 1)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", False)
-        self.top_k = self.num_experts_per_tok
         self.use_moe = kwargs.get("use_moe", False)
+        self.use_memory_gate = kwargs.get("use_memory_gate", False)
 
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
 
-        # v3 Block-AttnRes: window prior layer outputs into blocks of S before
-        # they're summed and handed to the aggregator, so the number of AttnRes
-        # sources stays O(N/S) instead of O(N). S=1 (default) reproduces the
-        # original per-layer AttnRes graph exactly (see KairosDiffusionBackbone).
+        # v3 Block-AttnRes: windows prior layer outputs
         self.attnres_block_size = kwargs.get("attnres_block_size", 1)
+
+    @property
+    def n_routed_experts(self):
+        """Alias for num_local_experts (the field transformers' DeepseekV3Experts actually reads) so the two."""
+        return self.num_local_experts
+
+    @n_routed_experts.setter
+    def n_routed_experts(self, value):
+        self.num_local_experts = value
 
 
 class KairosCache(DynamicCache):
-    """Cache for block-diffusion inference: `.clone()` before each denoising step to avoid state leaking across steps."""
+    """Cache for block-diffusion inference: `.clone()` before each denoising step to avoid state."""
 
     def __init__(self, config):
         super().__init__()
@@ -180,19 +188,65 @@ class KairosMultiCache(DynamicCache):
         return out
 
 
+class KairosMemoryGate(nn.Module):
+    """Cross-attention gate over a low-rank bottleneck; blends state_t with a memory bank, no-op if empty."""
+
+    def __init__(self, state_dim, bottleneck_dim=None):
+        super().__init__()
+        self.bottleneck_dim = bottleneck_dim or max(8, round(math.sqrt(state_dim)))
+        self.down = nn.Linear(state_dim, self.bottleneck_dim)
+        self.up = nn.Linear(self.bottleneck_dim, state_dim)
+        self.context_attn = nn.MultiheadAttention(self.bottleneck_dim, num_heads=1, batch_first=True)
+
+    def forward(self, state_t, memory=None):
+        """state_t: (B, D). memory: (M, D) or None. Returns (B, D)."""
+        if memory is None or memory.size(0) == 0:
+            return state_t
+        if memory.size(0) == 1:
+            return memory[0].expand_as(state_t).contiguous()
+        q = self.down(state_t).unsqueeze(1)
+        kv = torch.cat([q, self.down(memory).unsqueeze(0).expand(state_t.size(0), -1, -1)], dim=1)
+        out, _ = self.context_attn(q, kv, kv)
+        return self.up(out.squeeze(1))
+
+
+def gate_memory_bank(model, memory_caches: list, batch_size: int) -> "KairosMultiCache":
+    """Builds initial ssm_caches by gating a zero state_t against memory_caches; no-op layers stay None."""
+    new_cache = KairosMultiCache(model.config)
+    gate = model.memory_gate
+    if gate is None:
+        return new_cache
+    for scale_idx, backbone in enumerate(model.backbones):
+        for layer_idx in backbone.deltanet_layer_indices:
+            parts = []
+            per_row_shape = None
+            for c in memory_caches:
+                s = c.caches[scale_idx].ssm_caches[layer_idx]
+                if s is not None:
+                    per_row_shape = s.shape[1:]
+                    parts.append(s.reshape(s.shape[0], -1))
+            if not parts:
+                continue
+            memory = torch.cat(parts, dim=0)
+            state_t = memory.new_zeros(batch_size, memory.shape[1])
+            blended = gate(state_t, memory)
+            new_cache.caches[scale_idx].ssm_caches[layer_idx] = blended.reshape(batch_size, *per_row_shape)
+    return new_cache
+
+
 class KairosFFN(Qwen2MoeMLP):
     pass
 
 
 class KairosMoE(DeepseekV3MoE):
-    """DeepseekV3MoE's expert weights are raw torch.empty() tensors, never initialized by default; fixed here on self.experts/self.gate (version-stable) instead of via fragile isinstance checks on internal class names."""
+    """DeepseekV3MoE's expert weights are raw torch.empty() tensors, never initialized by default; fixed."""
 
     def __init__(self, config):
         super().__init__(config)
         std = getattr(config, "initializer_range", 0.02)
         self.experts.gate_up_proj.data.normal_(mean=0.0, std=std)
         self.experts.down_proj.data.normal_(mean=0.0, std=std)
-        self.gate.weight.data.normal_(mean=0.0, std=std)  # was torch.zeros() at construction; fine either way
+        self.gate.weight.data.normal_(mean=0.0, std=std)  # was torch.zeros() at construction; fine
 
 
 class DiffusionBlock(nn.Module):
@@ -236,7 +290,7 @@ class KairosAttnRes(nn.Module):
 
 
 class KairosDiffusionBackbone(nn.Module):
-    """v3 Block-AttnRes: prior layer outputs are windowed into blocks of `attnres_block_size` before aggregation, cost O(N/S)."""
+    """v3 Block-AttnRes: prior layer outputs are windowed into blocks of `attnres_block_size` before."""
 
     def __init__(self, config, use_moe=False):
         super().__init__()
@@ -244,11 +298,12 @@ class KairosDiffusionBackbone(nn.Module):
         self.norm = KairosNorm(config.hidden_size)
         self.aggregator = KairosAttnRes(config.hidden_size)
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
+        self.deltanet_layer_indices = [i for i, lt in enumerate(config.layers_config) if "d" in lt]
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         emb = x
-        completed = []  # finalized block-sums of prior layer outputs
-        partial = None  # running sum of the current (unfinished) block
+        completed = []  # finalized block-sums of prior layer
+        partial = None  # running sum of the current
         in_block = 0
         S = self.attnres_block_size
 
@@ -279,11 +334,13 @@ class KairosEmbedding(nn.Module):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.modality_embed = nn.Embedding(num_modalities, d_model)
+        self.fusion_proj = nn.Linear(d_model * 2, d_model)
         self.scale = d_model**0.5
 
     def forward(self, token_ids, modality_ids):
-        h = self.token_embed(token_ids)
-        h = h + self.modality_embed(modality_ids)
+        tok = self.token_embed(token_ids)
+        mod = self.modality_embed(modality_ids)
+        h = self.fusion_proj(torch.cat([tok, mod], dim=-1))
         h = h * self.scale
         return h
 
@@ -304,7 +361,7 @@ class OutputHead(nn.Module):
 
 
 class KairosScaleRouter(nn.Module):
-    """Gathers active positions per scale into a padded batch, runs the backbone once per scale, and scatters back."""
+    """Gathers active positions per scale into a padded batch, runs the backbone."""
 
     def __init__(self, modality_scales):
         super().__init__()
@@ -426,13 +483,19 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         self.backbones = nn.ModuleList(
             [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
         )
+        if getattr(config, "use_memory_gate", False):
+            head_dim = config.hidden_size // config.num_attention_heads
+            state_dim = config.num_attention_heads * head_dim * 2 * head_dim
+            self.memory_gate = KairosMemoryGate(state_dim=state_dim)
+        else:
+            self.memory_gate = None
         self.rotary = KairosRotaryEmbedding(config, config.head_dim)
         self.norm = KairosNorm(config.hidden_size)
         self.lm_head = OutputHead(self.embedding)
-        self.post_init()  # triggers _init_weights on every submodule/parameter below
+        self.post_init()  # triggers _init_weights on every submodule/parameter
 
     def _init_weights(self, module):
-        """Every PreTrainedModel subclass must define this (the base class default is a no-op). MoE expert/router weights are handled separately in KairosMoE.__init__ itself, not here - see that class for why."""
+        """Every PreTrainedModel subclass must define this (the base class default is a."""
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
@@ -453,7 +516,7 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
     ):
         x = decoder_input_ids if decoder_input_ids is not None else input_ids
         if x is None:
-            raise ValueError()
+            raise ValueError("either input_ids or decoder_input_ids must be provided")
         if modality_ids is None:
             modality_ids = torch.full_like(x, self.config.text_modality_id)
         h = self.embedding(token_ids=x, modality_ids=modality_ids)

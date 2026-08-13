@@ -73,6 +73,16 @@ partition "3. KairosDiffusionBackbone" #FEF9E7 {
             * Gated delta rule (chunk / recurrent)
             * Causal Conv1d on Q/K/V
         end note
+        if (use_memory_bank?) then (yes)
+            :KairosMemoryBank\nlearnable slots, cross-attend\nover prev batch's ssm_cache;
+            note right
+                * One bank per (scale, DeltaNet layer)
+                * write(): slots attend over prev batch (any size)
+                * read(): current batch attends over slots (any size)
+                * Inert unless explicitly invoked —
+                  plain forward()/generate() ignores it
+            end note
+        endif
     end fork
 
     :KairosLiZAttention2 — Merge\nShared Q/K/V/O projections (LiZ)\nconcat(SWA, Delta) → out_proj;

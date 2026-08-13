@@ -6,7 +6,7 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    # marimo without widget for Jupyter/Colab compatibility. (but only ok with mo.status.progress_bar) -
+    # marimo without widget for Jupyter/Colab compatibility.
     import marimo as mo
 
     return (mo,)
@@ -14,7 +14,7 @@ def _():
 
 @app.cell
 def _():
-    # !pip install -q -e ".[notebook]"   # uncomment on a bare Colab/Kaggle
+    # !pip install -q -e ".[notebook]" #
     import random
     from pathlib import Path
 
@@ -47,12 +47,12 @@ def _():
 @app.cell
 def _():
     # ---- data settings ----
-    MULTIMODAL_SOURCE = "hf"  # "hf" or "local" (.pt built by build_keep_it_simple_multimodal.py)
+    MULTIMODAL_SOURCE = "hf"  # "hf" or "local" (.pt built
     MULTIMODAL_LOCAL_PATH = "data/keep-it-simple-multimodal.pt"
     BUILD_LOCAL_IF_MISSING = False
 
-    TEXT_SOURCE = "hf"  # "hf" (ffurfaro/keep-it-simple) or "inline" (tiny built-in sample)
-    TEXT_PCT = 2  # % of keep-it-simple to load, only used if TEXT_SOURCE == "hf"
+    TEXT_SOURCE = "hf"  # "hf" (ffurfaro/keep-it-simple) or "inline" (tiny
+    TEXT_PCT = 2  # % of keep-it-simple to load,
 
     EVAL_PCT = 10  # % held out for eval
     return (
@@ -123,7 +123,7 @@ def _(multimodal_examples, pd, text_examples):
 
 @app.cell
 def _():
-    SHOW_PREVIEW = True  # set False to skip decoding/plotting sample content
+    SHOW_PREVIEW = True  # set False to skip decoding/plotting
     return (SHOW_PREVIEW,)
 
 
@@ -205,8 +205,8 @@ def _(EVAL_PCT, multimodal_examples, random, text_examples):
 @app.cell
 def _():
     # ---- model settings ----
-    # modality_scales routes each modality to a PyramidalConvCodec scale; attnres_block_size sets
-    # the v3 Block-AttnRes window (1 = classic AttnRes)
+    # modality_scales routes each modality to a
+    # the v3 Block-AttnRes window (1 =
     CFG_D_MODEL = 88
     CFG_N_HEADS = 4
     CFG_N_LAYERS = 4
@@ -217,6 +217,7 @@ def _():
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
     CFG_INTERMEDIATE = 352
+    CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     return (
         CFG_ATTNRES_BLOCK,
         CFG_D_MODEL,
@@ -228,12 +229,13 @@ def _():
         CFG_N_LAYERS,
         CFG_SHARED_EXPERTS,
         CFG_STRIDE,
+        CFG_USE_MEMORY_BANK,
     )
 
 
 @app.cell
 def _(Modality):
-    # scale 0: finest temporal res (text, control) · 1: images/lidar · 2: audio/video frames · 3: coarse/META
+    # scale 0: finest temporal res (text,
     modality_scales = {
         int(Modality.TEXT): [0, 1],
         int(Modality.STATE): [0],
@@ -259,6 +261,7 @@ def _(
     CFG_N_LAYERS,
     CFG_SHARED_EXPERTS,
     CFG_STRIDE,
+    CFG_USE_MEMORY_BANK,
     KairosConfig,
     modality_scales,
     tokenizer,
@@ -277,13 +280,14 @@ def _(
         intermediate_size=CFG_INTERMEDIATE,
         moe_intermediate_size=CFG_INTERMEDIATE,
         n_routed_experts=CFG_EXPERTS if use_moe else 8,
-        num_local_experts=CFG_EXPERTS if use_moe else 8,  # DeepseekV3MoE backend reads this one, not n_routed_experts
+        num_local_experts=CFG_EXPERTS if use_moe else 8,  # DeepseekV3MoE backend reads this one,
         num_experts_per_tok=CFG_EXPERTS_PER_TOK,
         n_shared_experts=CFG_SHARED_EXPERTS,
         use_moe=use_moe,
         attnres_block_size=CFG_ATTNRES_BLOCK,
+        use_memory_gate=CFG_USE_MEMORY_BANK,
     )
-    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}")
+    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}")
     return (model_config,)
 
 
@@ -296,20 +300,26 @@ def _():
     TRAIN_MAX_LEN = 1024
     TRAIN_STRIDE = 3
     TRAIN_SAVE_EVERY = 200
-    TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to auto-resume
+    TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to
+
+    # ---- packing: concatenate samples before chunking
+    TRAIN_PACK = True
 
     # ---- HF hub push-per-checkpoint (optional) ----
-    HUB_REPO_ID = None  # e.g. "ffurfaro/kairos" - set to also push each checkpoint as it's saved
+    HUB_REPO_ID = None  # e.g. "ffurfaro/kairos" - set to
     HUB_PUSH_EVERY_CKPT = False
     HUB_PRIVATE = False
+    HUB_SUBFOLDER = None  # e.g. "run_01" - push under
     return (
         HUB_PRIVATE,
         HUB_PUSH_EVERY_CKPT,
         HUB_REPO_ID,
+        HUB_SUBFOLDER,
         TRAIN_BATCH,
         TRAIN_EPOCHS,
         TRAIN_LR,
         TRAIN_MAX_LEN,
+        TRAIN_PACK,
         TRAIN_RUN_DIR,
         TRAIN_SAVE_EVERY,
         TRAIN_STRIDE,
@@ -322,10 +332,12 @@ def _(
     HUB_PRIVATE,
     HUB_PUSH_EVERY_CKPT,
     HUB_REPO_ID,
+    HUB_SUBFOLDER,
     TRAIN_BATCH,
     TRAIN_EPOCHS,
     TRAIN_LR,
     TRAIN_MAX_LEN,
+    TRAIN_PACK,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
     TRAIN_STRIDE,
@@ -339,6 +351,7 @@ def _(
         max_len=TRAIN_MAX_LEN,
         stride=TRAIN_STRIDE,
         batch_size=TRAIN_BATCH,
+        pack=TRAIN_PACK,
     )
     eval_data_config = DataConfig(
         text_examples=[],
@@ -357,6 +370,7 @@ def _(
         hub_repo_id=HUB_REPO_ID,
         hub_push_every_ckpt=HUB_PUSH_EVERY_CKPT,
         hub_private=HUB_PRIVATE,
+        hub_subfolder=HUB_SUBFOLDER,
     )
     return data_config, eval_data_config, train_config
 
@@ -387,8 +401,8 @@ def _(
 
 @app.cell
 def _():
-    # compute-cost summary: params/memory instantly, plus an estimated total training time from a
-    # few real timed steps (state is restored right after, so this doesn't affect training below)
+    # compute-cost summary: params/memory instantly, plus an
+    # few real timed steps (state is
     RUN_BENCHMARK = True
     N_BENCH_STEPS = 5
     return N_BENCH_STEPS, RUN_BENCHMARK
@@ -403,10 +417,10 @@ def _(N_BENCH_STEPS, RUN_BENCHMARK, pipe):
 
 @app.cell
 def _(pd, pipe):
-    # visualize the tokenized input exactly as the model receives it (post-tokenization,
-    # post-collation) - use this to rule data in/out before suspecting the architecture.
-    # note: a single row can (and often does) mix several modalities at once, since text/image/
-    # audio/... segments get concatenated into one token sequence before chunking.
+    # visualize the tokenized input exactly as
+    # post-collation) - use this to rule
+    # note: a single row can (and
+    # audio/... segments get concatenated into one
     _reports = pipe.inspect_batch(n=1)
     _table = pd.DataFrame(
         [
@@ -414,8 +428,8 @@ def _(pd, pipe):
                 "row": r["row"],
                 "modality_counts": r["modality_counts"],
                 "token_id_range": r["token_id_range"],
-                "top_token_ids": r["top_token_ids"],  # [(id, count), ...] - most frequent raw ids
-                "max_repeat_run": r["max_repeat_run"],  # longest run of one id repeated in a row
+                "top_token_ids": r["top_token_ids"],  # [(id, count), ...] - most
+                "max_repeat_run": r["max_repeat_run"],  # longest run of one id
                 "out_of_bounds_tokens": len(r["out_of_bounds"]["token_ids"]),
                 "out_of_bounds_modality": len(r["out_of_bounds"]["modality_ids"]),
                 "pad_frac": round(r["pad_frac"], 3) if r["pad_frac"] is not None else None,
@@ -427,11 +441,11 @@ def _(pd, pipe):
     if n_oob:
         print(f"WARNING: {n_oob} out-of-bounds ids found in this batch - inspect before training")
     max_run = max(r["max_repeat_run"]["length"] for r in _reports)
-    if max_run > 50:  # arbitrary but generous threshold; a real sequence rarely repeats this much
+    if max_run > 50:  # arbitrary but generous threshold; a
         print(f"WARNING: a row repeats the same token id {max_run} times in a row - likely corrupted")
     print(_table.to_string())
 
-    # raw numeric view of the first row: exactly what the embedding layer indexes with
+    # raw numeric view of the first
     print("\nrow 0 input_ids  :", _reports[0]["input_ids"])
     print("row 0 modality_ids:", _reports[0]["modality_ids"])
     return
@@ -439,7 +453,7 @@ def _(pd, pipe):
 
 @app.cell
 def _():
-    FORCE_RESTART = True  # True ignores any existing last.pt / hub checkpoint and starts from step 0
+    FORCE_RESTART = True  # True ignores any existing last.pt
     return (FORCE_RESTART,)
 
 
@@ -520,7 +534,7 @@ def _(logs_df):
 
 @app.cell
 def _(pipe):
-    # diffusion loss masked per modality, so a router-ignored one can't hide behind the global average
+    # diffusion loss masked per modality, so
     per_modality = pipe.check_per_modality_loss(n_batches=10)
     for _k, _v in sorted(per_modality.items(), key=lambda kv: -kv[1]):
         print(f"{_k}: {_v:.4f}")
@@ -529,8 +543,8 @@ def _(pipe):
 
 @app.cell
 def _():
-    # not needed for a simple crash-recovery (training already auto-resumes from last.pt or the hub) -
-    # use this only to load a *different* checkpoint, e.g. best.pt or an older step_*.pt
+    # not needed for a simple crash-recovery
+    # use this only to load a
     RESUME_CKPT_PATH = ""
     return (RESUME_CKPT_PATH,)
 
@@ -547,7 +561,7 @@ def _(RESUME_CKPT_PATH, pipe):
 
 @app.cell
 def _():
-    PUSH_FULL_MODEL_TO_HUB = False  # pushes weights+config+model card, on top of any per-checkpoint pushes above
+    PUSH_FULL_MODEL_TO_HUB = False  # pushes weights+config+model card, on top
     FULL_MODEL_HUB_REPO_ID = "ffurfaro/kairos"
     return FULL_MODEL_HUB_REPO_ID, PUSH_FULL_MODEL_TO_HUB
 

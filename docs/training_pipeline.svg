@@ -1,0 +1,139 @@
+<svg viewBox="0 0 900 1230" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+  </defs>
+  <style>
+    .box { stroke:#333; stroke-width:1.4; }
+    .lbl { font-size:14px; fill:#111; text-anchor:middle; }
+    .lbl-sm { font-size:11.5px; fill:#333; text-anchor:middle; }
+    .title { font-size:20px; font-weight:bold; text-anchor:middle; fill:#111; }
+    .sub { font-size:12px; fill:#555; text-anchor:middle; }
+    .arr { stroke:#333; stroke-width:1.6; fill:none; marker-end:url(#arrow2); }
+    .arrd { stroke:#999; stroke-width:1.4; stroke-dasharray:4 3; fill:none; marker-end:url(#arrow2); }
+  </style>
+
+  <text x="450" y="32" class="title">KairosMultimodalPipeline — Training Flow</text>
+
+  <!-- Data -->
+  <rect x="130" y="55" width="640" height="110" rx="8" class="box" fill="#eef2ff"/>
+  <text x="450" y="78" class="lbl" font-weight="bold">DataConfig → KairosPretrainingDataset</text>
+  <rect x="155" y="92" width="185" height="55" rx="5" class="box" fill="#fff"/>
+  <text x="247" y="112" class="lbl-sm">text / multimodal</text>
+  <text x="247" y="128" class="lbl-sm">examples or path</text>
+  <rect x="357" y="92" width="185" height="55" rx="5" class="box" fill="#fff"/>
+  <text x="450" y="112" class="lbl-sm">tokenize + chunk</text>
+  <text x="450" y="128" class="lbl-sm">pack=True: concat before chunk</text>
+  <rect x="559" y="92" width="185" height="55" rx="5" class="box" fill="#fff"/>
+  <text x="652" y="112" class="lbl-sm">DataLoader</text>
+  <text x="652" y="128" class="lbl-sm">batch_size, shuffle, drop_last</text>
+
+  <line x1="450" y1="165" x2="450" y2="195" class="arr"/>
+
+  <!-- build() -->
+  <rect x="130" y="195" width="640" height="130" rx="8" class="box" fill="#f0fdf4"/>
+  <text x="450" y="218" class="lbl" font-weight="bold">pipe.build()</text>
+  <text x="450" y="238" class="lbl-sm">KairosDiffusionLLM(model_config) → AdamW → CosineAnnealingLR</text>
+  <text x="450" y="256" class="lbl-sm">ckpt_dir / tensorboard dir created</text>
+  <text x="450" y="274" class="lbl-sm">training_config.json written (model_config + train_config + data_config)</text>
+  <text x="450" y="292" class="lbl-sm">hub_repo_id set + hub_push_every_ckpt: create_repo() up front</text>
+  <text x="450" y="310" class="lbl-sm">resume=True: local last.pt, else hub last.pt, else fresh start</text>
+
+  <line x1="450" y1="325" x2="450" y2="355" class="arr"/>
+
+  <!-- per-step loop -->
+  <rect x="90" y="355" width="720" height="430" rx="8" class="box" fill="#fdf4ff"/>
+  <text x="450" y="378" class="lbl" font-weight="bold">train() — per step, for each batch</text>
+
+  <rect x="120" y="395" width="300" height="70" rx="6" class="box" fill="#fff"/>
+  <text x="270" y="415" class="lbl-sm" font-weight="bold">state_carry=True</text>
+  <text x="270" y="432" class="lbl-sm">random_state_carry_plan(batch_size)</text>
+  <text x="270" y="448" class="lbl-sm">build_carried_cache(prev_cache, plan)</text>
+  <text x="270" y="461" class="lbl-sm">DeltaNet layers only, 0/carry/sum</text>
+
+  <rect x="480" y="395" width="300" height="70" rx="6" class="box" fill="#fff"/>
+  <text x="630" y="415" class="lbl-sm" font-weight="bold">inspect_batch() (debug)</text>
+  <text x="630" y="432" class="lbl-sm">decoded preview, modality counts</text>
+  <text x="630" y="448" class="lbl-sm">out-of-bounds ids, repeat runs</text>
+
+  <line x1="270" y1="465" x2="270" y2="495" class="arrd"/>
+  <line x1="630" y1="465" x2="630" y2="495" class="arrd"/>
+
+  <rect x="150" y="495" width="600" height="60" rx="6" class="box" fill="#dbeafe"/>
+  <text x="450" y="518" class="lbl-sm" font-weight="bold">hf_trainer.compute_loss(model, batch, cache_params)</text>
+  <text x="450" y="536" class="lbl-sm">masked-diffusion forward → loss</text>
+
+  <line x1="450" y1="555" x2="450" y2="580" class="arr"/>
+
+  <!-- nan branch -->
+  <polygon points="450,580 560,615 450,650 340,615" class="box" fill="#fee2e2"/>
+  <text x="450" y="611" class="lbl-sm">loss finite?</text>
+  <text x="450" y="626" class="lbl-sm">math.isfinite</text>
+
+  <line x1="340" y1="615" x2="180" y2="615" class="arr"/>
+  <text x="255" y="605" class="lbl-sm">no</text>
+  <rect x="90" y="590" width="90" height="55" rx="5" class="box" fill="#fff"/>
+  <text x="135" y="608" class="lbl-sm">skip batch</text>
+  <text x="135" y="622" class="lbl-sm">log to</text>
+  <text x="135" y="635" class="lbl-sm">nan_log</text>
+
+  <line x1="90" y1="617" x2="60" y2="617" class="arrd"/>
+  <text x="30" y="600" class="lbl-sm" transform="rotate(-90 30 600)">consecutive ≥ max</text>
+  <rect x="10" y="590" width="55" height="55" rx="5" class="box" fill="#fecaca"/>
+  <text x="37" y="608" class="lbl-sm">raise</text>
+  <text x="37" y="620" class="lbl-sm">+ locate</text>
+  <text x="37" y="632" class="lbl-sm">_nan_source()</text>
+
+  <line x1="560" y1="615" x2="700" y2="615" class="arr"/>
+  <text x="630" y="605" class="lbl-sm">yes</text>
+  <rect x="700" y="590" width="90" height="55" rx="5" class="box" fill="#dcfce7"/>
+  <text x="745" y="608" class="lbl-sm">backward()</text>
+  <text x="745" y="622" class="lbl-sm">clip_grad_norm</text>
+  <text x="745" y="635" class="lbl-sm">optimizer.step()</text>
+
+  <line x1="745" y1="645" x2="745" y2="665" class="arrd"/>
+  <line x1="745" y1="665" x2="450" y2="665" class="arrd"/>
+  <line x1="450" y1="665" x2="450" y2="685" class="arr"/>
+
+  <rect x="150" y="685" width="600" height="80" rx="6" class="box" fill="#fff"/>
+  <text x="450" y="705" class="lbl-sm" font-weight="bold">logging + checkpointing</text>
+  <text x="450" y="722" class="lbl-sm">tensorboard scalars, log_rows, progress_callback(step, total, loss)</text>
+  <text x="450" y="739" class="lbl-sm">last.pt every last_ckpt_every steps · step_*.pt every save_every</text>
+  <text x="450" y="756" class="lbl-sm">state_carry: prev_cache ← this step's final cache</text>
+
+  <!-- epoch end -->
+  <line x1="450" y1="765" x2="450" y2="795" class="arr"/>
+  <rect x="200" y="795" width="500" height="55" rx="6" class="box" fill="#fff"/>
+  <text x="450" y="815" class="lbl-sm" font-weight="bold">epoch end</text>
+  <text x="450" y="832" class="lbl-sm">avg_loss &lt; best_loss → best.pt (+ hub push if configured)</text>
+
+  <line x1="450" y1="850" x2="450" y2="890" class="arrd"/>
+  <text x="470" y="875" class="lbl-sm">next epoch</text>
+
+  <!-- after loop -->
+  <line x1="450" y1="785" x2="450" y2="905" class="arr" transform="translate(0,0)"/>
+  <rect x="220" y="905" width="460" height="46" rx="6" class="box" fill="#f0fdf4"/>
+  <text x="450" y="925" class="lbl-sm" font-weight="bold">training complete</text>
+  <text x="450" y="940" class="lbl-sm">last.pt removed · writer flushed/closed · log_rows returned</text>
+
+  <line x1="450" y1="951" x2="450" y2="980" class="arr"/>
+
+  <!-- push_to_hub -->
+  <rect x="90" y="980" width="720" height="220" rx="8" class="box" fill="#fef9c3"/>
+  <text x="450" y="1003" class="lbl" font-weight="bold">pipe.push_to_hub(repo_id, subfolder=None)</text>
+  <text x="450" y="1023" class="lbl-sm">subfolder set → repo_id/&lt;subfolder&gt;/... , else repo root</text>
+
+  <rect x="120" y="1038" width="330" height="60" rx="5" class="box" fill="#fff"/>
+  <text x="285" y="1058" class="lbl-sm">model_config.save_pretrained()</text>
+  <text x="285" y="1073" class="lbl-sm">state_dict() → pytorch_model.bin</text>
+  <text x="285" y="1088" class="lbl-sm">(bypasses tied-weight safetensors check)</text>
+
+  <rect x="460" y="1038" width="330" height="60" rx="5" class="box" fill="#fff"/>
+  <text x="625" y="1058" class="lbl-sm">upload_folder: checkpoints/, tensorboard/</text>
+  <text x="625" y="1073" class="lbl-sm">upload_file: training_config.json</text>
+  <text x="625" y="1088" class="lbl-sm">upload_file: README.md (model_card.md template)</text>
+
+  <text x="450" y="1120" class="sub">multiple configs/runs can share one repo_id via distinct subfolder values</text>
+  <text x="450" y="1140" class="sub">each subfolder is independently loadable: from_pretrained(repo_id, subfolder=...)</text>
+</svg>

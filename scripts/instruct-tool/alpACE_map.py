@@ -22,7 +22,7 @@ def extract_function_block(system: str):
                 try:
                     json.loads(block)
                     return block
-                except Exception:
+                except json.JSONDecodeError:
                     return None
     return None
 
@@ -35,10 +35,9 @@ def extract_all_user_and_toolcalls(conversations):
         value = msg.get("value", "").strip()
         if sender == "user":
             last_user = msg
-        elif sender == "assistant" and value.startswith("["):
-            if last_user:
-                inputs.append(last_user)
-                outputs.append(msg)
+        elif sender == "assistant" and value.startswith("[") and last_user:
+            inputs.append(last_user)
+            outputs.append(msg)
     return inputs, outputs
 
 

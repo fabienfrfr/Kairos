@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"] # every branch, not just main
+  pull_request: # also covers fork PRs, which "push" alone can't see
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv run ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: setuptools_scm needs tags to compute a version
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --group dev
+      - run: uv run pytest -q --cov=kairos --cov-report=term-missing
