@@ -32,7 +32,7 @@ dependencies = [
     "pathspec>=1.1.1",
     "tensorboard>=2.19.0",
     "torch>=2.10.0",
-    "transformers>=5.12.1", # mandatory for gemma
+    "transformers>=5.15.0", # mandatory for gemma
 ]
 
 [project.urls]

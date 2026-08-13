@@ -217,6 +217,7 @@ def _():
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
     CFG_INTERMEDIATE = 352
+    CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     return (
         CFG_ATTNRES_BLOCK,
         CFG_D_MODEL,
@@ -228,6 +229,7 @@ def _():
         CFG_N_LAYERS,
         CFG_SHARED_EXPERTS,
         CFG_STRIDE,
+        CFG_USE_MEMORY_BANK,
     )
 
 
@@ -259,6 +261,7 @@ def _(
     CFG_N_LAYERS,
     CFG_SHARED_EXPERTS,
     CFG_STRIDE,
+    CFG_USE_MEMORY_BANK,
     KairosConfig,
     modality_scales,
     tokenizer,
@@ -282,6 +285,7 @@ def _(
         n_shared_experts=CFG_SHARED_EXPERTS,
         use_moe=use_moe,
         attnres_block_size=CFG_ATTNRES_BLOCK,
+        use_memory_gate=CFG_USE_MEMORY_BANK,
     )
     print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}")
     return (model_config,)

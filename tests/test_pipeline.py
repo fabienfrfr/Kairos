@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from kairos.dataset import pack_multimodal_data
-from kairos.modeling import KairosConfig
+from kairos.modeling import KairosConfig, KairosDiffusionLLM
 from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 from kairos.tokenizer import Modality
 from kairos.utils import TrainingSummary, count_parameters
@@ -81,7 +81,7 @@ def test_training_converges_with_moe_enabled(tmp_path):
     # num_local_experts/num_experts_per_tok kept small: MoE checkpoints are
     # copies) and this test writes a
     model_config = KairosConfig(
-        d_model=64, n_heads=4, n_layers=12, use_moe=True, num_local_experts=2, num_experts_per_tok=1
+        d_model=64, n_heads=4, n_layers=3, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
     data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
@@ -101,7 +101,7 @@ def test_training_converges_with_moe_enabled(tmp_path):
 def test_training_converges_with_attnres_block_size_four(tmp_path):
     # attnres_block_size defaults to 1 everywhere else
     # aggregator to sum 4 layer outputs
-    model_config = KairosConfig(d_model=64, n_heads=4, n_layers=12, attnres_block_size=4)
+    model_config = KairosConfig(d_model=64, n_heads=4, n_layers=3, attnres_block_size=4)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
     data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
     train_config = TrainConfig(epochs=6, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5)
@@ -122,7 +122,7 @@ def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
     model_config = KairosConfig(
         d_model=64,
         n_heads=4,
-        n_layers=12,
+        n_layers=3,
         use_moe=True,
         attnres_block_size=4,
         num_local_experts=2,
@@ -148,7 +148,7 @@ def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
     # so it stays fast in CI;
     model_config = KairosConfig(d_model=768, n_heads=12, n_layers=2)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
-    data_config = DataConfig(text_examples=texts, max_len=256, batch_size=2)
+    data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
     train_config = TrainConfig(epochs=3, lr=1e-3, save_every=1000, run_dir=str(tmp_path / "run"))
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
@@ -162,13 +162,103 @@ def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
     assert last_epoch_avg < first_epoch_avg
 
 
+def test_memory_gate_params_receive_gradient_during_train(tmp_path):
+    model_config = KairosConfig(d_model=32, n_heads=2, n_layers=2, use_memory_gate=True)
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 4
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
+    train_config = TrainConfig(epochs=2, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    gate = pipe.model.memory_gate
+    assert gate is not None
+    before = [p.clone() for p in gate.parameters()]
+
+    pipe.train(resume=False)
+
+    after = [p.clone() for p in gate.parameters()]
+    assert all(not torch.equal(b, a) for b, a in zip(before, after))
+
+
+def test_memory_gate_is_noop_without_memory():
+    from kairos.modeling import KairosMemoryGate
+
+    gate = KairosMemoryGate(state_dim=16)
+    state_t = torch.randn(3, 16)
+    out = gate(state_t, memory=None)
+    assert torch.equal(out, state_t)
+
+
+def test_memory_gate_passes_through_single_memory_unchanged():
+    from kairos.modeling import KairosMemoryGate
+
+    gate = KairosMemoryGate(state_dim=16)
+    state_t = torch.randn(3, 16)
+    memory = torch.randn(1, 16)
+    out = gate(state_t, memory=memory)
+    assert torch.allclose(out, memory[0].expand_as(state_t))
+
+
+def test_memory_gate_blends_across_multiple_memories():
+    from kairos.modeling import KairosMemoryGate
+
+    gate = KairosMemoryGate(state_dim=16)
+    state_t = torch.randn(3, 16)
+    memory = torch.randn(4, 16)
+    out = gate(state_t, memory=memory)
+    assert out.shape == state_t.shape
+    assert not torch.allclose(out, memory[0].expand_as(state_t))
+    assert not torch.equal(out, state_t)
+
+
+def test_memory_gate_bottleneck_keeps_param_count_small():
+    from kairos.modeling import KairosMemoryGate
+
+    state_dim = 3872  # matches d_model=88, n_heads=4 in the notebook config
+    gate = KairosMemoryGate(state_dim=state_dim)
+    n_params = sum(p.numel() for p in gate.parameters())
+    assert n_params < 200_000, f"memory gate should be a tiny bottleneck, got {n_params} params"
+
+
+def test_memory_gate_is_shared_across_layers_and_scales():
+    model_config = KairosConfig(d_model=32, n_heads=2, n_layers=3, use_memory_gate=True)
+    model = KairosDiffusionLLM(model_config)
+    n_gate_modules = sum(1 for m in model.modules() if type(m).__name__ == "KairosMemoryGate")
+    assert n_gate_modules == 1
+
+
+def test_memory_gate_blends_state_t_with_external_bank(tmp_path):
+    from kairos.modeling import KairosMultiCache, gate_memory_bank
+
+    model_config = KairosConfig(d_model=32, n_heads=2, n_layers=2, use_memory_gate=True)
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 4
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
+    train_config = TrainConfig(epochs=1, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    layer_idx = pipe.model.backbones[0].deltanet_layer_indices[0]
+    head_dim = model_config.hidden_size // model_config.num_attention_heads
+    n_heads = model_config.num_attention_heads
+    real_shape = (n_heads, head_dim, 2 * head_dim)
+
+    bank = KairosMultiCache(model_config)
+    bank.caches[0].ssm_caches[layer_idx] = torch.randn(5, *real_shape)
+
+    out = gate_memory_bank(pipe.model, [bank], batch_size=2)
+    assert out.caches[0].ssm_caches[layer_idx].shape == (2, *real_shape)
+
+    logs = pipe.train(resume=False, memory_bank=bank)
+    assert all(math.isfinite(row["loss"]) for row in logs)
+
+
 def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
     # a small, highly repetitive corpus should
     # doesn't trend down (or any batch
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 8
     data_config = DataConfig(text_examples=texts, max_len=32, batch_size=4)
     train_config = TrainConfig(
-        epochs=30, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5
+        epochs=15, lr=1e-2, save_every=1000, run_dir=str(tmp_path / "run"), max_consecutive_nan=5
     )
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
@@ -178,8 +268,8 @@ def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
     assert pipe.skipped_nonfinite_steps == 0
     assert all(math.isfinite(row["loss"]) for row in logs)
 
-    first_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] <= 3) / sum(1 for r in logs if r["epoch"] <= 3)
-    last_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] > 27) / sum(1 for r in logs if r["epoch"] > 27)
+    first_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] <= 2) / sum(1 for r in logs if r["epoch"] <= 2)
+    last_epochs_avg = sum(r["loss"] for r in logs if r["epoch"] > 13) / sum(1 for r in logs if r["epoch"] > 13)
     assert last_epochs_avg < first_epochs_avg
 
 

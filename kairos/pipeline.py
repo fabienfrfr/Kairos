@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .dataset import KairosPretrainingDataset
-from .modeling import KairosConfig, KairosDiffusionLLM, KairosMultiCache, pool_batch_states
+from .modeling import KairosConfig, KairosDiffusionLLM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
@@ -191,8 +191,10 @@ class KairosMultimodalPipeline:
         if self.model is None:
             raise RuntimeError("call .build() before .train()/.check_per_modality_loss()")
 
-    def train(self, progress_callback=None, resume: bool = True) -> list[dict]:
-        """Runs the training loop; resumes from local last.pt or, failing that, the."""
+    def train(
+        self, progress_callback=None, resume: bool = True, memory_bank: KairosMultiCache | None = None
+    ) -> list[dict]:
+        """Runs the training loop; resumes from local last.pt or the hub if unavailable."""
         self._require_built()
         tc = self.train_config
         self.model.train()
@@ -210,7 +212,7 @@ class KairosMultimodalPipeline:
         skipped_nonfinite = 0
         consecutive_nan = 0
         prev_cache = None
-        use_state_combiner = getattr(self.model_config, "use_state_combiner", False)
+        use_memory_gate = getattr(self.model_config, "use_memory_gate", False)
 
         try:
             for epoch in range(start_epoch, tc.epochs + 1):
@@ -219,26 +221,18 @@ class KairosMultimodalPipeline:
                     batch = {k: v.to(self.device) for k, v in batch.items()}
 
                     cache_params = None
-                    if use_state_combiner:
+                    if use_memory_gate:
                         cur_bsz = batch["input_ids"].size(0)
-                        cache_params = KairosMultiCache(self.model_config)
-                        if prev_cache is not None:
-                            # pool every row of batch t-1
-                            pooled = pool_batch_states(self.model, prev_cache)
-                            for scale_idx, scale_cache in enumerate(cache_params.caches):
-                                for layer_idx_str in self.model.backbones[scale_idx].state_combiners:
-                                    layer_idx = int(layer_idx_str)
-                                    one_row = pooled.caches[scale_idx].ssm_caches[layer_idx]
-                                    if one_row is not None:
-                                        expanded = one_row.expand(cur_bsz, *one_row.shape[1:]).contiguous()
-                                        scale_cache.ssm_caches[layer_idx] = expanded
-                        # else: nothing to combine yet (first
+                        memory_caches = [c for c in (prev_cache, memory_bank) if c is not None]
+                        if memory_caches:
+                            cache_params = gate_memory_bank(self.model, memory_caches, cur_bsz)
+                        else:
+                            cache_params = KairosMultiCache(self.model_config)
 
                     self.optimizer.zero_grad()
                     loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
                     loss_val = loss.item()
-                    if use_state_combiner:
-                        # cache_params now holds this step's own
+                    if use_memory_gate:
                         for scale_cache in cache_params.caches:
                             for layer_idx, s in enumerate(scale_cache.ssm_caches):
                                 if s is not None:

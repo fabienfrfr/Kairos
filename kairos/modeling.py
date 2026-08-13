@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch
@@ -93,7 +94,7 @@ class KairosConfig(PretrainedConfig):
         self.topk_group = kwargs.get("topk_group", 1)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", False)
         self.use_moe = kwargs.get("use_moe", False)
-        self.use_state_combiner = kwargs.get("use_state_combiner", False)  # combine_deltanet_caches()
+        self.use_memory_gate = kwargs.get("use_memory_gate", False)
 
         self.layers_config = kwargs.get("layers_config", ["ld"] * n_layers)
         self.slw_wsize = kwargs.get("slw_wsize", -1)
@@ -187,58 +188,49 @@ class KairosMultiCache(DynamicCache):
         return out
 
 
-class KairosStateCombiner(nn.Module):
-    """Learned, size-unbounded combination of K DeltaNet ssm_cache states via self-attention over the."""
+class KairosMemoryGate(nn.Module):
+    """Cross-attention gate over a low-rank bottleneck; blends state_t with a memory bank, no-op if empty."""
 
-    def __init__(self, state_dim, num_heads=4):
+    def __init__(self, state_dim, bottleneck_dim=None):
         super().__init__()
-        self.context_attn = nn.MultiheadAttention(state_dim, num_heads, batch_first=True)
-        self.score = nn.Sequential(nn.Linear(state_dim, state_dim), nn.Tanh(), nn.Linear(state_dim, 1))
+        self.bottleneck_dim = bottleneck_dim or max(8, round(math.sqrt(state_dim)))
+        self.down = nn.Linear(state_dim, self.bottleneck_dim)
+        self.up = nn.Linear(self.bottleneck_dim, state_dim)
+        self.context_attn = nn.MultiheadAttention(self.bottleneck_dim, num_heads=1, batch_first=True)
 
-    def forward(self, states):
-        """states: (K, state_dim), K unbounded (including 1)."""
-        if states.size(0) == 1:
-            return states[0]
-        context, _ = self.context_attn(states.unsqueeze(0), states.unsqueeze(0), states.unsqueeze(0))
-        weights = torch.softmax(self.score(context.squeeze(0)).squeeze(-1), dim=0)
-        return (weights.unsqueeze(-1) * states).sum(dim=0)
+    def forward(self, state_t, memory=None):
+        """state_t: (B, D). memory: (M, D) or None. Returns (B, D)."""
+        if memory is None or memory.size(0) == 0:
+            return state_t
+        if memory.size(0) == 1:
+            return memory[0].expand_as(state_t).contiguous()
+        q = self.down(state_t).unsqueeze(1)
+        kv = torch.cat([q, self.down(memory).unsqueeze(0).expand(state_t.size(0), -1, -1)], dim=1)
+        out, _ = self.context_attn(q, kv, kv)
+        return self.up(out.squeeze(1))
 
 
-def combine_deltanet_caches(model, caches: list) -> "KairosMultiCache":
-    """Combines multiple per-session caches (same batch layout, typically batch_size=1 each) via a."""
-    if not caches:
-        raise ValueError("combine_deltanet_caches needs at least one cache")
+def gate_memory_bank(model, memory_caches: list, batch_size: int) -> "KairosMultiCache":
+    """Builds initial ssm_caches by gating a zero state_t against memory_caches; no-op layers stay None."""
     new_cache = KairosMultiCache(model.config)
+    gate = model.memory_gate
+    if gate is None:
+        return new_cache
     for scale_idx, backbone in enumerate(model.backbones):
-        for layer_idx_str, combiner in backbone.state_combiners.items():
-            layer_idx = int(layer_idx_str)
-            states = [c.caches[scale_idx].ssm_caches[layer_idx] for c in caches]
-            states = [s for s in states if s is not None]
-            if not states:
+        for layer_idx in backbone.deltanet_layer_indices:
+            parts = []
+            per_row_shape = None
+            for c in memory_caches:
+                s = c.caches[scale_idx].ssm_caches[layer_idx]
+                if s is not None:
+                    per_row_shape = s.shape[1:]
+                    parts.append(s.reshape(s.shape[0], -1))
+            if not parts:
                 continue
-            batch_size = states[0].shape[0]
-            per_row_shape = states[0].shape[1:]
-            combined_rows = [
-                combiner(torch.stack([s[row].reshape(-1) for s in states], dim=0)) for row in range(batch_size)
-            ]
-            new_cache.caches[scale_idx].ssm_caches[layer_idx] = torch.stack(combined_rows, dim=0).view(
-                batch_size, *per_row_shape
-            )
-    return new_cache
-
-
-def pool_batch_states(model, cache) -> "KairosMultiCache":
-    """Pools every row of ONE cache (e.g."""
-    new_cache = KairosMultiCache(model.config)
-    for scale_idx, backbone in enumerate(model.backbones):
-        for layer_idx_str, combiner in backbone.state_combiners.items():
-            layer_idx = int(layer_idx_str)
-            states = cache.caches[scale_idx].ssm_caches[layer_idx]
-            if states is None:
-                continue
-            per_row_shape = states.shape[1:]
-            combined = combiner(states.reshape(states.shape[0], -1))
-            new_cache.caches[scale_idx].ssm_caches[layer_idx] = combined.view(1, *per_row_shape)
+            memory = torch.cat(parts, dim=0)
+            state_t = memory.new_zeros(batch_size, memory.shape[1])
+            blended = gate(state_t, memory)
+            new_cache.caches[scale_idx].ssm_caches[layer_idx] = blended.reshape(batch_size, *per_row_shape)
     return new_cache
 
 
@@ -306,17 +298,7 @@ class KairosDiffusionBackbone(nn.Module):
         self.norm = KairosNorm(config.hidden_size)
         self.aggregator = KairosAttnRes(config.hidden_size)
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
-        head_dim = config.hidden_size // config.num_attention_heads  # ssm_cache shape: (B, n_heads, head_dim,
-        n_heads = config.num_attention_heads
-        self.state_combiners = nn.ModuleDict(
-            {
-                str(i): KairosStateCombiner(state_dim=n_heads * head_dim * 2 * head_dim)
-                for i, layer_type in enumerate(config.layers_config)
-                if "d" in layer_type
-            }
-            if getattr(config, "use_state_combiner", False)
-            else {}
-        )
+        self.deltanet_layer_indices = [i for i, lt in enumerate(config.layers_config) if "d" in lt]
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         emb = x
@@ -501,6 +483,12 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         self.backbones = nn.ModuleList(
             [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
         )
+        if getattr(config, "use_memory_gate", False):
+            head_dim = config.hidden_size // config.num_attention_heads
+            state_dim = config.num_attention_heads * head_dim * 2 * head_dim
+            self.memory_gate = KairosMemoryGate(state_dim=state_dim)
+        else:
+            self.memory_gate = None
         self.rotary = KairosRotaryEmbedding(config, config.head_dim)
         self.norm = KairosNorm(config.hidden_size)
         self.lm_head = OutputHead(self.embedding)

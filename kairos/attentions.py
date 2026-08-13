@@ -36,11 +36,14 @@ try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn = None
-    from transformers.models.qwen3_next.modeling_qwen3_next import (
-        torch_causal_conv1d_update,
-    )
-
-    causal_conv1d_update = torch_causal_conv1d_update
+    try:
+        from transformers.models.qwen3_next.modeling_qwen3_next import (
+            torch_causal_conv1d_update as causal_conv1d_update,
+        )
+    except ImportError:
+        from transformers.models.qwen3_next.modeling_qwen3_next import (
+            causal_conv1d_update,
+        )
 
 
 def _supports_cu_seqlens(fn):
@@ -262,9 +265,7 @@ class KairosGatedDeltaNet(nn.Module):
             padding=self.conv_size - 1,
         )
         self.causal_conv1d_fn = causal_conv1d_fn
-        self.causal_conv1d_update = (
-            causal_conv1d_update if causal_conv1d_update is not None else torch_causal_conv1d_update
-        )
+        self.causal_conv1d_update = causal_conv1d_update
         self.chunk_gated_delta_rule = (
             chunk_gated_delta_rule if chunk_gated_delta_rule is not None else torch_chunk_gated_delta_rule
         )
