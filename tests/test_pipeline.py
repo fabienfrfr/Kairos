@@ -827,6 +827,68 @@ def test_last_ckpt_not_written_every_step(built_pipeline, monkeypatch):
     assert last_pt_saves <= built_pipeline.train_config.epochs
 
 
+def test_train_logs_periodic_eval_loss(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
+    eval_texts = [{"modality": "text", "text": "a completely different held-out sentence " * 8}] * 4
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    eval_data_config = DataConfig(text_examples=eval_texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1,
+        save_every=1000,
+        eval_every=3,
+        eval_batches=1,
+        run_dir=str(tmp_path / "run"),
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+
+    logs = pipe.train(resume=False)
+
+    assert pipe.eval_loader is not None
+    assert len(logs) > 3
+    assert len(pipe.eval_log_rows) >= 2  # mid-training evals + a final one
+    assert all(math.isfinite(row["loss"]) for row in pipe.eval_log_rows)
+    assert all(row["batches"] <= 1 for row in pipe.eval_log_rows)
+    assert pipe.best_eval_loss == min(row["loss"] for row in pipe.eval_log_rows)
+    # mid-training evals land on the eval_every boundary (the final one may not)
+    assert all(row["step"] % 3 == 0 for row in pipe.eval_log_rows[:-1])
+    assert pipe.eval_log_rows[-1]["step"] == pipe.global_step
+
+
+def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    before = copy.deepcopy(pipe.model.state_dict())
+    step_before = pipe.global_step
+    loader_before = pipe.loader
+
+    logs = pipe.overfit_test(n_examples=16, steps=60, lr=1e-2)
+
+    assert len(logs) == 60
+    assert logs[-1]["loss"] < logs[0]["loss"]  # memorization must be happening
+    # non-destructive: weights/step/loader all restored for the real run
+    for key, val in before.items():
+        assert torch.equal(val, pipe.model.state_dict()[key])
+    assert pipe.global_step == step_before
+    assert pipe.loader is loader_before
+
+
+def test_train_without_eval_config_skips_eval(tmp_path, model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, save_every=1000, eval_every=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    pipe.train(resume=False)
+
+    assert pipe.eval_loader is None
+    assert pipe.eval_log_rows == []
+
+
 def test_train_does_not_step_optimizer_on_nonfinite_loss(built_pipeline, monkeypatch):
     before = {k: v.clone() for k, v in built_pipeline.model.state_dict().items()}
 

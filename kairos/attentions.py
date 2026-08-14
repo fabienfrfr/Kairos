@@ -159,8 +159,7 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
     return out.contiguous()
 
 
-# Flex mask builder (bidir)
-# flex block size; bucketing lengths up to it keeps the mask/kernel shape stable.
+# Flex mask builder (bidir); flex block size - bucketing lengths up to it keeps the mask/kernel shape stable.
 _FLEX_BLOCK_SIZE = 128
 
 def _round_up(n, block):

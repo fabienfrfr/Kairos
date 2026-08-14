@@ -324,6 +324,8 @@ def _():
     TRAIN_MAX_LEN = 1024
     TRAIN_STRIDE = 3
     TRAIN_SAVE_EVERY = 200
+    TRAIN_EVAL_EVERY = 100  # eval on held-out set every N steps (0 = off)
+    TRAIN_EVAL_BATCHES = 2  # batches per eval; small keeps it cheap
     TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to
 
     # ---- packing: concatenate samples before chunking
@@ -341,6 +343,8 @@ def _():
         HUB_SUBFOLDER,
         TRAIN_BATCH,
         TRAIN_EPOCHS,
+        TRAIN_EVAL_BATCHES,
+        TRAIN_EVAL_EVERY,
         TRAIN_LR,
         TRAIN_MAX_LEN,
         TRAIN_PACK,
@@ -359,6 +363,8 @@ def _(
     HUB_SUBFOLDER,
     TRAIN_BATCH,
     TRAIN_EPOCHS,
+    TRAIN_EVAL_BATCHES,
+    TRAIN_EVAL_EVERY,
     TRAIN_LR,
     TRAIN_MAX_LEN,
     TRAIN_PACK,
@@ -390,6 +396,8 @@ def _(
         lr=TRAIN_LR,
         epochs=TRAIN_EPOCHS,
         save_every=TRAIN_SAVE_EVERY,
+        eval_every=TRAIN_EVAL_EVERY,
+        eval_batches=TRAIN_EVAL_BATCHES,
         run_dir=TRAIN_RUN_DIR,
         hub_repo_id=HUB_REPO_ID,
         hub_push_every_ckpt=HUB_PUSH_EVERY_CKPT,
@@ -403,13 +411,16 @@ def _(
 def _(
     KairosMultimodalPipeline,
     data_config,
+    eval_data_config,
     model_config,
     tokenizer,
     train_config,
 ):
     from kairos.utils import count_active_parameters
 
-    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, tokenizer=tokenizer)
+    pipe = KairosMultimodalPipeline(
+        model_config, data_config, train_config, eval_data_config=eval_data_config, tokenizer=tokenizer
+    )
     pipe.build()
 
     total_params = sum(p.numel() for p in pipe.model.parameters())
@@ -477,6 +488,25 @@ def _(pd, pipe):
 
 @app.cell
 def _():
+    OVERFIT_RUN = True  # sanity-check the model can memorize before the real run
+    OVERFIT_EXAMPLES = 64  # tiny subset, repeated each epoch
+    OVERFIT_STEPS = 200  # steps on that subset; loss should crash toward 0
+    return OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS
+
+
+@app.cell
+def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, pipe):
+    # non-destructive: model/optimizer/loader state is restored afterwards
+    _oflogs = []
+    if OVERFIT_RUN:
+        _oflogs = pipe.overfit_test(n_examples=OVERFIT_EXAMPLES, steps=OVERFIT_STEPS)
+    else:
+        print("OVERFIT_RUN is False - skipping overfit test")
+    return (_oflogs,)
+
+
+@app.cell
+def _():
     FORCE_RESTART = True  # True ignores any existing last.pt
     return (FORCE_RESTART,)
 
@@ -507,6 +537,8 @@ def _(FORCE_RESTART, mo, pipe):
 
     print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
     print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
+    if pipe.eval_log_rows:
+        print(f"eval points: {len(pipe.eval_log_rows)}  best eval loss: {pipe.best_eval_loss:.4f}")
     print(f"checkpoints: {pipe.ckpt_dir}")
     return (logs,)
 
@@ -628,6 +660,17 @@ def _(logs_df):
         logs_df.plot(x="step", y="loss", figsize=(8, 4), title="Multimodal diffusion loss")
     else:
         print("no logged steps - nothing to plot")
+    return
+
+
+@app.cell
+def _(pd, pipe):
+    if pipe.eval_log_rows:
+        pd.DataFrame(pipe.eval_log_rows).plot(
+            x="step", y="loss", figsize=(8, 4), title="Eval loss (held-out, every N steps)"
+        )
+    else:
+        print("no eval points logged - set TRAIN_EVAL_EVERY > 0")
     return
 
 

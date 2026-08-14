@@ -1,17 +1,4 @@
-"""Block-diffusion generation for the Kairos single-tower architecture.
-
-Reuses the DiffusionGemma generation machinery shipped with transformers
-(EntropyBoundSampler, LinearTemperatureScheduleLogitsProcessor and
-StableAndConfidentStoppingCriteria) but replaces the encoder/decoder + KV-cache
-loop with a single forward pass over ``[prompt, canvas]`` at every denoising
-step, which is the natural fit for KairosDiffusionLLM.
-
-``KairosDiffusionLLM`` inherits this mixin (see ``kairos/modeling.py``); the base
-``DiffusionGemmaGenerationMixin.generate`` is *not* usable as-is because it is
-hard-wired to the DiffusionGemma architecture (separate encoder/decoder towers,
-``config.canvas_length`` / ``config.text_config``, KV caches, diffusion decoder
-attention masks).
-"""
+"""Block-diffusion generation for the single-tower Kairos architecture, reusing DiffusionGemma samplers (EntropyBoundSampler, temperature schedule, adaptive stopping) via a single forward pass over ``[prompt, canvas]`` instead of the encoder/decoder + KV-cache loop."""
 
 from __future__ import annotations
 
@@ -55,32 +42,7 @@ class KairosDiffusionGenerationMixin:
 
     @torch.no_grad()
     def generate(self, input_ids=None, modality_ids=None, generation_config=None, **kwargs):
-        """Denoises ``max_new_tokens`` continuation tokens after a fixed prompt.
-
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, prompt_len)`):
-                Fixed prompt tokens (kept unnoised).
-            modality_ids (`torch.LongTensor` of shape `(batch_size, prompt_len)`, *optional*):
-                Modality of each prompt token; defaults to the text modality.
-            generation_config (`DiffusionGemmaGenerationConfig`, *optional*):
-                Base configuration; kwargs below override it.
-            max_new_tokens (`int`, *optional*):
-                Number of continuation tokens to generate.
-            max_denoising_steps (`int`, *optional*):
-                Diffusion iterations per canvas.
-            entropy_bound (`float`, *optional*):
-                Cumulative-entropy acceptance bound (higher accepts more tokens/step).
-            t_min/t_max (`float`, *optional*):
-                Final/initial temperature of the linear schedule.
-            stability_threshold/confidence_threshold (`int`/`float`, *optional*):
-                Adaptive stopping criteria (disabled when both are unset).
-            **kwargs: forwarded to the model ``forward`` call.
-
-        Returns:
-            `DiffusionGemmaGenerationOutput` with ``sequences`` of shape
-            `(batch_size, prompt_len + max_new_tokens)`, or the raw tensor when
-            ``return_dict_in_generate=False``.
-        """
+        """Denoises ``max_new_tokens`` continuation tokens after a fixed prompt (kwargs mirror ``DEFAULT_GENERATION_PARAMS``; returns ``DiffusionGemmaGenerationOutput`` with ``sequences`` of shape ``(batch, prompt_len + max_new_tokens)``)."""
         cfg = copy.deepcopy(generation_config) if generation_config is not None else DiffusionGemmaGenerationConfig()
         for key, val in DEFAULT_GENERATION_PARAMS.items():
             if getattr(cfg, key, None) is None:
