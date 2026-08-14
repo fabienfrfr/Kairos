@@ -92,12 +92,34 @@ class KairosMultimodalPipeline:
         self.hf_trainer: KairosDiffusionTrainer | None = None
         self.writer: SummaryWriter | None = None
 
+        # AMP: fp16 on pre-Ampere (T4), bf16 on Ampere+; GradScaler only for fp16.
+        if torch.cuda.is_available():
+            self.amp_device_type = "cuda"
+            self.amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability() >= (8, 0) else torch.float16
+        elif torch.backends.mps.is_available():
+            self.amp_device_type = "mps"
+            self.amp_dtype = torch.float16
+        else:
+            self.amp_device_type = "cpu"
+            self.amp_dtype = torch.float16
+        self.use_amp = torch.cuda.is_available()
+        self.scaler = torch.amp.GradScaler(
+            "cuda" if self.use_amp else "cpu", enabled=self.use_amp and self.amp_dtype == torch.float16
+        )
+
         self.log_rows: list[dict] = []
         self.best_loss: float = float("inf")
         self.global_step: int = 0
         self.skipped_nonfinite_steps: int = 0
         self.nan_log: list[dict] = []
         self._last_nonfinite_batch: dict | None = None
+
+    def _autocast(self):
+        return torch.autocast(device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.use_amp)
+
+    @property
+    def _num_workers(self) -> int:
+        return 4 if self.data_config.batch_size > 1 else 0
 
     # ------------------------------------------------------------------ build
     def _build_dataset(self) -> KairosPretrainingDataset:
@@ -126,7 +148,17 @@ class KairosMultimodalPipeline:
         dc, tc = self.data_config, self.train_config
 
         self.dataset = self._build_dataset()
-        self.loader = DataLoader(self.dataset, batch_size=dc.batch_size, shuffle=dc.shuffle, drop_last=dc.drop_last)
+        num_workers = self._num_workers
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=dc.batch_size,
+            shuffle=dc.shuffle,
+            drop_last=dc.drop_last,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
 
         self.model = KairosDiffusionLLM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
@@ -167,9 +199,13 @@ class KairosMultimodalPipeline:
                 batch = next(loader_iter)
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 self.optimizer.zero_grad()
-                loss = self.hf_trainer.compute_loss(self.model, batch)
-                loss.backward()
-                self.optimizer.step()
+                with self._autocast():
+                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
         try:
             return training_summary(
@@ -230,7 +266,8 @@ class KairosMultimodalPipeline:
                             cache_params = KairosMultiCache(self.model_config)
 
                     self.optimizer.zero_grad()
-                    loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
+                    with self._autocast():
+                        loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
                     loss_val = loss.item()
                     if use_memory_gate:
                         for scale_cache in cache_params.caches:
@@ -263,9 +300,11 @@ class KairosMultimodalPipeline:
                         continue
                     consecutive_nan = 0
 
-                    loss.backward()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=tc.grad_clip)
-                    self.optimizer.step()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                     self.scheduler.step()
 
                     epoch_loss += loss_val

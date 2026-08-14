@@ -307,7 +307,7 @@ def _(
 def _():
     # ---- training settings ----
     TRAIN_LR = 3e-4
-    TRAIN_BATCH = 8
+    TRAIN_BATCH = 32
     TRAIN_EPOCHS = 3
     TRAIN_MAX_LEN = 1024
     TRAIN_STRIDE = 3
@@ -520,7 +520,8 @@ def _(eval_data_config, pipe, torch):
         with torch.no_grad():
             for batch in eval_loader:
                 batch = {k: v.to(pipe.device) for k, v in batch.items()}
-                losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
+                with pipe._autocast():
+                    losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
         pipe.model.train()
         eval_loss = sum(losses) / len(losses)
         pipe.writer.add_scalar("eval/loss", eval_loss, pipe.global_step)
