@@ -530,6 +530,80 @@ def _(eval_data_config, pipe, torch):
 
 
 @app.cell
+def _():
+    # ---- generation smoke test ----
+    GEN_N_EXAMPLES = 3  # number of text prompts to denoise
+    GEN_PROMPT_TOKENS = 32  # keep this many tokens as the fixed prompt
+    GEN_MAX_NEW_TOKENS = 64  # length of the denoised continuation (canvas)
+    GEN_DENOISING_STEPS = 24  # diffusion iterations per canvas
+    GEN_T_MIN = 0.4  # final temperature (cold/confident)
+    GEN_T_MAX = 1.0  # initial temperature (hot/exploratory)
+    GEN_ENTROPY_BOUND = 0.5  # cumulative-entropy bound: higher -> accept more tokens/step
+    GEN_SEED = 0
+    return (
+        GEN_DENOISING_STEPS,
+        GEN_ENTROPY_BOUND,
+        GEN_MAX_NEW_TOKENS,
+        GEN_N_EXAMPLES,
+        GEN_PROMPT_TOKENS,
+        GEN_SEED,
+        GEN_T_MAX,
+        GEN_T_MIN,
+    )
+
+
+@app.cell
+def _(
+    GEN_DENOISING_STEPS,
+    GEN_ENTROPY_BOUND,
+    GEN_MAX_NEW_TOKENS,
+    GEN_N_EXAMPLES,
+    GEN_PROMPT_TOKENS,
+    GEN_SEED,
+    GEN_T_MAX,
+    GEN_T_MIN,
+    eval_examples,
+    pipe,
+    text_examples,
+    tokenizer,
+):
+    # diffusion generation via KairosDiffusionGenerationMixin (reuses the HF
+    # DiffusionGemma EntropyBoundSampler + temperature schedule + adaptive stopping)
+    _rows = [
+        ex
+        for ex in eval_examples
+        if ex.get("modality") == "text" and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
+    ]
+    if len(_rows) < GEN_N_EXAMPLES:
+        _rows = [
+            ex
+            for ex in text_examples
+            if ex.get("modality") == "text" and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
+        ]
+    _rows = _rows[:GEN_N_EXAMPLES]
+
+    for _i, _ex in enumerate(_rows, 1):
+        _ids = tokenizer.encode(_ex["text"], add_special_tokens=False)
+        _prompt = _ids[:GEN_PROMPT_TOKENS]
+        _full = pipe.generate(
+            _prompt,
+            max_new_tokens=GEN_MAX_NEW_TOKENS,
+            max_denoising_steps=GEN_DENOISING_STEPS,
+            entropy_bound=GEN_ENTROPY_BOUND,
+            t_min=GEN_T_MIN,
+            t_max=GEN_T_MAX,
+            seed=GEN_SEED + _i,
+        )
+        _gen = _full[GEN_PROMPT_TOKENS:]
+        _reference = _ids[GEN_PROMPT_TOKENS : GEN_PROMPT_TOKENS + GEN_MAX_NEW_TOKENS]
+        print(f"--- example {_i} ---")
+        print("prompt:    ", tokenizer.decode(_prompt, skip_special_tokens=True))
+        print("generated: ", tokenizer.decode(_gen, skip_special_tokens=True))
+        print("reference: ", tokenizer.decode(_reference, skip_special_tokens=True))
+    return
+
+
+@app.cell
 def _(logs, pd):
     logs_df = pd.DataFrame(logs)
     print(logs_df)

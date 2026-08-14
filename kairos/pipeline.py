@@ -470,6 +470,32 @@ class KairosMultimodalPipeline:
             return 1
 
     # ------------------------------------------------------------- hf hub
+    def generate(self, prompt_ids, max_new_tokens=64, modality=Modality.TEXT, seed=None, **kwargs):
+        """Block-diffusion continuation of a token prompt; returns prompt + generated ids.
+
+        Thin wrapper around ``KairosDiffusionGenerationMixin.generate`` (see
+        ``kairos/generation.py``) that handles device placement, modality ids and the
+        AMP context. Decode the result with ``self.tokenizer.decode(...)``.
+        """
+        self._require_built()
+        if seed is not None:
+            torch.manual_seed(seed)
+        prompt = torch.as_tensor(prompt_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        modality_ids = torch.full_like(prompt, int(modality))
+        self.model.eval()
+        try:
+            with self._autocast():
+                out = self.model.generate(
+                    input_ids=prompt,
+                    modality_ids=modality_ids,
+                    max_new_tokens=max_new_tokens,
+                    **kwargs,
+                )
+        finally:
+            self.model.train()
+        sequences = out.sequences if hasattr(out, "sequences") else out
+        return sequences[0].tolist()
+
     def _push_checkpoint_to_hub(self, path: Path):
         from huggingface_hub import HfApi
 

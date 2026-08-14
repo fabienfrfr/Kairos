@@ -5,23 +5,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
+from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 
-try:
-    from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
-        DiffusionGemmaGenerationMixin,
-    )
-except ImportError:
-
-    class DiffusionGemmaGenerationMixin:
-        pass
-
-
-from transformers.cache_utils import DynamicCache
-
 from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
+
+try:
+    from .generation import KairosDiffusionGenerationMixin
+except ImportError:  # transformers < 5.15: training still works, generation does not
+    class KairosDiffusionGenerationMixin:
+        pass
 
 
 class KairosConfig(PretrainedConfig):
@@ -100,6 +95,9 @@ class KairosConfig(PretrainedConfig):
 
         # v3 Block-AttnRes: windows prior layer outputs
         self.attnres_block_size = kwargs.get("attnres_block_size", 1)
+
+        # block-diffusion generation: one canvas of this many tokens per outer loop
+        self.canvas_length = kwargs.get("canvas_length", 128)
 
     @property
     def n_routed_experts(self):
@@ -192,7 +190,7 @@ class KairosMemoryGate(nn.Module):
 
     def __init__(self, state_dim, bottleneck_dim=None):
         super().__init__()
-        self.bottleneck_dim = bottleneck_dim or max(8, round(math.sqrt(state_dim)))
+        self.bottleneck_dim = bottleneck_dim or max(8, round(math.sqrt(state_dim) / 4))
         self.down = nn.Linear(state_dim, self.bottleneck_dim)
         self.up = nn.Linear(self.bottleneck_dim, state_dim)
         self.context_attn = nn.MultiheadAttention(self.bottleneck_dim, num_heads=1, batch_first=True)
@@ -467,7 +465,7 @@ class KairosOutput(CausalLMOutputWithPast):
     modality_logits: torch.FloatTensor = None
 
 
-class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
+class KairosDiffusionLLM(PreTrainedModel, KairosDiffusionGenerationMixin):
     def __init__(self, config, vocab_size=None, use_moe=None):
         super().__init__(config)
         if use_moe is None:
@@ -521,7 +519,7 @@ class KairosDiffusionLLM(PreTrainedModel, DiffusionGemmaGenerationMixin):
         h = self.embedding(token_ids=x, modality_ids=modality_ids)
         if self_conditioning_logits is not None:
             probs = torch.softmax(self_conditioning_logits, dim=-1)
-            h = h + (probs @ self.embedding.token_embed.weight)
+            h = h + (probs @ self.embedding.token_embed.weight).to(h.dtype)
         encoded = self.codec.encode(h)
         features = []
         for scale_idx, (scale, backbone) in enumerate(zip(encoded.scales, self.backbones)):
