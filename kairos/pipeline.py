@@ -46,10 +46,10 @@ class TrainConfig:
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
     report_to: list = field(default_factory=list)
-    hub_repo_id: str | None = None  # set to also push each
-    hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as
+    hub_repo_id: str | None = None  # set to also push each checkpoint
+    hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes checkpoints
     hub_private: bool = False
-    hub_subfolder: str | None = None  # push checkpoints/model under repo_id/<subfolder> instead
+    hub_subfolder: str | None = None  # push under repo_id/<subfolder>
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
@@ -153,7 +153,7 @@ class KairosMultimodalPipeline:
 
     # -------------------------------------------------------------- summary
     def summary(self, benchmark: bool = True, n_bench_steps: int = 5) -> TrainingSummary:
-        """Params/memory/estimated-time report; benchmark steps are timed then reverted, no side effects."""
+        """Report params/memory/time; benchmark steps are timed then reverted."""
         self._require_built()
 
         step_fn = None
@@ -239,7 +239,7 @@ class KairosMultimodalPipeline:
                                     scale_cache.ssm_caches[layer_idx] = s.detach()
                         prev_cache = cache_params
                     if not math.isfinite(loss_val):
-                        # a corrupted batch can spike the
+                        # a corrupted batch can spike the loss; skip it
                         skipped_nonfinite += 1
                         consecutive_nan += 1
                         self._last_nonfinite_batch = batch
@@ -279,7 +279,7 @@ class KairosMultimodalPipeline:
                         progress_callback(self.global_step, total_steps, loss_val)
 
                     if self.global_step % tc.last_ckpt_every == 0:
-                        self._save(last_ckpt, loss_val, epoch)  # overwritten periodically: resumable, not every
+                        self._save(last_ckpt, loss_val, epoch)  # periodically overwritten, resumable
                     if self.global_step % tc.save_every == 0:
                         step_ckpt = self.ckpt_dir / f"step_{self.global_step:06d}.pt"
                         self._save(step_ckpt, loss_val, epoch)
@@ -344,7 +344,7 @@ class KairosMultimodalPipeline:
                 text_ids = row_ids[text_mask] if text_mask is not None else row_ids
                 try:
                     text_preview = self.tokenizer.decode(text_ids.tolist(), skip_special_tokens=True)[:200]
-                except Exception as e:  # noqa: BLE001 - best-effort preview, never block the inspection itself
+                except Exception as e:  # noqa: BLE001 - best-effort preview, never blocks inspection
                     text_preview = f"<decode failed: {e}>"
 
                 modality_counts = {}
@@ -369,13 +369,13 @@ class KairosMultimodalPipeline:
                         "modality_counts": modality_counts,
                         "token_id_range": (int(row_ids.min()), int(row_ids.max())),
                         "out_of_bounds": {
-                            "token_ids": oob_token.tolist(),  # positions with id outside [0,
-                            "modality_ids": oob_modality.tolist(),  # positions with id outside [0,
+                            "token_ids": oob_token.tolist(),  # ids outside [0, vocab)
+                            "modality_ids": oob_modality.tolist(),  # ids outside [0, num_modalities)
                         },
                         "text_preview": text_preview,
-                        "input_ids": row_ids.tolist(),  # raw ids, exactly what the
+                        "input_ids": row_ids.tolist(),  # raw ids, as fed to the model
                         "modality_ids": row_modality.tolist() if row_modality is not None else None,
-                        "top_token_ids": top_ids,  # [(id, count), ...] most frequent
+                        "top_token_ids": top_ids,  # most frequent ids
                         "max_repeat_run": {"id": max_run_id, "length": max_run_len},
                     }
                 )
@@ -422,7 +422,7 @@ class KairosMultimodalPipeline:
         return ckpt
 
     def _safe_resume(self, path: Path) -> int:
-        # an incompatible checkpoint (different model_config) starts
+        # an incompatible checkpoint (different model_config) starts fresh
         try:
             ckpt = self.load_checkpoint(str(path))
             return ckpt.get("epoch", 1)
@@ -452,13 +452,13 @@ class KairosMultimodalPipeline:
         # best-effort: no checkpoint on the repo
         try:
             return self.load_checkpoint_from_hub(repo_id)
-        except Exception:  # noqa: BLE001 — no checkpoint on the hub yet is not an error, just start fresh
+        except Exception:  # noqa: BLE001 — no hub checkpoint yet, start fresh
             return None
 
     def push_to_hub(
         self, repo_id: str, private: bool = False, license: str = "apache-2.0", subfolder: str | None = None
     ):
-        """Pushes model, config, checkpoints, tensorboard logs, training config, and a model card."""
+        """Pushes model, config, checkpoints, logs, and a model card to the hub."""
         from huggingface_hub import HfApi
 
         self._require_built()
@@ -473,7 +473,7 @@ class KairosMultimodalPipeline:
         # save_pretrained + upload_folder honors the subfolder
         export_dir = Path(self.train_config.run_dir) / "hf_export"
         export_dir.mkdir(parents=True, exist_ok=True)
-        # tied SWA/DeltaNet weights break save_pretrained's tied-weight
+        # tied SWA/DeltaNet weights break save_pretrained's tied-weight logic
         self.model_config.save_pretrained(str(export_dir))
         torch.save(self.model.state_dict(), export_dir / "pytorch_model.bin")
         api.upload_folder(repo_id=repo_id, folder_path=str(export_dir), path_in_repo=subfolder or ".")
@@ -515,7 +515,7 @@ class KairosMultimodalPipeline:
 
     # ------------------------------------------------------------- checks
     def check_per_modality_loss(self, n_batches: int = 1) -> dict[str, float]:
-        """Diffusion loss averaged per modality over n_batches, so a router-ignored modality can't."""
+        """Diffusion loss averaged per modality, so a router-ignored modality is caught."""
         self._require_built()
         self.model.eval()
         losses_by_modality: dict[str, list[float]] = defaultdict(list)

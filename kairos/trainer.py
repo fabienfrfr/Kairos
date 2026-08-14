@@ -26,7 +26,7 @@ class KairosDiffusionTrainer(Trainer):
             noise_mask &= pad_mask.bool()  # never noise/score padding
 
         if not noise_mask.any():
-            # exceedingly rare (short sequence + low
+            # exceedingly rare: short sequence + low mask ratio
             eligible = pad_mask.bool() if pad_mask is not None else torch.ones_like(noise_mask)
             for i in range(x0.size(0)):
                 row_idx = eligible[i].nonzero(as_tuple=True)[0]

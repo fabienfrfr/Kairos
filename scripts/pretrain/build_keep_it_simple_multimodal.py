@@ -1,4 +1,4 @@
-"""Builds keep-it-simple-multimodal (~51MB): image/audio/video/lidar/control captions from coco, relaion-coco, AudioCaps, finevideo, Cosmos-Transfer-LidarGen, PixelBytes-OptimalControl."""
+"""Builds keep-it-simple-multimodal: image/audio/video/lidar/control captions."""
 
 import io
 import json
@@ -16,9 +16,9 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 CACHE_DIR = "data/cache"
 CACHE_SCHEMA_VERSION = 5  # bumped: caches now store RAW
-CHECKPOINT_EVERY = 10  # rows between checkpoint saves for
+CHECKPOINT_EVERY = 10  # rows between checkpoint saves for resume
 
-# per-source example count, sized so each
+# per-source example count, sized so each source finishes fast
 N_PER_SOURCE = {
     "image_bbox": 2700,
     "image_caption": 1800,
@@ -127,7 +127,7 @@ def _decode_video_bytes(raw_bytes: bytes) -> tuple[list, dict] | None:
     for frame in container.decode(stream):
         t = float(frame.time or 0.0)
         arr = frame.to_ndarray(format="rgb24")
-        # proper resize (not a strided crop) top-left corner after a coarse stride
+        # resize (not a strided crop) from the top-left after the coarse stride
         resized = np.array(Image.fromarray(arr).resize((VIDEO_SIZE, VIDEO_SIZE), Image.BILINEAR))
         buffer.append((t, resized))
         if t >= window:
@@ -380,7 +380,7 @@ def _subsample_lidar_azimuth(points: np.ndarray, n: int) -> np.ndarray:
 
 
 def build_lidar():
-    """Lidar points from nvidia/Cosmos-Transfer-LidarGen-Example (gated); caches raw merged frames, --force-rebuild re-merges."""
+    """Lidar points from nvidia/Cosmos-Transfer-LidarGen-Example (gated); caches merged frames."""
     from huggingface_hub import hf_hub_download
 
     cache_path = os.path.join(CACHE_DIR, f"lidar_v{CACHE_SCHEMA_VERSION}.pkl")
@@ -487,7 +487,7 @@ def build_control():
             return None
         state, state_peak = _peak_normalize(arr[1])
         action, action_peak = _peak_normalize(arr[0])
-        # stereo layout: channel 0 (left) =
+        # stereo layout: channel 0 = action, channel 1 = state
         return make_row(
             "control",
             "pixelbytes-optimalcontrol",

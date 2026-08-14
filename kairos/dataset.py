@@ -41,7 +41,7 @@ def _pad_and_gen_mask(ids, prompt_len, max_len, pad_token_id):
 
 
 class KairosPretrainingDataset(Dataset):
-    """Full diffusion pretraining dataset: text or multimodal, chunked to {input_ids, modality_ids, mask,."""
+    """Full diffusion pretraining dataset: text or multimodal, chunked to token ids."""
 
     def __init__(
         self,
@@ -111,7 +111,7 @@ class KairosPretrainingDataset(Dataset):
                 # anti-Reversal Curse: randomize prompt/text order
                 merged = " ".join([prompt, text] if random.random() < 0.5 else [text, prompt]).strip()
                 if not merged:
-                    continue  # empty example: nothing to learn,
+                    continue  # empty example: nothing to learn from
                 tokens = self.tokenizer.encode(merged, add_special_tokens=False)
                 if not tokens:
                     continue
@@ -173,7 +173,7 @@ class KairosPretrainingDataset(Dataset):
             return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"]))]
 
         if modality == "imu":
-            # flattened 1D signal, reuses the audio
+            # flattened 1D signal, reuses the audio encoder
             flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
             return [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_audio(flat))]
 
@@ -291,7 +291,7 @@ class KairosSFTDataset(Dataset):
 
 
 class KairosDPODataset(Dataset):
-    """DPO dataset: fixed prompt (gen_mask=0) plus separately-tokenized chosen/rejected responses (gen_mask=1)."""
+    """DPO dataset: fixed prompt plus separately-tokenized chosen/rejected responses."""
 
     def __init__(self, tokenizer, max_len=512, examples=None):
         self.tokenizer = tokenizer
@@ -308,7 +308,7 @@ class KairosDPODataset(Dataset):
         return "".join(f"<{m['role']}>\n{m['content']}\n</{m['role']}>\n" for m in messages)
 
     def _encode_pair(self, prompt_text, response_text):
-        # byte-level tokenizer: encode(A)+encode(B) == encode(A+B), so
+        # byte-level tokenizer: encode(A) + encode(B) == encode(A + B)
         prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
         response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
         response_ids = response_ids[: self.max_len - len(prompt_ids)]

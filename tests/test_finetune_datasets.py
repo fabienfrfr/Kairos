@@ -68,7 +68,7 @@ def test_sft_truncates_to_max_len(tokenizer):
 
 
 def test_sft_alpaca_style_example(tokenizer):
-    # _process_alpaca is exercised directly to avoid
+    # call _process_alpaca directly to avoid dataset randomness
     raw = KairosSFTDataset(tokenizer, max_len=64, examples=[{"conversations": []}])
     processed = raw._process_alpaca({"instruction": "Say hi", "input": "", "output": "Hi there"})
     assert processed["prompt_len"] > 0

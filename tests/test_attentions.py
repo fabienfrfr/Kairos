@@ -98,7 +98,7 @@ def test_swa_eager_vs_flex(monkeypatch):
         monkeypatch.setattr("attention.ATTN_IMPL", "flex")
         out_flex = attn(x, rope(x, pos))
         assert torch.allclose(out_eager, out_flex, atol=1e-3)
-    except Exception:  # noqa: BLE001, S110 — flex path is optional; any failure just skips this check
+    except Exception:  # noqa: BLE001, S110 — flex path optional; failure just skips
         pass
 
 
@@ -291,7 +291,7 @@ def test_deltanet_cache_effect():
 
 
 def test_deltanet_ssm_cache_used_even_without_conv_cache():
-    # regression: has_previous_state used to be gated
+    # regression: has_previous_state was wrongly gating the SSM path
     model = get_deltanet_model()
     x = torch.randn(1, 8, 32)
 
@@ -487,7 +487,7 @@ def test_supports_cu_seqlens_returns_false_for_none():
 
 
 def test_supports_cu_seqlens_returns_false_when_signature_unavailable():
-    # builtins raise ValueError from inspect.signature; must
+    # builtins raise ValueError in inspect.signature; handle it
     assert _supports_cu_seqlens(int) is False
 
 
@@ -515,5 +515,5 @@ def test_attention_without_layer_idx_warns_but_still_works(capsys):
 
 
 def test_current_backend_is_eager_on_cpu():
-    # documents/locks the CPU fallback this test the flex_attention path requires CUDA and
+    # flex_attention requires CUDA; lock the eager CPU fallback here
     assert ATTN_IMPL == "eager"

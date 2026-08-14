@@ -165,14 +165,14 @@ def test_audio_tick_count(tokenizer, sample_audio):
     assert num_ticks == -(-len(sample_audio) // 16_000)  # ceil division
 
 
-# ========================= LIDAR: periodic <PTSEP>, fixed quantization bounds =========================
+# ======================= LIDAR: <PTSEP>, fixed quantization bounds ========================
 def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     markers = KairosTokenizer.encode_lidar(sample_lidar)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.LIDAR, markers)])
     decoded = tokenizer.decode_multimodal(out["input_ids"])
     recon = tokenizer.decode_lidar(decoded[0].data)
     assert recon.shape == sample_lidar.shape
-    # quantization step over the FIXED xyz
+    # quantization step over the fixed xyz range
     xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
     max_step = (xyz_hi - xyz_lo) / 255
     assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
@@ -183,7 +183,7 @@ def test_lidar_rejects_wrong_shape():
         KairosTokenizer.encode_lidar(np.zeros((10, 3), dtype=np.float32))
 
 
-# ========================= encode_multimodal / decode_multimodal: mixed sequences =========================
+# ==================== encode_multimodal / decode_multimodal: mixed seqs =====================
 def test_mixed_text_image_video_audio(tokenizer, sample_image, sample_video, sample_audio):
     segs = [
         MultimodalSegment(Modality.TEXT, b"a scene:"),

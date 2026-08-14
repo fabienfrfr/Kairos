@@ -76,7 +76,7 @@ def built_pipeline(tmp_path, model_config, text_examples, multimodal_examples):
 
 
 def test_training_converges_with_moe_enabled(tmp_path):
-    # use_moe=True was never covered by any NaN or blocks convergence, this must num_local_experts/num_experts_per_tok kept small: MoE checkpoints are copies) and this test writes a
+    # regression: use_moe=True used to NaN or block convergence; keep MoE small here
     model_config = KairosConfig(
         d_model=64, n_heads=4, n_layers=3, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -96,7 +96,7 @@ def test_training_converges_with_moe_enabled(tmp_path):
 
 
 def test_training_converges_with_attnres_block_size_four(tmp_path):
-    # attnres_block_size defaults to 1 everywhere else aggregator to sum 4 layer outputs
+    # cover attnres_block_size=4 (defaults to 1 elsewhere)
     model_config = KairosConfig(d_model=64, n_heads=4, n_layers=3, attnres_block_size=4)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
     data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
@@ -111,7 +111,7 @@ def test_training_converges_with_attnres_block_size_four(tmp_path):
 
 
 def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
-    # the exact combination the user reported at real depth (12 layers). Width if this passes but the real test's job is to at least
+    # regression: the exact MoE + attnres_block_size combination the user reported
     model_config = KairosConfig(
         d_model=64,
         n_heads=4,
@@ -245,7 +245,7 @@ def test_memory_gate_blends_state_t_with_external_bank(tmp_path):
 
 
 def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
-    # a small, highly repetitive corpus should doesn't trend down (or any batch
+    # a small, highly repetitive corpus should converge fast
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 8
     data_config = DataConfig(text_examples=texts, max_len=32, batch_size=4)
     train_config = TrainConfig(
@@ -552,7 +552,7 @@ def test_load_checkpoint_from_hub_downloads_then_loads(built_pipeline, monkeypat
 
 
 def test_train_resumes_from_hub_when_no_local_checkpoint(tmp_path, model_config, text_examples, monkeypatch):
-    # simulate a previous run's checkpoint living
+    # simulate a previous run's checkpoint on the hub
     donor_config = DataConfig(text_examples=text_examples, max_len=256, batch_size=2)
     donor = KairosMultimodalPipeline(model_config, donor_config, TrainConfig(epochs=1, run_dir=str(tmp_path / "donor")))
     donor.build()
@@ -581,8 +581,8 @@ def test_train_starts_fresh_when_hub_has_no_checkpoint(built_pipeline, monkeypat
     assert len(logs) > 0
 
 
-def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text_examples):  # a checkpoint saved with a
-    # crash the run: warn and start
+def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text_examples):
+    # warn and start fresh
     old_config = KairosConfig(d_model=32, n_heads=4, n_layers=6, num_modalities=8, attnres_block_size=2)
     data_config = DataConfig(text_examples=text_examples, max_len=256, batch_size=2)
     old_pipe = KairosMultimodalPipeline(old_config, data_config, TrainConfig(epochs=1, run_dir=str(tmp_path / "old")))
@@ -635,7 +635,7 @@ def test_nan_log_captures_diagnostics(built_pipeline, monkeypatch):
 
 
 def test_nan_log_includes_trainer_diagnostics_for_real_forward_pass(built_pipeline, monkeypatch):
-    # don't mock compute_loss: corrupt the model's non-finite check fires naturally and populates
+    # don't mock compute_loss: make forward emit NaN so the real check fires
     real_forward = built_pipeline.model.forward
 
     def _nan_forward(*args, **kw):
@@ -665,7 +665,7 @@ def test_training_aborts_after_too_many_consecutive_nans(built_pipeline, monkeyp
     with pytest.warns(UserWarning, match="non-finite"), pytest.raises(RuntimeError, match="consecutive non-finite"):
         built_pipeline.train(resume=False)
 
-    # circuit breaker must fire well before
+    # circuit breaker must fire at the configured limit
     assert built_pipeline.skipped_nonfinite_steps == 3
 
 
@@ -774,7 +774,7 @@ def test_inspect_batch_flags_a_degenerate_repeated_run(built_pipeline):
 
 
 def test_inspect_batch_ignores_padding_tail_in_repeat_run(built_pipeline):
-    # a short example padded out to that must NOT be reported as
+    # a padded short example must not be reported as a long repeat run
     real_batch = next(iter(built_pipeline.loader))
     seq_len = real_batch["input_ids"].size(1)
     real_len = 8
@@ -806,7 +806,7 @@ def test_progress_callback_still_called_on_nonfinite_loss(built_pipeline, monkey
     with pytest.warns(UserWarning, match="non-finite"):
         built_pipeline.train(resume=False, progress_callback=lambda step, total, loss: seen_steps.append(step))
 
-    # every batch was skipped, but the
+    # every batch was skipped, but progress still advances
     assert len(seen_steps) == len(built_pipeline.loader) * built_pipeline.train_config.epochs
 
 
@@ -822,7 +822,7 @@ def test_last_ckpt_not_written_every_step(built_pipeline, monkeypatch):
     built_pipeline.train_config.last_ckpt_every = 1000  # higher than total steps in
     built_pipeline.train(resume=False)
 
-    # last.pt should only be written at not on every single training step
+    # last.pt is only written at epoch boundaries, not every step
     last_pt_saves = save_calls.count("last.pt")
     assert last_pt_saves <= built_pipeline.train_config.epochs
 

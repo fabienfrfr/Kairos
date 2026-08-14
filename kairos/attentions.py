@@ -13,7 +13,7 @@ if torch.cuda.is_available():
 
         flex_attention = torch.compile(flex_attention)
         ATTN_IMPL = "flex"
-    except Exception:  # noqa: BLE001 — flex_attention compile can fail for many backend reasons; must not crash import
+    except Exception:  # noqa: BLE001 — flex_attention compile can fail; must not crash import
         ATTN_IMPL = "eager"
 else:
     ATTN_IMPL = "eager"
@@ -60,7 +60,7 @@ class KairosNorm(LlamaRMSNorm):
 
 
 class KairosRotaryEmbedding(nn.Module):
-    """cos/sin cache grows on demand (amortized doubling) so generation past max_position_embeddings never."""
+    """cos/sin cache grows on demand so generation past max_position_embeddings never fails."""
 
     def __init__(self, config, head_dim):
         super().__init__()

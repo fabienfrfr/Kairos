@@ -83,7 +83,7 @@ class KairosConfig(PretrainedConfig):
 
         self.intermediate_size = intermediate_size
 
-        # num_local_experts is the only one transformers' n_routed_experts is a property alias below
+        # only num_local_experts is real; n_routed_experts is a property alias below
         self.num_local_experts = kwargs.get("num_local_experts", kwargs.get("n_routed_experts", 8))
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 2)
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", intermediate_size)
@@ -103,7 +103,7 @@ class KairosConfig(PretrainedConfig):
 
     @property
     def n_routed_experts(self):
-        """Alias for num_local_experts (the field transformers' DeepseekV3Experts actually reads) so the two."""
+        """Alias for num_local_experts, the field DeepseekV3Experts actually reads."""
         return self.num_local_experts
 
     @n_routed_experts.setter
@@ -188,7 +188,7 @@ class KairosMultiCache(DynamicCache):
 
 
 class KairosMemoryGate(nn.Module):
-    """Cross-attention gate over a low-rank bottleneck; blends state_t with a memory bank, no-op if empty."""
+    """Cross-attention gate over a low-rank bottleneck; blends state_t with a memory bank."""
 
     def __init__(self, state_dim, bottleneck_dim=None):
         super().__init__()
@@ -210,7 +210,7 @@ class KairosMemoryGate(nn.Module):
 
 
 def gate_memory_bank(model, memory_caches: list, batch_size: int) -> "KairosMultiCache":
-    """Builds initial ssm_caches by gating a zero state_t against memory_caches; no-op layers stay None."""
+    """Gates a zero state_t against memory_caches to seed ssm_caches; no-op layers stay None."""
     new_cache = KairosMultiCache(model.config)
     gate = model.memory_gate
     if gate is None:
@@ -238,7 +238,7 @@ class KairosFFN(Qwen2MoeMLP):
 
 
 class KairosMoE(DeepseekV3MoE):
-    """DeepseekV3MoE's expert weights are raw torch.empty() tensors, never initialized by default; fixed."""
+    """DeepseekV3MoE's expert weights are raw torch.empty(), never initialized; fixed here."""
 
     def __init__(self, config):
         super().__init__(config)
@@ -289,7 +289,7 @@ class KairosAttnRes(nn.Module):
 
 
 class KairosDiffusionBackbone(nn.Module):
-    """v3 Block-AttnRes: prior layer outputs are windowed into blocks of `attnres_block_size` before."""
+    """v3 Block-AttnRes: prior layer outputs are windowed into blocks before aggregation."""
 
     def __init__(self, config, use_moe=False):
         super().__init__()
