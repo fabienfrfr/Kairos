@@ -19,18 +19,24 @@ def _():
 @app.cell
 def _():
     # marimo without widget for Jupyter/Colab compatibility.
-    import marimo as mo
+    try:
+        import marimo as mo
+    except ImportError:  # plain Jupyter/Colab (no marimo): disable marimo widgets
 
+        class _MoStub:
+            @staticmethod
+            def running_in_notebook() -> bool:
+                return False
+
+        mo = _MoStub()
     return (mo,)
 
 
-app._unparsable_cell(
-    r"""
+@app.cell
+def _():
     # --force-reinstall is required: pip skips reinstalling if the version is unchanged.
-    !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
-    """,
-    name="_",
-)
+    # !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
+    return
 
 
 @app.cell
@@ -495,14 +501,32 @@ def _():
 
 
 @app.cell
-def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, pipe):
+def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, mo, pipe):
     # non-destructive: model/optimizer/loader state is restored afterwards
     _oflogs = []
     if OVERFIT_RUN:
-        _oflogs = pipe.overfit_test(n_examples=OVERFIT_EXAMPLES, steps=OVERFIT_STEPS)
+        if mo.running_in_notebook():
+            with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
+                _state = {"last_step": 0}
+
+                def _on_step(step, total, loss_val):
+                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
+                    _state["last_step"] = step
+
+                _oflogs = pipe.overfit_test(
+                    n_examples=OVERFIT_EXAMPLES, steps=OVERFIT_STEPS, progress_callback=_on_step
+                )
+        else:
+            from kairos.utils import make_progress_callback
+
+            _oflogs = pipe.overfit_test(
+                n_examples=OVERFIT_EXAMPLES,
+                steps=OVERFIT_STEPS,
+                progress_callback=make_progress_callback(desc="overfit_test"),
+            )
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
-    return (_oflogs,)
+    return
 
 
 @app.cell
