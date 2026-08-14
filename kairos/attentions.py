@@ -1,5 +1,7 @@
 import inspect
 import math
+import os
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -139,11 +141,11 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
 # Flex mask builder (bidir)
 
 
-def build_flex_mask(max_len, window):
+def build_flex_mask(q_len, kv_len, window, device=None):
     def bidir_window(b, h, q_idx, kv_idx):
         return (kv_idx >= q_idx - window) & (kv_idx <= q_idx + window)
 
-    return create_block_mask(bidir_window, B=None, H=None, Q_LEN=max_len, KV_LEN=max_len)
+    return create_block_mask(bidir_window, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device)
 
 
 def build_flex_mask_padded(window, attention_mask):
@@ -177,8 +179,16 @@ class KairosAttention(nn.Module):
         self.out = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         if ATTN_IMPL == "flex":
             assert self.head_dim & (self.head_dim - 1) == 0, "head_dim must be a power of 2 for flex_attention"
-            self.block_mask = build_flex_mask(config.max_position_embeddings, self.window)
+        self._flex_mask_cache = {}
         self.rope = KairosRotaryEmbedding(config, self.head_dim)
+
+    def _flex_mask(self, q_len, kv_len, device):
+        key = (q_len, kv_len, str(device))
+        mask = self._flex_mask_cache.get(key)
+        if mask is None:
+            mask = build_flex_mask(q_len, kv_len, self.window, device=device)
+            self._flex_mask_cache[key] = mask
+        return mask
 
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         B, L, _ = x.shape
@@ -209,7 +219,7 @@ class KairosAttention(nn.Module):
             if has_padding:
                 block_mask = build_flex_mask_padded(self.window, attention_mask)
             else:
-                block_mask = self.block_mask._adjust(q.size(1), k.size(1))
+                block_mask = self._flex_mask(q.size(1), k.size(1), q.device)
             out = flex_attention(
                 q.transpose(1, 2),
                 k.transpose(1, 2),

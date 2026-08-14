@@ -1,5 +1,6 @@
 import time
 
+import pytest
 import torch
 
 from kairos.attentions import (
@@ -517,3 +518,92 @@ def test_attention_without_layer_idx_warns_but_still_works(capsys):
 def test_current_backend_is_eager_on_cpu():
     # flex_attention requires CUDA; lock the eager CPU fallback here
     assert ATTN_IMPL == "eager"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or ATTN_IMPL != "flex",
+    reason="flex_attention requires a CUDA device",
+)
+class TestFlexAttentionBlockMask:
+    """flex_attention path (CUDA only): block masks must match the exact input length.
+
+    Regression: the mask was pre-built at max_position_embeddings then truncated with
+    BlockMask._adjust, which rounds lengths up to the block size, so flex_attention
+    raised a ValueError for non-block-aligned lengths (e.g. 114 vs a 128 mask).
+    """
+
+    def _attn(self, max_position_embeddings=128, layer_idx=0):
+        cfg = DummySWAConfig()
+        cfg.max_position_embeddings = max_position_embeddings
+        attn = KairosAttention(cfg, layer_idx=layer_idx)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        return attn, rope
+
+    def test_non_block_aligned_length_no_longer_raises(self):
+        # q_len=114 vs a 128-max block mask was the exact reported failure
+        attn, rope = self._attn()
+        for L in (114, 37, 64, 128):
+            x = torch.randn(2, L, 32, device="cuda")
+            pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+            out = attn(x, rope(x, pos))
+            assert out.shape == x.shape
+            assert not torch.isnan(out).any()
+
+    def test_padded_path_accepts_non_block_aligned_length(self):
+        attn, rope = self._attn()
+        L = 114
+        x = torch.randn(2, L, 32, device="cuda")
+        pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+        mask = torch.ones(2, L, dtype=torch.bool, device="cuda")
+        mask[:, -7:] = False
+        out = attn(x, rope(x, pos), attention_mask=mask)
+        assert out.shape == x.shape
+
+    def test_rectangular_mask_with_growing_kv_cache(self):
+        # during cached generation kv_len grows beyond q_len
+        cfg = DummySWAConfig()
+        cfg.sliding_window_size = 128  # no trimming during this test
+        attn = KairosAttention(cfg, layer_idx=0)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        cache = KairosCache(cfg)
+        L = 37
+        for step in range(2):
+            x = torch.randn(2, L, 32, device="cuda")
+            pos = torch.arange(step * L, step * L + L, device="cuda").unsqueeze(0).expand(2, -1)
+            out = attn(x, rope(x, pos), cache_params=cache, position_ids=pos)
+            assert out.shape == x.shape
+        assert cache._key_cache[0].size(1) == 2 * L
+
+    def test_flex_mask_cache_reuses_masks_per_length(self):
+        attn, _ = self._attn()
+        dev = torch.device("cuda")
+        m1 = attn._flex_mask(114, 114, dev)
+        m2 = attn._flex_mask(114, 114, dev)
+        assert m1 is m2
+        m3 = attn._flex_mask(114, 128, dev)
+        assert m3 is not m1
+        assert len(attn._flex_mask_cache) == 2
+
+    def test_flex_matches_eager_on_cuda(self):
+        # parity check: flex (fixed) and eager must agree for the same windowed mask
+        from kairos.attentions import apply_rotary_emb, eager_attention
+
+        cfg = DummySWAConfig()
+        attn = KairosAttention(cfg, layer_idx=0)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        x = torch.randn(2, 114, 32, device="cuda")
+        pos = torch.arange(114, device="cuda").unsqueeze(0).expand(2, -1)
+        cos_sin = rope(x, pos)
+        out_flex = attn(x, cos_sin)
+
+        # manual eager equivalent: project + rotate + eager_attention
+        q = attn.q_proj(x).view(2, 114, cfg.num_attention_heads, attn.head_dim)
+        k = attn.k_proj(x).view(2, 114, cfg.num_key_value_heads, attn.head_dim)
+        v = attn.v_proj(x).view(2, 114, cfg.num_key_value_heads, attn.head_dim)
+        cos, sin = cos_sin
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        eager = eager_attention(q, k, v, cfg.sliding_window_size)
+        eager = eager.reshape(2, 114, -1)
+        out_eager = attn.out(eager)
+        assert torch.allclose(out_flex, out_eager, atol=1e-3)
