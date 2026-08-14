@@ -12,11 +12,23 @@ def _():
     return (mo,)
 
 
+app._unparsable_cell(
+    r"""
+    # --force-reinstall is required: pip skips reinstalling if the version is unchanged.
+    !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
+    """,
+    name="_",
+)
+
+
 @app.cell
 def _():
-    # !pip install -q -e ".[notebook]" #
+    import os
     import random
     from pathlib import Path
+
+    # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
+    os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
 
     import torch
     import pandas as pd

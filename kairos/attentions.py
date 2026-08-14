@@ -9,16 +9,39 @@ from einops import rearrange
 from torch import nn
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
-if torch.cuda.is_available():
-    try:
-        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+_ATTN_BACKEND = os.environ.get("KAIROS_ATTN_BACKEND", "auto").strip().lower()
 
-        flex_attention = torch.compile(flex_attention)
-        ATTN_IMPL = "flex"
-    except Exception:  # noqa: BLE001 — flex_attention compile can fail; must not crash import
-        ATTN_IMPL = "eager"
-else:
+# flex needs SM >= 7.0; below that torch.compile cannot fuse it (unfused = O(L^2)).
+_FLEX_MIN_COMPUTE_CAPABILITY = (7, 0)
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    flex_attention = torch.compile(flex_attention)
+    _FLEX_IMPORT_OK = True
+except Exception:  # noqa: BLE001 - flex compile can fail; must not crash import
+    create_block_mask = None
+    flex_attention = None
+    _FLEX_IMPORT_OK = False
+
+
+def _can_fuse_flex():
+    if not torch.cuda.is_available():
+        return False
+    cap = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return cap >= _FLEX_MIN_COMPUTE_CAPABILITY
+
+
+if _ATTN_BACKEND == "flex":
+    # explicit opt-in; fail loudly if flex_attention cannot be imported
+    if not _FLEX_IMPORT_OK:
+        raise ImportError("KAIROS_ATTN_BACKEND=flex requested but flex_attention is unavailable")
+    ATTN_IMPL = "flex"
+elif _ATTN_BACKEND == "eager":
+    # windowed bidirectional SWA is O(L*W) with the eager unfold path
     ATTN_IMPL = "eager"
+else:  # "auto" (default): flex on a fused-capable GPU, eager otherwise
+    ATTN_IMPL = "flex" if _FLEX_IMPORT_OK and _can_fuse_flex() else "eager"
 
 try:
     from fla.ops.gated_delta_rule import (
@@ -102,8 +125,6 @@ def apply_rotary_emb(x, cos, sin):
 
 
 # Eager attention (CPU / fallback)
-
-
 def eager_attention(q, k, v, window, key_padding_mask=None):
     _, Lq, H, D = q.shape
     Lk = k.shape[1]
@@ -139,7 +160,11 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
 
 
 # Flex mask builder (bidir)
+# flex block size; bucketing lengths up to it keeps the mask/kernel shape stable.
+_FLEX_BLOCK_SIZE = 128
 
+def _round_up(n, block):
+    return ((n + block - 1) // block) * block
 
 def build_flex_mask(q_len, kv_len, window, device=None):
     def bidir_window(b, h, q_idx, kv_idx):
@@ -157,10 +182,18 @@ def build_flex_mask_padded(window, attention_mask):
 
     return create_block_mask(bidir_window_padded, B=B, H=None, Q_LEN=Lk, KV_LEN=Lk)
 
+def build_flex_mask_bucketed(window, q_mask, kv_mask, device=None):
+    """Bucketed bidir window mask: fixed block shape, padded q-rows attend kv 0."""
+    B, bq = kv_mask.shape
+
+    def bidir_window_bucketed(b, h, q_idx, kv_idx):
+        in_window = (kv_idx >= q_idx - window) & (kv_idx <= q_idx + window) & kv_mask[b, kv_idx]
+        # padded query rows attend only to kv 0 (finite softmax; outputs discarded)
+        return torch.where(q_mask[b, q_idx], in_window, kv_idx == 0)
+
+    return create_block_mask(bidir_window_bucketed, B=B, H=None, Q_LEN=bq, KV_LEN=bq, device=device)
 
 # Kairos Attention (SWA bidirectional)
-
-
 class KairosAttention(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
@@ -190,6 +223,63 @@ class KairosAttention(nn.Module):
             self._flex_mask_cache[key] = mask
         return mask
 
+    def _flex_mask_bucketed(self, bq, q_len, B, device):
+        # content depends only on (bucket, real length, batch); cached
+        key = ("bucket", bq, q_len, B, str(device))
+        mask = self._flex_mask_cache.get(key)
+        if mask is None:
+            q_mask = torch.ones(B, bq, dtype=torch.bool, device=device)
+            q_mask[:, q_len:] = False
+            kv_mask = torch.ones(B, bq, dtype=torch.bool, device=device)
+            kv_mask[:, q_len:] = False
+            mask = build_flex_mask_bucketed(self.window, q_mask, kv_mask, device=device)
+            self._flex_mask_cache[key] = mask
+        return mask
+
+    def _flex_mask_bucketed_padded(self, bq, attention_mask, device):
+        # per-row pad_mask (gather_active); rebuilt per step (content varies), block fixed.
+        B, kv_len = attention_mask.shape
+        padded = F.pad(attention_mask.bool(), (0, bq - kv_len), value=False)
+        return build_flex_mask_bucketed(self.window, padded, padded.clone(), device=device)
+
+    def _flex_train(self, q, k, v, q_len, attention_mask):
+        # round up to flex block so mask shape (and compiled kernel) is stable per length.
+        bq = _round_up(q_len, _FLEX_BLOCK_SIZE)
+        if bq > q_len:
+            pad_n = bq - q_len
+            q = F.pad(q, (0, 0, 0, 0, 0, pad_n))
+            k = F.pad(k, (0, 0, 0, 0, 0, pad_n))
+            v = F.pad(v, (0, 0, 0, 0, 0, pad_n))
+        has_padding = attention_mask is not None and not bool(attention_mask.all())
+        if has_padding:
+            block_mask = self._flex_mask_bucketed_padded(bq, attention_mask, q.device)
+        else:
+            block_mask = self._flex_mask_bucketed(bq, q_len, q.size(0), q.device)
+        out = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask=block_mask,
+            scale=self.head_dim**-0.5,
+        )
+        return out.transpose(1, 2)[:, :q_len].contiguous()
+
+    def _flex_cached(self, q, k, v, attention_mask):
+        # decode/prefill: exact-length masks (q_len < kv_len when cached)
+        has_padding = attention_mask is not None and not bool(attention_mask.all())
+        if has_padding:
+            block_mask = build_flex_mask_padded(self.window, attention_mask)
+        else:
+            block_mask = self._flex_mask(q.size(1), k.size(1), q.device)
+        out = flex_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            block_mask=block_mask,
+            scale=self.head_dim**-0.5,
+        )
+        return out.transpose(1, 2)
+
     def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
         B, L, _ = x.shape
         if cache_params is not None and self.layer_idx is not None:
@@ -214,19 +304,12 @@ class KairosAttention(nn.Module):
         if cache_params is not None:
             k, v = cache_params.update(k, v, self.layer_idx)
             cache_params.trim(self.layer_idx)
-        has_padding = attention_mask is not None and not bool(attention_mask.all())
         if ATTN_IMPL == "flex":
-            if has_padding:
-                block_mask = build_flex_mask_padded(self.window, attention_mask)
+            q_len, kv_len = q.size(1), k.size(1)
+            if q_len == kv_len and q_len > 0:
+                out = self._flex_train(q, k, v, q_len, attention_mask)
             else:
-                block_mask = self._flex_mask(q.size(1), k.size(1), q.device)
-            out = flex_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                block_mask=block_mask,
-                scale=self.head_dim**-0.5,
-            ).transpose(1, 2)
+                out = self._flex_cached(q, k, v, attention_mask)
         else:
             out = eager_attention(q, k, v, self.window, key_padding_mask=attention_mask)
         out = out.reshape(B, L, self.n_heads * self.head_dim)
