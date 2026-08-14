@@ -6,6 +6,18 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    import os
+
+    from huggingface_hub import login
+
+    # set via Kaggle > Secrets > Add secret (key: HF_TOKEN), or paste the token here
+    HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
+    login(token=HF_TOKEN, add_to_git_credential=False)
+    return
+
+
+@app.cell
+def _():
     # marimo without widget for Jupyter/Colab compatibility.
     import marimo as mo
 
