@@ -395,7 +395,7 @@ class KairosScaleRouter(nn.Module):
         D = output.shape[-1]
         idx = positions.unsqueeze(-1).expand(-1, -1, D)
         current = torch.gather(output, 1, idx)
-        values = torch.where(pad_mask.unsqueeze(-1), chunk, current)
+        values = torch.where(pad_mask.unsqueeze(-1), chunk.to(output.dtype), current)
         return output.scatter(1, idx, values)
 
 
