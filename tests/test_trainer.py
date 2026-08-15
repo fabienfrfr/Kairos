@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
-from kairos.modeling import KairosConfig, KairosDiffusionLLM
+from kairos.modeling import KairosConfig, KairosDiffusionFM
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import KairosDiffusionTrainer
 
@@ -35,7 +35,7 @@ def config(tokenizer):
 @pytest.fixture
 def model(config, tokenizer):
     torch.manual_seed(42)
-    return KairosDiffusionLLM(config, vocab_size=len(tokenizer))
+    return KairosDiffusionFM(config, vocab_size=len(tokenizer))
 
 
 @pytest.fixture
@@ -48,7 +48,7 @@ def dense_config(tokenizer):
 @pytest.fixture
 def dense_model(dense_config, tokenizer):
     torch.manual_seed(42)
-    return KairosDiffusionLLM(dense_config, vocab_size=len(tokenizer))
+    return KairosDiffusionFM(dense_config, vocab_size=len(tokenizer))
 
 
 def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
@@ -123,7 +123,7 @@ def test_compute_loss_backward_compatible_without_modality_or_mask(tokenizer):
     """SFT/DPO/RL-style batches (no modality_ids/mask keys) must still work."""
     torch.manual_seed(0)
     dense_config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=len(tokenizer), num_modalities=8)
-    dense_model = KairosDiffusionLLM(dense_config, vocab_size=len(tokenizer))
+    dense_model = KairosDiffusionFM(dense_config, vocab_size=len(tokenizer))
 
     ids = tokenizer.encode("hello world", add_special_tokens=False)
     ids = ids + [tokenizer.pad_token_id] * (32 - len(ids))

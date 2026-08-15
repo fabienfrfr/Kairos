@@ -10,7 +10,7 @@ from kairos.modeling import (
     KairosCache,
     KairosConfig,
     KairosDiffusionBackbone,
-    KairosDiffusionLLM,
+    KairosDiffusionFM,
     KairosEmbedding,
     KairosMultiCache,
     PyramidalConvCodec,
@@ -217,7 +217,7 @@ def test_codec_roundtrip():
 
 
 def test_kairos_model_init(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     assert model is not None
 
 
@@ -226,7 +226,7 @@ def test_post_init_is_called_and_initializes_all_parameters():
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
 
     non_finite = [name for name, p in model.named_parameters() if not torch.isfinite(p).all()]
     assert non_finite == [], f"non-finite parameters right after construction: {non_finite}"
@@ -237,7 +237,7 @@ def test_moe_expert_weights_are_not_uninitialized_memory():
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
 
     found_experts = False
     for module in model.modules():
@@ -249,20 +249,20 @@ def test_moe_expert_weights_are_not_uninitialized_memory():
 
 
 def test_kairos_model_forward(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     x = torch.randint(0, 259, (2, 16))
     out = model(input_ids=x)
     assert out.logits.shape == (2, 16, 259)
 
 
 def test_kairos_model_forward_requires_input_ids(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     with pytest.raises(ValueError, match="input_ids"):
         model()
 
 
 def test_kairos_model_forward_with_self_conditioning(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     x = torch.randint(0, 259, (2, 16))
     logits = torch.randn(2, 16, 259)
     out = model(input_ids=x, self_conditioning_logits=logits)
@@ -270,7 +270,7 @@ def test_kairos_model_forward_with_self_conditioning(config):
 
 
 def test_kairos_cache_get_ssm_cache_roundtrip(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     cache = KairosMultiCache(config)
     x = torch.randint(0, 259, (2, 16))
     model(input_ids=x, cache_params=cache)
@@ -280,14 +280,14 @@ def test_kairos_cache_get_ssm_cache_roundtrip(config):
 
 
 def test_no_nan_forward(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     x = torch.randint(0, 259, (2, 8))
     out = model(input_ids=x)
     assert not torch.isnan(out.logits).any()
 
 
 def test_backward_pass(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     x = torch.randint(0, 259, (2, 8))
     out = model(input_ids=x)
     loss = out.logits.mean()
@@ -301,7 +301,7 @@ def test_backward_pass(config):
 
 def test_diffusion_trainer_loss(config):
     B, L, vocab = 2, 8, 50
-    model = KairosDiffusionLLM(config, vocab_size=vocab)
+    model = KairosDiffusionFM(config, vocab_size=vocab)
     trainer = KairosDiffusionTrainer(model=model)
     inputs = {"input_ids": torch.randint(0, vocab, (B, L)), "prompt_len": torch.zeros(B, dtype=torch.long)}
     loss = trainer.compute_loss(model, inputs)
@@ -314,7 +314,7 @@ def test_diffusion_trainer_loss(config):
 
 def test_diffusion_trainer_backward(config):
     B, L, vocab = 2, 8, 50
-    model = KairosDiffusionLLM(config, vocab_size=vocab)
+    model = KairosDiffusionFM(config, vocab_size=vocab)
     trainer = KairosDiffusionTrainer(model=model)
     inputs = {"input_ids": torch.randint(0, vocab, (B, L)), "prompt_len": torch.zeros(B, dtype=torch.long)}
     loss = trainer.compute_loss(model, inputs)
@@ -325,7 +325,7 @@ def test_diffusion_trainer_backward(config):
 
 def test_diffusion_trainer_applies_noise(config):
     B, L, vocab = 2, 16, 100
-    model = KairosDiffusionLLM(config, vocab_size=vocab)
+    model = KairosDiffusionFM(config, vocab_size=vocab)
     trainer = KairosDiffusionTrainer(model=model)
     x0 = torch.randint(0, vocab, (B, L))
     inputs = {"input_ids": x0.clone(), "prompt_len": torch.zeros(B, dtype=torch.long)}
@@ -560,7 +560,7 @@ def test_backbone_cache_conditions_output(config):
 
 
 def test_model_forward_with_cache(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     cache = KairosMultiCache(config)
     x = torch.randint(0, 259, (1, 16))
     out = model(input_ids=x, cache_params=cache)
@@ -569,7 +569,7 @@ def test_model_forward_with_cache(config):
 
 
 def test_model_diffusion_stability_with_cache(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     x_ctx = torch.randint(0, 259, (1, 16))
     x_m = torch.randint(0, 259, (1, 8))
     cache = KairosMultiCache(config)

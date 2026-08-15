@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .dataset import KairosPretrainingDataset
-from .modeling import KairosConfig, KairosDiffusionLLM, KairosMultiCache, gate_memory_bank
+from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer, compute_masked_diffusion_losses, make_diffusion_mask
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
@@ -92,7 +92,7 @@ class KairosMultimodalPipeline:
 
         self.device = train_config.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model: KairosDiffusionLLM | None = None
+        self.model: KairosDiffusionFM | None = None
         self.dataset: KairosPretrainingDataset | None = None
         self.loader: DataLoader | None = None
         self.eval_loader: DataLoader | None = None
@@ -179,7 +179,7 @@ class KairosMultimodalPipeline:
                 drop_last=False,
             )
 
-        self.model = KairosDiffusionLLM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
+        self.model = KairosDiffusionFM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)

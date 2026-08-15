@@ -463,7 +463,7 @@ class KairosOutput(CausalLMOutputWithPast):
     modality_logits: torch.FloatTensor = None
 
 
-class KairosDiffusionLLM(PreTrainedModel, KairosDiffusionGenerationMixin):
+class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
     def __init__(self, config, vocab_size=None, use_moe=None):
         super().__init__(config)
         if use_moe is None:

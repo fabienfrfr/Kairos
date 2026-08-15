@@ -3,7 +3,7 @@ import torch
 
 from kairos.modeling import (
     KairosConfig,
-    KairosDiffusionLLM,
+    KairosDiffusionFM,
     KairosMultiCache,
     KairosScaleRouter,
 )
@@ -167,7 +167,7 @@ def test_gather_scatter_backward():
 
 
 def test_model_forward_batch_independence_via_routing(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     x = torch.randint(0, 259, (2, 16))
     modality_ids = torch.zeros(2, 16, dtype=torch.long)
     modality_ids[0, :8] = 1
@@ -179,7 +179,7 @@ def test_model_forward_batch_independence_via_routing(config):
 
 
 def test_model_cache_offset_consistent_across_scales(config):
-    model = KairosDiffusionLLM(config)
+    model = KairosDiffusionFM(config)
     cache = KairosMultiCache(config)
     x_ctx = torch.randint(0, 259, (1, 16))
     x_next = torch.randint(0, 259, (1, 8))

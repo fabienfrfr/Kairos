@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from kairos.dataset import pack_multimodal_data
-from kairos.modeling import KairosConfig, KairosDiffusionLLM
+from kairos.modeling import KairosConfig, KairosDiffusionFM
 from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 from kairos.tokenizer import Modality
 from kairos.utils import TrainingSummary, count_parameters
@@ -214,7 +214,7 @@ def test_memory_gate_bottleneck_keeps_param_count_small():
 
 def test_memory_gate_is_shared_across_layers_and_scales():
     model_config = KairosConfig(d_model=32, n_heads=2, n_layers=3, use_memory_gate=True)
-    model = KairosDiffusionLLM(model_config)
+    model = KairosDiffusionFM(model_config)
     n_gate_modules = sum(1 for m in model.modules() if type(m).__name__ == "KairosMemoryGate")
     assert n_gate_modules == 1
 

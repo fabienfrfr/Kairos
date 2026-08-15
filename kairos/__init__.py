@@ -1,6 +1,6 @@
 """KairosFM: less parameters, more signal."""
 
-from .modeling import KairosConfig, KairosDiffusionLLM, KairosMemoryGate, KairosMultiCache, gate_memory_bank
+from .modeling import KairosConfig, KairosDiffusionFM, KairosMemoryGate, KairosMultiCache, gate_memory_bank
 from .pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 from .tokenizer import KairosTokenizer, Modality
 
@@ -12,7 +12,7 @@ except ImportError:
 __all__ = [
     "DataConfig",
     "KairosConfig",
-    "KairosDiffusionLLM",
+    "KairosDiffusionFM",
     "KairosMemoryGate",
     "KairosMultiCache",
     "KairosMultimodalPipeline",
