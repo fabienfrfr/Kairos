@@ -46,6 +46,8 @@ class TrainConfig:
     eval_batches: int = 2  # eval batches per evaluation, capped; keep small
     grad_clip: float = 1.0
     mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows sharply as this shrinks
+    mask_p_max: float = 1.0  # ceiling of p; cap below 1.0 (e.g. 0.3) for an MAE-style fixed-rate curriculum stage
+    mask_reweight: bool = True  # divide CE by p; set False for plain CE (pairs with a capped mask_p_max)
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
@@ -193,6 +195,8 @@ class KairosMultimodalPipeline:
             model=self.model, args=TrainingArguments(output_dir=str(run_dir), report_to=tc.report_to)
         )
         self.hf_trainer.mask_eps = tc.mask_eps
+        self.hf_trainer.mask_p_max = tc.mask_p_max
+        self.hf_trainer.mask_reweight = tc.mask_reweight
         self.writer = SummaryWriter(str(self.tb_dir))
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt:

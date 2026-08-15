@@ -243,7 +243,9 @@ def _():
     CFG_STRIDE = 3
     CFG_NUM_SCALES = 4
     CFG_ATTNRES_BLOCK = 4
-    CFG_EXPERTS = 7  # 0 = dense FFN
+    CFG_EXPERTS = 7  # 0 = dense FFN. Top-1 routing (see CFG_EXPERTS_PER_TOK) is slow to converge on tiny
+    # overfit-test runs since gradient only reaches the chosen expert per token; set to 0 to isolate whether
+    # the backbone itself can memorize before blaming routing.
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
     CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
@@ -331,6 +333,8 @@ def _():
     TRAIN_STRIDE = 3
     TRAIN_SAVE_EVERY = 200
     TRAIN_MASK_EPS = 1e-3  # floor of masked-diffusion rate p (CE/p); lower -> more variance, harder to overfit fast
+    TRAIN_MASK_P_MAX = 1.0  # ceiling of p. Set e.g. 0.3 for an MAE-style fixed-rate curriculum (bootstrap) stage
+    TRAIN_MASK_REWEIGHT = True  # divide CE by p (full diffusion). Set False for plain CE when using a capped p_max
     TRAIN_EVAL_EVERY = 100  # eval on held-out set every N steps (0 = off)
     TRAIN_EVAL_BATCHES = 2  # batches per eval; small keeps it cheap
     TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to
@@ -354,6 +358,8 @@ def _():
         TRAIN_EVAL_EVERY,
         TRAIN_LR,
         TRAIN_MASK_EPS,
+        TRAIN_MASK_P_MAX,
+        TRAIN_MASK_REWEIGHT,
         TRAIN_MAX_LEN,
         TRAIN_PACK,
         TRAIN_RUN_DIR,
@@ -377,6 +383,8 @@ def _(
     TRAIN_MAX_LEN,
     TRAIN_PACK,
     TRAIN_MASK_EPS,
+    TRAIN_MASK_P_MAX,
+    TRAIN_MASK_REWEIGHT,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
     TRAIN_STRIDE,
@@ -404,6 +412,8 @@ def _(
     train_config = TrainConfig(
         lr=TRAIN_LR,
         mask_eps=TRAIN_MASK_EPS,
+        mask_p_max=TRAIN_MASK_P_MAX,
+        mask_reweight=TRAIN_MASK_REWEIGHT,
         epochs=TRAIN_EPOCHS,
         save_every=TRAIN_SAVE_EVERY,
         eval_every=TRAIN_EVAL_EVERY,
