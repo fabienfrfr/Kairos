@@ -13,10 +13,10 @@ from kairos.modeling import (
     KairosDiffusionFM,
     KairosEmbedding,
     KairosMultiCache,
-    PyramidalConvCodec,
+    PyramidalLinearCodec,
 )
 from kairos.tokenizer import KairosTokenizer
-from kairos.trainer import KairosDiffusionTrainer
+from kairos.trainer import KairosDiffusionTrainer, make_diffusion_mask
 
 
 @pytest.fixture
@@ -209,11 +209,42 @@ def test_token_embedding():
 
 
 def test_codec_roundtrip():
-    codec = PyramidalConvCodec(32, stride=3)
+    codec = PyramidalLinearCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
     encoded = codec.encode(x)
     decoded = codec.decode(encoded)
     assert decoded.shape == x.shape
+
+
+def test_codec_roundtrip_length_not_a_multiple_of_any_patch():
+    # 16 isn't a multiple of any of stride**1..4 = 3, 9, 27, 81: exercises the padding path
+    # on every scale at once.
+    codec = PyramidalLinearCodec(32, stride=3, num_scales=4)
+    x = torch.randn(2, 16, 32)
+    decoded = codec.decode(codec.encode(x))
+    assert decoded.shape == x.shape
+
+
+def test_codec_decode_has_no_zeroed_positions():
+    # regression: the old strided-conv codec left 2 out of every `stride` positions as a hard
+    # zero after decode (kernel narrower than stride at the finest scale). The linear
+    # patchify/unpatchify codec must give every position a real, nonzero contribution.
+    codec = PyramidalLinearCodec(32, stride=3, num_scales=4)
+    x = torch.randn(2, 30, 32)
+    decoded = codec.decode(codec.encode(x))
+    per_position_norm = decoded.norm(dim=-1)
+    assert (per_position_norm > 1e-6).all()
+
+
+def test_codec_every_input_position_affects_every_output_position_in_its_patch():
+    # a real linear layer over the whole patch means each of the `patch` reconstructed
+    # positions has nonzero gradient w.r.t. every input position in that patch - unlike the
+    # old kernel=1 conv, where only 1-in-`patch` positions carried any signal at all.
+    codec = PyramidalLinearCodec(4, stride=3, num_scales=1)
+    x = torch.randn(1, 3, 4, requires_grad=True)
+    decoded = codec.decode(codec.encode(x))
+    decoded[0, 1].sum().backward()
+    assert (x.grad.abs().sum(dim=-1) > 0).all()
 
 
 def test_kairos_model_init(config):
@@ -321,6 +352,51 @@ def test_diffusion_trainer_backward(config):
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.requires_grad]
     assert any(g is not None for g in grads)
+
+
+def test_model_overfits_a_tiny_batch_without_collapsing_to_noise(config):
+    # Convergence sanity check: on a handful of fixed, repeated sequences the model must both
+    # (a) drive the MAE-style loss well below the "predicting uniformly at random" baseline
+    # ln(vocab_size), and (b) end up with token-level accuracy clearly above chance - not just a
+    # lower loss from confidently-wrong-but-less-uniform logits. Kept small (dense FFN, no MoE,
+    # short sequences, few steps) so it stays fast in CI while still exercising the codec + full
+    # backbone + lm_head path end to end.
+    torch.manual_seed(0)
+    vocab = 64
+    seq_len = 12
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=vocab, num_modalities=2, use_moe=False)
+    model = KairosDiffusionFM(cfg, vocab_size=vocab)
+    trainer = KairosDiffusionTrainer(model=model)
+    trainer.mask_p_max = 0.3
+    trainer.mask_reweight = False
+
+    x0 = torch.randint(0, vocab, (4, seq_len))
+    prompt_len = torch.zeros(4, dtype=torch.long)
+    inputs = {"input_ids": x0, "prompt_len": prompt_len}
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    random_baseline = torch.log(torch.tensor(float(vocab)))
+    first_loss = None
+    for _ in range(80):
+        optimizer.zero_grad()
+        loss = trainer.compute_loss(model, inputs)
+        if first_loss is None:
+            first_loss = loss.item()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+    assert first_loss > random_baseline.item() * 0.5  # sanity: started near/above the chance floor
+    assert loss.item() < first_loss * 0.5  # meaningfully below where it started
+    assert loss.item() < random_baseline.item() * 0.5  # and well below "uniform guessing"
+
+    model.eval()
+    with torch.no_grad():
+        noise_mask, p = make_diffusion_mask(x0, prompt_len, eps=trainer.mask_eps, p_max=trainer.mask_p_max)
+        logits = model(decoder_input_ids=x0, modality_ids=torch.zeros_like(x0)).logits
+        preds = logits[noise_mask].argmax(dim=-1)
+        accuracy = (preds == x0[noise_mask]).float().mean().item()
+    assert accuracy > 3.0 / vocab  # clearly better than chance (1/vocab), not just lower CE
 
 
 def test_diffusion_trainer_applies_noise(config):

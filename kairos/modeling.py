@@ -342,18 +342,19 @@ class KairosEmbedding(nn.Module):
 
 
 class OutputHead(nn.Module):
+    """Predicts only the flat token stream. modality_id is an input (which backbone/scale a
+    position is routed to), never a prediction target - there is a single element to predict,
+    like byte-by-byte generation across modalities, not one head per input field."""
+
     def __init__(self, embedding: KairosEmbedding):
         super().__init__()
         d_model = embedding.token_embed.embedding_dim
         self.vocab_size = embedding.token_embed.num_embeddings
-        self.num_modalities = embedding.modality_embed.num_embeddings
         self.token_head = nn.Linear(d_model, self.vocab_size, bias=False)
-        self.modality_head = nn.Linear(d_model, self.num_modalities, bias=False)
         self.token_head.weight = embedding.token_embed.weight
-        self.modality_head.weight = embedding.modality_embed.weight
 
     def forward(self, h):
-        return self.token_head(h), self.modality_head(h)
+        return self.token_head(h)
 
 
 class KairosScaleRouter(nn.Module):
@@ -402,58 +403,60 @@ class CodecOutput:
     length: int
 
 
-class PyramidalConvCodec(nn.Module):
-    """Parallel multi-scale convolutional codec with modality routing."""
+class PyramidalLinearCodec(nn.Module):
+    """Parallel multi-scale codec with modality routing, built from linear patchify/unpatchify
+    instead of strided convolution.
+
+    A strided depthwise conv with a kernel narrower than its stride (the finest scale needs
+    kernel_size=1 at stride=3) only ever looks at one position in three and, on decode, writes
+    real values back at that same one-in-three position, leaving the other two literally zero
+    before fusion. That is a hard information bottleneck at the one place (the codec) it can't be
+    routed around, which is disproportionately costly for byte-level text where every position
+    matters.
+
+    Instead, each scale groups `patch = stride ** (level + 1)` consecutive positions and applies
+    a single Linear over the whole group both ways: encode reads all `patch` positions to produce
+    one token, decode writes a distinct value back to each of the `patch` positions. No position
+    is ever zero-filled; the only lossy step is the linear projection itself, same as any other
+    layer in the network.
+    """
 
     def __init__(self, d_model, stride=5, num_scales=4):
         super().__init__()
         self.stride = stride
         self.num_scales = num_scales
-        self.encoders = nn.ModuleList()
-        self.decoders = nn.ModuleList()
-        for level in range(num_scales):
-            scale_stride = stride ** (level + 1)
-            kernel_size = scale_stride // 2
-            kernel_size += kernel_size % 2 == 0
-            padding = kernel_size // 2
-            self.encoders.append(
-                nn.Conv1d(
-                    d_model, d_model, kernel_size=kernel_size, stride=scale_stride, padding=padding, groups=d_model
-                )
-            )
-            self.decoders.append(
-                nn.ConvTranspose1d(
-                    d_model,
-                    d_model,
-                    kernel_size=kernel_size,
-                    stride=scale_stride,
-                    padding=padding,
-                    output_padding=max(scale_stride - 1, 0),
-                    groups=d_model,
-                )
-            )
+        self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
+        self.encoders = nn.ModuleList(nn.Linear(d_model * patch, d_model) for patch in self.patch_sizes)
+        self.decoders = nn.ModuleList(nn.Linear(d_model, d_model * patch) for patch in self.patch_sizes)
         self.norm = KairosNorm(d_model * num_scales)
         self.fusion = nn.Linear(d_model * num_scales, d_model)
 
+    @staticmethod
+    def _pad_to_multiple(x, patch):
+        length = x.shape[1]
+        remainder = length % patch
+        return F.pad(x, (0, 0, 0, patch - remainder)) if remainder else x
+
     def encode(self, x):
-        h = x.transpose(1, 2)
-        scales = [encoder(h).transpose(1, 2) for encoder in self.encoders]
-        return CodecOutput(scales=scales, length=x.shape[1])
+        length = x.shape[1]
+        scales = []
+        for patch, encoder in zip(self.patch_sizes, self.encoders):
+            padded = self._pad_to_multiple(x, patch)
+            batch, padded_len, d_model = padded.shape
+            grouped = padded.reshape(batch, padded_len // patch, patch * d_model)
+            scales.append(encoder(grouped))
+        return CodecOutput(scales=scales, length=length)
 
     def decode(self, encoded):
-        scales = encoded.scales
         length = encoded.length
         reconstructed = []
-        for scale, decoder in zip(scales, self.decoders):
-            h = decoder(scale.transpose(1, 2))
-            reconstructed.append(h.transpose(1, 2))
-        padded = []
-        for r in reconstructed:
-            if r.shape[1] < length:
-                pad_amount = length - r.shape[1]
-                r = F.pad(r.transpose(1, 2), (0, pad_amount), mode="replicate").transpose(1, 2)
-            padded.append(r[:, :length])
-        h = torch.cat(padded, dim=-1)
+        for scale, decoder, patch in zip(encoded.scales, self.decoders, self.patch_sizes):
+            batch, num_groups, _ = scale.shape
+            expanded = decoder(scale).reshape(batch, num_groups * patch, -1)
+            if expanded.shape[1] < length:
+                expanded = F.pad(expanded, (0, 0, 0, length - expanded.shape[1]))
+            reconstructed.append(expanded[:, :length])
+        h = torch.cat(reconstructed, dim=-1)
         h = self.norm(h)
         return self.fusion(h)
 
@@ -461,7 +464,6 @@ class PyramidalConvCodec(nn.Module):
 @dataclass
 class KairosOutput(CausalLMOutputWithPast):
     encoder_last_hidden_state: torch.FloatTensor = None
-    modality_logits: torch.FloatTensor = None
 
 
 class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
@@ -469,7 +471,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         super().__init__(config)
         if use_moe is None:
             use_moe = config.use_moe
-        self.codec = PyramidalConvCodec(d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales)
+        self.codec = PyramidalLinearCodec(d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales)
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:
             vocab_size = config.vocab_size
@@ -545,5 +547,5 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         decoded = CodecOutput(scales=features, length=encoded.length)
         h = self.codec.decode(decoded)
         h = self.norm(h)
-        token_logits, modality_logits = self.lm_head(h)
-        return KairosOutput(logits=token_logits, modality_logits=modality_logits, past_key_values=cache_params)
+        token_logits = self.lm_head(h)
+        return KairosOutput(logits=token_logits, past_key_values=cache_params)
