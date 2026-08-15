@@ -15,6 +15,7 @@ from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
 try:
     from .generation import KairosDiffusionGenerationMixin
 except ImportError:  # transformers < 5.15: training still works, generation does not
+
     class KairosDiffusionGenerationMixin:
         pass
 

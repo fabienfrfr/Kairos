@@ -775,13 +775,15 @@ def _(
     _rows = [
         ex
         for ex in eval_examples
-        if ex.get("modality") == "text" and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
+        if ex.get("modality") == "text"
+        and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
     ]
     if len(_rows) < GEN_N_EXAMPLES:
         _rows = [
             ex
             for ex in text_examples
-            if ex.get("modality") == "text" and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
+            if ex.get("modality") == "text"
+            and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
         ]
     _rows = _rows[:GEN_N_EXAMPLES]
 
