@@ -293,7 +293,7 @@ class KairosDiffusionBackbone(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([DiffusionBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
         self.norm = KairosNorm(config.hidden_size)
-        self.aggregator = KairosAttnRes(config.hidden_size)
+        self.aggregator = nn.ModuleList([KairosAttnRes(config.hidden_size) for _ in range(config.num_hidden_layers)])
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
         self.deltanet_layer_indices = [i for i, lt in enumerate(config.layers_config) if "d" in lt]
 
@@ -307,8 +307,8 @@ class KairosDiffusionBackbone(nn.Module):
         def sources():
             return [emb] + completed + ([partial] if partial is not None else [])
 
-        for layer in self.layers:
-            h = self.aggregator(sources())
+        for layer_idx, layer in enumerate(self.layers):
+            h = self.aggregator[layer_idx](sources())
             x = layer(
                 h,
                 position_embeddings=position_embeddings,
@@ -332,13 +332,11 @@ class KairosEmbedding(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.modality_embed = nn.Embedding(num_modalities, d_model)
         self.fusion_proj = nn.Linear(d_model * 2, d_model)
-        self.scale = d_model**0.5
 
     def forward(self, token_ids, modality_ids):
         tok = self.token_embed(token_ids)
         mod = self.modality_embed(modality_ids)
         h = self.fusion_proj(torch.cat([tok, mod], dim=-1))
-        h = h * self.scale
         return h
 
 

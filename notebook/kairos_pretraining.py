@@ -330,6 +330,7 @@ def _():
     TRAIN_MAX_LEN = 1024
     TRAIN_STRIDE = 3
     TRAIN_SAVE_EVERY = 200
+    TRAIN_MASK_EPS = 1e-3  # floor of masked-diffusion rate p (CE/p); lower -> more variance, harder to overfit fast
     TRAIN_EVAL_EVERY = 100  # eval on held-out set every N steps (0 = off)
     TRAIN_EVAL_BATCHES = 2  # batches per eval; small keeps it cheap
     TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to
@@ -352,6 +353,7 @@ def _():
         TRAIN_EVAL_BATCHES,
         TRAIN_EVAL_EVERY,
         TRAIN_LR,
+        TRAIN_MASK_EPS,
         TRAIN_MAX_LEN,
         TRAIN_PACK,
         TRAIN_RUN_DIR,
@@ -374,6 +376,7 @@ def _(
     TRAIN_LR,
     TRAIN_MAX_LEN,
     TRAIN_PACK,
+    TRAIN_MASK_EPS,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
     TRAIN_STRIDE,
@@ -400,6 +403,7 @@ def _(
     )
     train_config = TrainConfig(
         lr=TRAIN_LR,
+        mask_eps=TRAIN_MASK_EPS,
         epochs=TRAIN_EPOCHS,
         save_every=TRAIN_SAVE_EVERY,
         eval_every=TRAIN_EVAL_EVERY,

@@ -30,6 +30,8 @@ class KairosDiffusionTrainer(Trainer):
     """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and."""
 
     last_loss_diagnostics: dict | None = None
+    mask_eps: float = 1e-3  # floor of the per-row masking rate p ~ U(eps, 1); CE is divided by p, so a
+    # small eps makes rare low-p rows dominate the loss with high variance. Expose/tune via TrainConfig.mask_eps.
 
     def compute_loss(self, model, inputs, return_outputs=False, cache_params=None):
         x0 = inputs["input_ids"]
@@ -37,7 +39,7 @@ class KairosDiffusionTrainer(Trainer):
         modality_ids = inputs.get("modality_ids")
         pad_mask = inputs.get("mask")
 
-        noise_mask, p = make_diffusion_mask(x0, prompt_len, pad_mask)
+        noise_mask, p = make_diffusion_mask(x0, prompt_len, pad_mask, eps=self.mask_eps)
         if not noise_mask.any():
             # exceedingly rare: short sequence + low mask ratio
             eligible = pad_mask.bool() if pad_mask is not None else torch.ones_like(noise_mask)

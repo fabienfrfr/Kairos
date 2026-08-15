@@ -146,11 +146,11 @@ def test_backbone_block_size_one_matches_original_graph():
     model = KairosDiffusionBackbone(cfg)
     x = torch.randn(2, 6, 16)
 
-    # Reference: the original states=[x]; h=agg(states); x=layer(h);
+    # Reference: the original states=[x]; h=agg[i](states); x=layer(h);
     states = [x]
     xr = x
-    for layer in model.layers:
-        h = model.aggregator(states)
+    for i, layer in enumerate(model.layers):
+        h = model.aggregator[i](states)
         xr = layer(h)
         states.append(xr)
     expected = model.norm(xr)

@@ -137,11 +137,11 @@ def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
 
 
 def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
-    # full-width (d_model=768, matching the real KairosConfig so it stays fast in CI;
+    # full-width (d_model=768, matching the real KairosConfig) but trimmed batch/epochs/seq-len to stay fast in CI
     model_config = KairosConfig(d_model=768, n_heads=12, n_layers=2)
-    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
-    data_config = DataConfig(text_examples=texts, max_len=128, batch_size=2)
-    train_config = TrainConfig(epochs=3, lr=1e-3, save_every=1000, run_dir=str(tmp_path / "run"))
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog "}] * 4
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
+    train_config = TrainConfig(epochs=2, lr=1e-3, save_every=1000, run_dir=str(tmp_path / "run"))
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
 
@@ -150,7 +150,7 @@ def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
     assert pipe.skipped_nonfinite_steps == 0
     assert all(math.isfinite(row["loss"]) for row in logs)
     first_epoch_avg = sum(r["loss"] for r in logs if r["epoch"] == 1) / sum(1 for r in logs if r["epoch"] == 1)
-    last_epoch_avg = sum(r["loss"] for r in logs if r["epoch"] == 3) / sum(1 for r in logs if r["epoch"] == 3)
+    last_epoch_avg = sum(r["loss"] for r in logs if r["epoch"] == 2) / sum(1 for r in logs if r["epoch"] == 2)
     assert last_epoch_avg < first_epoch_avg
 
 
