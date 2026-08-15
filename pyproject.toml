@@ -58,7 +58,7 @@ kairos = ["templates/*.md"]
 
 [tool.setuptools_scm]
 version_file = "kairos/_version.py"
-fallback_version = "0.0.1.dev0"  # editable/no-git-history installs (e.g. this sandbox's rebuilt checkout)
+fallback_version = "0.1.1.dev0"  # editable/no-git-history installs (e.g. this sandbox's rebuilt checkout)
 local_scheme = "no-local-version"
 
 [tool.pytest.ini_options]
