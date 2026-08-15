@@ -211,7 +211,9 @@ def test_compute_masked_diffusion_losses_reweight_true_divides_by_p(dense_model)
     noise_mask[:, 2:5] = True
     p = torch.full_like(x0, fill_value=5, dtype=torch.float)  # p=5 everywhere (unrealistic but isolates the /p math)
 
+    torch.manual_seed(0)  # same noise for both calls, otherwise /p math is masked by fresh noise draws
     reweighted, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    torch.manual_seed(0)
     plain, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
 
     assert torch.allclose(reweighted, plain / 5, atol=1e-5)
