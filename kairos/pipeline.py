@@ -292,8 +292,14 @@ class KairosMultimodalPipeline:
         lr: float = 1e-3,
         seed: int = 0,
         progress_callback=None,
+        mask_p_max: float | None = None,
+        mask_reweight: bool | None = None,
     ) -> list[dict]:
-        """Trains on a tiny subset to verify the model can memorize before a long run (a plateau high means a structural problem; non-destructive, restores model/optimizer/scheduler/loader state on return)."""
+        """Trains on a tiny subset to verify the model can memorize before a long run (a plateau high means a structural problem; non-destructive, restores model/optimizer/scheduler/loader state on return).
+
+        ``mask_p_max``/``mask_reweight`` temporarily override the trainer's masking curriculum for this call
+        only (e.g. MAE-style low, fixed-rate corruption vs. full diffusion), restored afterwards either way.
+        """
         self._require_built()
         from torch.utils.data import Subset
 
@@ -306,6 +312,12 @@ class KairosMultimodalPipeline:
         saved_best = self.best_loss
         saved_eval_logs = self.eval_log_rows
         saved_best_eval = self.best_eval_loss
+        saved_mask_p_max = self.hf_trainer.mask_p_max
+        saved_mask_reweight = self.hf_trainer.mask_reweight
+        if mask_p_max is not None:
+            self.hf_trainer.mask_p_max = mask_p_max
+        if mask_reweight is not None:
+            self.hf_trainer.mask_reweight = mask_reweight
 
         n = min(n_examples, len(self.dataset))
         if n == 0 or steps <= 0:
@@ -369,6 +381,8 @@ class KairosMultimodalPipeline:
             self.best_loss = saved_best
             self.eval_log_rows = saved_eval_logs
             self.best_eval_loss = saved_best_eval
+            self.hf_trainer.mask_p_max = saved_mask_p_max
+            self.hf_trainer.mask_reweight = saved_mask_reweight
 
     # ---------------------------------------------------------------- train
     def _require_built(self):

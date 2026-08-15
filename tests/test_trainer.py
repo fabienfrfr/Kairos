@@ -5,7 +5,7 @@ import torch
 from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
 from kairos.modeling import KairosConfig, KairosDiffusionFM
 from kairos.tokenizer import KairosTokenizer
-from kairos.trainer import KairosDiffusionTrainer
+from kairos.trainer import KairosDiffusionTrainer, compute_masked_diffusion_losses, make_diffusion_mask
 
 
 @pytest.fixture
@@ -166,3 +166,107 @@ def test_compute_loss_forces_one_position_without_pad_mask(dense_model, tokenize
     trainer = KairosDiffusionTrainer(model=dense_model)
     loss = trainer.compute_loss(dense_model, batch)
     assert torch.is_tensor(loss) and not torch.isnan(loss)
+
+
+# --- MAE-style curriculum (capped p_max / disabled reweighting) -----------------------------------
+
+
+def _padded_batch(tokenizer, text="hello world", total_len=32):
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    pad_len = total_len - len(ids)
+    ids = ids + [tokenizer.pad_token_id] * pad_len
+    return {
+        "input_ids": torch.tensor([ids], dtype=torch.long),
+        "mask": torch.tensor([[1] * (total_len - pad_len) + [0] * pad_len], dtype=torch.long),
+        "prompt_len": torch.zeros(1, dtype=torch.long),
+    }
+
+
+def test_make_diffusion_mask_default_p_max_matches_full_diffusion():
+    """p_max defaults to 1.0: unchanged behavior from before mask_p_max existed."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, 50, (64, 16))
+    prompt_len = torch.zeros(64, dtype=torch.long)
+    _, p = make_diffusion_mask(x0, prompt_len, eps=1e-3)
+    assert p.max() <= 1.0
+    assert p.min() >= 1e-3
+    # with enough rows, some should land close to the p_max=1.0 ceiling
+    assert p.max() > 0.9
+
+
+def test_make_diffusion_mask_p_max_caps_masking_rate():
+    """A capped p_max (MAE-style curriculum) must never sample p above that ceiling."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, 50, (64, 16))
+    prompt_len = torch.zeros(64, dtype=torch.long)
+    _, p = make_diffusion_mask(x0, prompt_len, eps=1e-3, p_max=0.3)
+    assert p.max() <= 0.3
+    assert p.min() >= 1e-3
+
+
+def test_compute_masked_diffusion_losses_reweight_true_divides_by_p(dense_model):
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=5, dtype=torch.float)  # p=5 everywhere (unrealistic but isolates the /p math)
+
+    reweighted, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    plain, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+
+    assert torch.allclose(reweighted, plain / 5, atol=1e-5)
+
+
+def test_compute_masked_diffusion_losses_reweight_false_is_plain_ce(dense_model):
+    """MAE mode (reweight=False) must not blow up with a tiny p, unlike the default /p weighting."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=1e-3, dtype=torch.float)  # tiny p: /p would explode if reweight were on
+
+    plain, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+    assert torch.isfinite(plain).all()
+    assert plain.max() < 50  # sane CE range for a small vocab, no 1/p blowup
+
+
+def test_trainer_mask_p_max_and_reweight_default_to_full_diffusion(dense_model):
+    """Defaults must reproduce the pre-curriculum behavior exactly."""
+    trainer = KairosDiffusionTrainer(model=dense_model)
+    assert trainer.mask_p_max == 1.0
+    assert trainer.mask_reweight is True
+
+
+def test_trainer_mae_mode_runs_end_to_end(dense_model, tokenizer):
+    """Stage-1 MAE config (capped p_max, no reweighting) must train like any other compute_loss call."""
+    torch.manual_seed(0)
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=dense_model)
+    trainer.mask_p_max = 0.3
+    trainer.mask_reweight = False
+
+    loss = trainer.compute_loss(dense_model, batch)
+
+    assert torch.is_tensor(loss) and not torch.isnan(loss)
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in dense_model.parameters())
+
+
+def test_trainer_mae_mode_never_exceeds_p_max(dense_model, tokenizer, monkeypatch):
+    """compute_loss's internal make_diffusion_mask call must respect trainer.mask_p_max."""
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=dense_model)
+    trainer.mask_p_max = 0.3
+
+    captured = {}
+    real_make_mask = make_diffusion_mask
+
+    def spy(*args, **kwargs):
+        noise_mask, p = real_make_mask(*args, **kwargs)
+        captured["p"] = p
+        return noise_mask, p
+
+    monkeypatch.setattr("kairos.trainer.make_diffusion_mask", spy)
+    trainer.compute_loss(dense_model, batch)
+
+    assert captured["p"].max() <= 0.3

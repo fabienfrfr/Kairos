@@ -75,6 +75,19 @@ def built_pipeline(tmp_path, model_config, text_examples, multimodal_examples):
     return pipe
 
 
+def test_build_wires_mask_curriculum_config_to_trainer(tmp_path, model_config, text_examples):
+    """TrainConfig.mask_p_max / mask_reweight (MAE curriculum stage) must reach the underlying trainer."""
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1, save_every=3, run_dir=str(tmp_path / "run"), mask_p_max=0.3, mask_reweight=False
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    assert pipe.hf_trainer.mask_p_max == 0.3
+    assert pipe.hf_trainer.mask_reweight is False
+
+
 def test_training_converges_with_moe_enabled(tmp_path):
     # regression: use_moe=True used to NaN or block convergence; keep MoE small here
     model_config = KairosConfig(
@@ -875,6 +888,33 @@ def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config
         assert torch.equal(val, pipe.model.state_dict()[key])
     assert pipe.global_step == step_before
     assert pipe.loader is loader_before
+
+
+def test_overfit_test_mask_override_is_applied_and_restored(tmp_path, model_config):
+    """mask_p_max/mask_reweight overrides (MAE vs. diffusion mode) must be used during the call, then reverted."""
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"), mask_p_max=1.0, mask_reweight=True)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    captured_p_max = []
+    captured_reweight = []
+    real_compute_loss = pipe.hf_trainer.compute_loss
+
+    def spy(model, batch, **kw):
+        captured_p_max.append(pipe.hf_trainer.mask_p_max)
+        captured_reweight.append(pipe.hf_trainer.mask_reweight)
+        return real_compute_loss(model, batch, **kw)
+
+    pipe.hf_trainer.compute_loss = spy
+    pipe.overfit_test(n_examples=16, steps=3, mask_p_max=0.3, mask_reweight=False)
+
+    assert all(v == 0.3 for v in captured_p_max)
+    assert all(v is False for v in captured_reweight)
+    # restored to the pipe's original (Stage 2 / diffusion) settings after the call
+    assert pipe.hf_trainer.mask_p_max == 1.0
+    assert pipe.hf_trainer.mask_reweight is True
 
 
 def test_train_without_eval_config_skips_eval(tmp_path, model_config, text_examples):
