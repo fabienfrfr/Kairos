@@ -113,6 +113,18 @@ def test_scatter_active_does_not_touch_inactive_positions(router):
     assert torch.allclose(output[0, [1, 4]], torch.full((2, 2), 99.0))
 
 
+def test_scatter_active_casts_chunk_to_output_dtype(router):
+    x = torch.randn(2, 8, 4, dtype=torch.float16)
+    active_mask = torch.zeros(2, 8, dtype=torch.bool)
+    active_mask[0, [1, 2]] = True
+    active_mask[1, [3]] = True
+    gathered, pad_mask, positions = router.gather_active(x, active_mask)
+    chunk = gathered.double()
+    output = router.scatter_active(x.clone(), chunk, pad_mask, positions)
+    assert output.dtype == torch.float16
+    assert torch.allclose(output, x, atol=1e-3)
+
+
 def test_scatter_active_is_not_inplace(router):
     x = torch.randn(1, 6, 2)
     active_mask = torch.zeros(1, 6, dtype=torch.bool)

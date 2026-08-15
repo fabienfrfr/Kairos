@@ -1,4 +1,4 @@
-"""Byte-level multimodal tokenizer built on ByT5Tokenizer, using periodic LOCAL markers (PixelBytes, arxiv.org/html/2410.01820v2)."""
+"""Byte-level multimodal tokenizer built on ByT5Tokenizer with periodic LOCAL markers."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ _MODALITY_TAGS: dict[Modality, tuple[str, str]] = {
     Modality.META: ("<META>", "</META>"),
 }
 
-# sub-channel tags, e.g. RGB planes or
+# sub-channel tags, e.g. RGB planes or channel-stacked audio
 _CHANNEL_TAGS: dict[str, tuple[str, str]] = {
     "R": ("<R>", "</R>"),
     "G": ("<G>", "</G>"),
@@ -63,7 +63,7 @@ class MultimodalSegment:
 
 
 class KairosTokenizer(ByT5Tokenizer):
-    """Byte-level multimodal tokenizer, ByT5-compatible for text; `encode_multimodal` is the entry point for."""
+    """Byte-level multimodal tokenizer, ByT5-compatible for text; use encode_multimodal."""
 
     # pipeline-level constants — not stored per-instance
     IMAGE_CHANNELS = 3
@@ -121,7 +121,7 @@ class KairosTokenizer(ByT5Tokenizer):
         return ids
 
     def decode_image(self, ids: list[int], channels: int | None = None) -> np.ndarray:
-        """Dimensions recovered by counting <ENDLINE> markers; raises on inconsistent row lengths."""
+        """Dimensions recovered by counting <ENDLINE> markers; raises on bad row lengths."""
         channels = channels or self.IMAGE_CHANNELS
         rows, current = [], []
         for i in ids:
@@ -245,7 +245,7 @@ class KairosTokenizer(ByT5Tokenizer):
 
     # ---------------- multimodal sequence assembly ----------------
     def encode_multimodal(self, segments: list[MultimodalSegment], max_len: int | None = None) -> dict:
-        """Returns {"input_ids", "modality_ids"} aligned tensors; padding uses Modality.TEXT (cheapest routing scale)."""
+        """Returns aligned {"input_ids", "modality_ids"} tensors; padding uses Modality.TEXT."""
         all_ids: list[int] = []
         all_modality: list[int] = []
 
@@ -309,4 +309,4 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# len(KairosTokenizer()) == 291 (259 base bytes/pad/eos/unk
+# len(KairosTokenizer()) == 291 (259 base bytes + pad/eos/unk + locals)

@@ -6,17 +6,47 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    # marimo without widget for Jupyter/Colab compatibility.
-    import marimo as mo
+    import os
 
+    from huggingface_hub import login
+
+    # set via Kaggle > Secrets > Add secret (key: HF_TOKEN), or paste the token here
+    HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
+    login(token=HF_TOKEN, add_to_git_credential=False)
+    return
+
+
+@app.cell
+def _():
+    # marimo without widget for Jupyter/Colab compatibility.
+    try:
+        import marimo as mo
+    except ImportError:  # plain Jupyter/Colab (no marimo): disable marimo widgets
+
+        class _MoStub:
+            @staticmethod
+            def running_in_notebook() -> bool:
+                return False
+
+        mo = _MoStub()
     return (mo,)
 
 
 @app.cell
 def _():
-    # !pip install -q -e ".[notebook]" #
+    # --force-reinstall is required: pip skips reinstalling if the version is unchanged.
+    # !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
+    return
+
+
+@app.cell
+def _():
+    import os
     import random
     from pathlib import Path
+
+    # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
+    os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
 
     import torch
     import pandas as pd
@@ -207,7 +237,7 @@ def _():
     # ---- model settings ----
     # modality_scales routes each modality to a
     # the v3 Block-AttnRes window (1 =
-    CFG_D_MODEL = 88
+    CFG_D_MODEL = 64  # head_dim = 64/4 = 16, power of 2 for flex_attention
     CFG_N_HEADS = 4
     CFG_N_LAYERS = 4
     CFG_STRIDE = 3
@@ -216,7 +246,7 @@ def _():
     CFG_EXPERTS = 7  # 0 = dense FFN
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
-    CFG_INTERMEDIATE = 352
+    CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
     CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     return (
         CFG_ATTNRES_BLOCK,
@@ -295,11 +325,14 @@ def _(
 def _():
     # ---- training settings ----
     TRAIN_LR = 3e-4
-    TRAIN_BATCH = 8
+    TRAIN_BATCH = 32
     TRAIN_EPOCHS = 3
     TRAIN_MAX_LEN = 1024
     TRAIN_STRIDE = 3
     TRAIN_SAVE_EVERY = 200
+    TRAIN_MASK_EPS = 1e-3  # floor of masked-diffusion rate p (CE/p); lower -> more variance, harder to overfit fast
+    TRAIN_EVAL_EVERY = 100  # eval on held-out set every N steps (0 = off)
+    TRAIN_EVAL_BATCHES = 2  # batches per eval; small keeps it cheap
     TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to
 
     # ---- packing: concatenate samples before chunking
@@ -317,7 +350,10 @@ def _():
         HUB_SUBFOLDER,
         TRAIN_BATCH,
         TRAIN_EPOCHS,
+        TRAIN_EVAL_BATCHES,
+        TRAIN_EVAL_EVERY,
         TRAIN_LR,
+        TRAIN_MASK_EPS,
         TRAIN_MAX_LEN,
         TRAIN_PACK,
         TRAIN_RUN_DIR,
@@ -335,9 +371,12 @@ def _(
     HUB_SUBFOLDER,
     TRAIN_BATCH,
     TRAIN_EPOCHS,
+    TRAIN_EVAL_BATCHES,
+    TRAIN_EVAL_EVERY,
     TRAIN_LR,
     TRAIN_MAX_LEN,
     TRAIN_PACK,
+    TRAIN_MASK_EPS,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
     TRAIN_STRIDE,
@@ -364,8 +403,11 @@ def _(
     )
     train_config = TrainConfig(
         lr=TRAIN_LR,
+        mask_eps=TRAIN_MASK_EPS,
         epochs=TRAIN_EPOCHS,
         save_every=TRAIN_SAVE_EVERY,
+        eval_every=TRAIN_EVAL_EVERY,
+        eval_batches=TRAIN_EVAL_BATCHES,
         run_dir=TRAIN_RUN_DIR,
         hub_repo_id=HUB_REPO_ID,
         hub_push_every_ckpt=HUB_PUSH_EVERY_CKPT,
@@ -379,13 +421,16 @@ def _(
 def _(
     KairosMultimodalPipeline,
     data_config,
+    eval_data_config,
     model_config,
     tokenizer,
     train_config,
 ):
     from kairos.utils import count_active_parameters
 
-    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, tokenizer=tokenizer)
+    pipe = KairosMultimodalPipeline(
+        model_config, data_config, train_config, eval_data_config=eval_data_config, tokenizer=tokenizer
+    )
     pipe.build()
 
     total_params = sum(p.numel() for p in pipe.model.parameters())
@@ -453,6 +498,43 @@ def _(pd, pipe):
 
 @app.cell
 def _():
+    OVERFIT_RUN = True  # sanity-check the model can memorize before the real run
+    OVERFIT_EXAMPLES = 64  # tiny subset, repeated each epoch
+    OVERFIT_STEPS = 200  # steps on that subset; loss should crash toward 0
+    return OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS
+
+
+@app.cell
+def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, mo, pipe):
+    # non-destructive: model/optimizer/loader state is restored afterwards
+    _oflogs = []
+    if OVERFIT_RUN:
+        if mo.running_in_notebook():
+            with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
+                _state = {"last_step": 0}
+
+                def _on_step(step, total, loss_val):
+                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
+                    _state["last_step"] = step
+
+                _oflogs = pipe.overfit_test(
+                    n_examples=OVERFIT_EXAMPLES, steps=OVERFIT_STEPS, progress_callback=_on_step
+                )
+        else:
+            from kairos.utils import make_progress_callback
+
+            _oflogs = pipe.overfit_test(
+                n_examples=OVERFIT_EXAMPLES,
+                steps=OVERFIT_STEPS,
+                progress_callback=make_progress_callback(desc="overfit_test"),
+            )
+    else:
+        print("OVERFIT_RUN is False - skipping overfit test")
+    return
+
+
+@app.cell
+def _():
     FORCE_RESTART = True  # True ignores any existing last.pt
     return (FORCE_RESTART,)
 
@@ -483,6 +565,8 @@ def _(FORCE_RESTART, mo, pipe):
 
     print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
     print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
+    if pipe.eval_log_rows:
+        print(f"eval points: {len(pipe.eval_log_rows)}  best eval loss: {pipe.best_eval_loss:.4f}")
     print(f"checkpoints: {pipe.ckpt_dir}")
     return (logs,)
 
@@ -508,11 +592,86 @@ def _(eval_data_config, pipe, torch):
         with torch.no_grad():
             for batch in eval_loader:
                 batch = {k: v.to(pipe.device) for k, v in batch.items()}
-                losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
+                with pipe._autocast():
+                    losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
         pipe.model.train()
         eval_loss = sum(losses) / len(losses)
         pipe.writer.add_scalar("eval/loss", eval_loss, pipe.global_step)
         print(f"eval loss: {eval_loss:.4f} on {len(eval_dataset)} samples")
+    return
+
+
+@app.cell
+def _():
+    # ---- generation smoke test ----
+    GEN_N_EXAMPLES = 3  # number of text prompts to denoise
+    GEN_PROMPT_TOKENS = 32  # keep this many tokens as the fixed prompt
+    GEN_MAX_NEW_TOKENS = 64  # length of the denoised continuation (canvas)
+    GEN_DENOISING_STEPS = 24  # diffusion iterations per canvas
+    GEN_T_MIN = 0.4  # final temperature (cold/confident)
+    GEN_T_MAX = 1.0  # initial temperature (hot/exploratory)
+    GEN_ENTROPY_BOUND = 0.5  # cumulative-entropy bound: higher -> accept more tokens/step
+    GEN_SEED = 0
+    return (
+        GEN_DENOISING_STEPS,
+        GEN_ENTROPY_BOUND,
+        GEN_MAX_NEW_TOKENS,
+        GEN_N_EXAMPLES,
+        GEN_PROMPT_TOKENS,
+        GEN_SEED,
+        GEN_T_MAX,
+        GEN_T_MIN,
+    )
+
+
+@app.cell
+def _(
+    GEN_DENOISING_STEPS,
+    GEN_ENTROPY_BOUND,
+    GEN_MAX_NEW_TOKENS,
+    GEN_N_EXAMPLES,
+    GEN_PROMPT_TOKENS,
+    GEN_SEED,
+    GEN_T_MAX,
+    GEN_T_MIN,
+    eval_examples,
+    pipe,
+    text_examples,
+    tokenizer,
+):
+    # diffusion generation via KairosDiffusionGenerationMixin (reuses the HF
+    # DiffusionGemma EntropyBoundSampler + temperature schedule + adaptive stopping)
+    _rows = [
+        ex
+        for ex in eval_examples
+        if ex.get("modality") == "text" and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
+    ]
+    if len(_rows) < GEN_N_EXAMPLES:
+        _rows = [
+            ex
+            for ex in text_examples
+            if ex.get("modality") == "text" and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
+        ]
+    _rows = _rows[:GEN_N_EXAMPLES]
+
+    for _i, _ex in enumerate(_rows, 1):
+        _ids = tokenizer.encode(_ex["text"], add_special_tokens=False)
+        _prompt = _ids[:GEN_PROMPT_TOKENS]
+        _full = pipe.generate(
+            _prompt,
+            max_new_tokens=GEN_MAX_NEW_TOKENS,
+            max_denoising_steps=GEN_DENOISING_STEPS,
+            entropy_bound=GEN_ENTROPY_BOUND,
+            t_min=GEN_T_MIN,
+            t_max=GEN_T_MAX,
+            seed=GEN_SEED + _i,
+        )
+        _gen = _full[GEN_PROMPT_TOKENS:]
+        _reference = _ids[GEN_PROMPT_TOKENS : GEN_PROMPT_TOKENS + GEN_MAX_NEW_TOKENS]
+        print(f"--- example {_i} ---")
+        print("prompt:    ", tokenizer.decode(_prompt, skip_special_tokens=True))
+        print("generated: ", tokenizer.decode(_gen, skip_special_tokens=True))
+        print("reference: ", tokenizer.decode(_reference, skip_special_tokens=True))
     return
 
 
@@ -529,6 +688,17 @@ def _(logs_df):
         logs_df.plot(x="step", y="loss", figsize=(8, 4), title="Multimodal diffusion loss")
     else:
         print("no logged steps - nothing to plot")
+    return
+
+
+@app.cell
+def _(pd, pipe):
+    if pipe.eval_log_rows:
+        pd.DataFrame(pipe.eval_log_rows).plot(
+            x="step", y="loss", figsize=(8, 4), title="Eval loss (held-out, every N steps)"
+        )
+    else:
+        print("no eval points logged - set TRAIN_EVAL_EVERY > 0")
     return
 
 

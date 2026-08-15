@@ -10,9 +10,7 @@ from datasets import Dataset
 from libzim.reader import Archive
 from tqdm import tqdm
 
-# -------------------------
-# CONFIG
-# -------------------------
+# ------------------------- CONFIG -------------------------
 DEBUG = True
 MAX_ARTICLES = None  # 10  # set to None to process
 
@@ -28,9 +26,7 @@ CATEGORY_RE = re.compile(r"\[\[Category:([^\]|]+)", re.IGNORECASE)
 SKIP_PREFIXES = ("{", "|", "!", "=", "thumb", "right", "left", "center", "File:", "Image:")
 
 
-# -------------------------
-# DOWNLOAD
-# -------------------------
+# ------------------------- DOWNLOAD -------------------------
 def download(url: str, path: str, min_mb: int = 5) -> None:
     if os.path.exists(path) and os.path.getsize(path) / 1e6 > min_mb:
         print(f"[skip] {path}")
@@ -43,9 +39,7 @@ def download(url: str, path: str, min_mb: int = 5) -> None:
             bar.update(len(chunk))
 
 
-# -------------------------
-# SIMPLE-ENGLISH: XML dump
-# -------------------------
+# ------------------------- SIMPLE-ENGLISH: XML dump -------------------------
 def parse_simplewiki(xml_bz2: str) -> list[dict]:
     data = []
     with bz2.open(xml_bz2, "rt", encoding="utf-8", errors="ignore") as f:
@@ -83,13 +77,13 @@ def _wikitext_to_record(title: str, raw: str) -> dict | None:
             if tag.tag.strip_code().lower() == "ref":
                 try:
                     wikicode.remove(tag)
-                except Exception:  # noqa: BLE001, S110 - a single malformed tag must not abort the whole page
+                except Exception:  # noqa: BLE001, S110 - one bad tag must not abort the page
                     pass
         text = wikicode.strip_code()
     except Exception:  # noqa: BLE001 - malformed wikitext must not abort the whole corpus build
         return None
 
-    # Remove any remaining HTML tags and
+    # remove refs and any remaining HTML tags
     text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)
 
@@ -108,9 +102,7 @@ def _wikitext_to_record(title: str, raw: str) -> dict | None:
     return {"prompt": prompt, "text": summary, "seed_data": "simple-english"}
 
 
-# -------------------------
-# VIKIDIA-FR: ZIM
-# -------------------------
+# ------------------------- VIKIDIA-FR: ZIM -------------------------
 def parse_vikidia(zim_path: str) -> list[dict]:
     data, skipped = [], 0
     archive = Archive(zim_path)
@@ -131,7 +123,7 @@ def parse_vikidia(zim_path: str) -> list[dict]:
                     continue
                 title = entry.title.strip()
                 content = bytes(item.content).decode("utf-8", errors="ignore")
-            except Exception:  # noqa: BLE001 - a single corrupted zim entry must not abort the whole dump
+            except Exception:  # noqa: BLE001 - one bad zim entry must not abort the dump
                 skipped += 1
                 bar.update(1)
                 continue
@@ -204,9 +196,7 @@ def _html_to_record(title: str, html: str) -> dict | None:
     return {"prompt": prompt, "text": " ".join(paragraphs)[:600], "seed_data": "vikidia-fr"}
 
 
-# -------------------------
-# RUN
-# -------------------------
+# ------------------------- RUN -------------------------
 SIMPLEWIKI_XML = "simplewiki-articles.xml.bz2"
 VIKIDIA_ZIM = "vikidia.zim"
 

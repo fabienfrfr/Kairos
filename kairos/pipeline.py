@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import random
 import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -18,7 +19,7 @@ from transformers import TrainingArguments
 from .dataset import KairosPretrainingDataset
 from .modeling import KairosConfig, KairosDiffusionLLM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
-from .trainer import KairosDiffusionTrainer
+from .trainer import KairosDiffusionTrainer, compute_masked_diffusion_losses, make_diffusion_mask
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
 
 
@@ -41,15 +42,18 @@ class TrainConfig:
     epochs: int = 3
     save_every: int = 200
     last_ckpt_every: int = 20  # how often last.pt (resume point)
+    eval_every: int = 0  # run eval on the held-out set every N steps (0 = off)
+    eval_batches: int = 2  # eval batches per evaluation, capped; keep small
     grad_clip: float = 1.0
+    mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows sharply as this shrinks
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
     report_to: list = field(default_factory=list)
-    hub_repo_id: str | None = None  # set to also push each
-    hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes step_*.pt/last.pt/best.pt as
+    hub_repo_id: str | None = None  # set to also push each checkpoint
+    hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes checkpoints
     hub_private: bool = False
-    hub_subfolder: str | None = None  # push checkpoints/model under repo_id/<subfolder> instead
+    hub_subfolder: str | None = None  # push under repo_id/<subfolder>
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
@@ -75,10 +79,12 @@ class KairosMultimodalPipeline:
         model_config: KairosConfig,
         data_config: DataConfig,
         train_config: TrainConfig,
+        eval_data_config: DataConfig | None = None,
         tokenizer: KairosTokenizer | None = None,
     ):
         self.model_config = model_config
         self.data_config = data_config
+        self.eval_data_config = eval_data_config
         self.train_config = train_config
         self.tokenizer = tokenizer or KairosTokenizer()
 
@@ -87,21 +93,46 @@ class KairosMultimodalPipeline:
         self.model: KairosDiffusionLLM | None = None
         self.dataset: KairosPretrainingDataset | None = None
         self.loader: DataLoader | None = None
+        self.eval_loader: DataLoader | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self.hf_trainer: KairosDiffusionTrainer | None = None
         self.writer: SummaryWriter | None = None
 
+        # AMP: fp16 on pre-Ampere (T4), bf16 on Ampere+; GradScaler only for fp16.
+        if torch.cuda.is_available():
+            self.amp_device_type = "cuda"
+            self.amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability() >= (8, 0) else torch.float16
+        elif torch.backends.mps.is_available():
+            self.amp_device_type = "mps"
+            self.amp_dtype = torch.float16
+        else:
+            self.amp_device_type = "cpu"
+            self.amp_dtype = torch.float16
+        self.use_amp = torch.cuda.is_available()
+        self.scaler = torch.amp.GradScaler(
+            "cuda" if self.use_amp else "cpu", enabled=self.use_amp and self.amp_dtype == torch.float16
+        )
+
         self.log_rows: list[dict] = []
+        self.eval_log_rows: list[dict] = []
         self.best_loss: float = float("inf")
+        self.best_eval_loss: float = float("inf")
         self.global_step: int = 0
         self.skipped_nonfinite_steps: int = 0
         self.nan_log: list[dict] = []
         self._last_nonfinite_batch: dict | None = None
 
+    def _autocast(self):
+        return torch.autocast(device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.use_amp)
+
+    @property
+    def _num_workers(self) -> int:
+        return 4 if self.data_config.batch_size > 1 else 0
+
     # ------------------------------------------------------------------ build
-    def _build_dataset(self) -> KairosPretrainingDataset:
-        dc = self.data_config
+    def _build_dataset(self, data_config: DataConfig | None = None) -> KairosPretrainingDataset:
+        dc = data_config or self.data_config
         examples = list(dc.text_examples or []) + list(dc.multimodal_examples or [])
         if examples:
             return KairosPretrainingDataset(
@@ -126,7 +157,25 @@ class KairosMultimodalPipeline:
         dc, tc = self.data_config, self.train_config
 
         self.dataset = self._build_dataset()
-        self.loader = DataLoader(self.dataset, batch_size=dc.batch_size, shuffle=dc.shuffle, drop_last=dc.drop_last)
+        num_workers = self._num_workers
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=dc.batch_size,
+            shuffle=dc.shuffle,
+            drop_last=dc.drop_last,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+
+        if self.eval_data_config is not None:
+            self.eval_loader = DataLoader(
+                self._build_dataset(self.eval_data_config),
+                batch_size=self.eval_data_config.batch_size,
+                shuffle=False,
+                drop_last=False,
+            )
 
         self.model = KairosDiffusionLLM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
@@ -143,6 +192,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer = KairosDiffusionTrainer(
             model=self.model, args=TrainingArguments(output_dir=str(run_dir), report_to=tc.report_to)
         )
+        self.hf_trainer.mask_eps = tc.mask_eps
         self.writer = SummaryWriter(str(self.tb_dir))
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt:
@@ -153,7 +203,7 @@ class KairosMultimodalPipeline:
 
     # -------------------------------------------------------------- summary
     def summary(self, benchmark: bool = True, n_bench_steps: int = 5) -> TrainingSummary:
-        """Params/memory/estimated-time report; benchmark steps are timed then reverted, no side effects."""
+        """Report params/memory/time; benchmark steps are timed then reverted."""
         self._require_built()
 
         step_fn = None
@@ -167,9 +217,13 @@ class KairosMultimodalPipeline:
                 batch = next(loader_iter)
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 self.optimizer.zero_grad()
-                loss = self.hf_trainer.compute_loss(self.model, batch)
-                loss.backward()
-                self.optimizer.step()
+                with self._autocast():
+                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
         try:
             return training_summary(
@@ -186,10 +240,136 @@ class KairosMultimodalPipeline:
                 self.model.load_state_dict(model_state)
                 self.optimizer.load_state_dict(optimizer_state)
 
+    # ---------------------------------------------------------------- eval
+    def evaluate(self, step: int | None = None) -> dict | None:
+        """Loss on the held-out eval set, capped at ``eval_batches``; logged to tensorboard and ``eval_log_rows``; returns the result dict or ``None`` when no eval set is configured."""
+        if self.eval_loader is None:
+            return None
+        step = self.global_step if step is None else step
+        tc = self.train_config
+        losses: list[float] = []
+        seen = 0
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                for batch in self.eval_loader:
+                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    with self._autocast():
+                        losses.append(self.hf_trainer.compute_loss(self.model, batch).item())
+                    seen += 1
+                    if tc.eval_batches and seen >= tc.eval_batches:
+                        break
+        finally:
+            self.model.train()
+        if not losses:
+            return None
+
+        eval_loss = sum(losses) / len(losses)
+        self.best_eval_loss = min(self.best_eval_loss, eval_loss)
+        row = {"step": step, "loss": eval_loss, "batches": seen}
+        self.eval_log_rows.append(row)
+        self.writer.add_scalar("eval/loss", eval_loss, step)
+        return row
+
+    # ---------------------------------------------------------- overfit test
+    def _optimizer_step(self, loss: torch.Tensor, optimizer: torch.optim.Optimizer, scheduler) -> None:
+        """AMP backward + grad clip + optimizer/scheduler step (shared by ``train`` and ``overfit_test``)."""
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
+        self.scaler.step(optimizer)
+        self.scaler.update()
+        scheduler.step()
+
+    def overfit_test(
+        self,
+        n_examples: int = 64,
+        steps: int = 200,
+        lr: float = 1e-3,
+        seed: int = 0,
+        progress_callback=None,
+    ) -> list[dict]:
+        """Trains on a tiny subset to verify the model can memorize before a long run (a plateau high means a structural problem; non-destructive, restores model/optimizer/scheduler/loader state on return)."""
+        self._require_built()
+        from torch.utils.data import Subset
+
+        saved_model = copy.deepcopy(self.model.state_dict())
+        saved_opt = copy.deepcopy(self.optimizer.state_dict()) if self.optimizer is not None else None
+        saved_sch = copy.deepcopy(self.scheduler.state_dict()) if self.scheduler is not None else None
+        saved_loader = self.loader
+        saved_step = self.global_step
+        saved_logs = self.log_rows
+        saved_best = self.best_loss
+        saved_eval_logs = self.eval_log_rows
+        saved_best_eval = self.best_eval_loss
+
+        n = min(n_examples, len(self.dataset))
+        if n == 0 or steps <= 0:
+            raise ValueError("overfit_test needs a non-empty dataset and steps > 0")
+        indices = random.Random(seed).sample(range(len(self.dataset)), n)
+        loader = DataLoader(
+            Subset(self.dataset, indices),
+            batch_size=self.data_config.batch_size,
+            shuffle=True,
+        )
+        opt = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps))
+        self.log_rows = []
+        self.eval_log_rows = []
+        self.best_loss = float("inf")
+        self.best_eval_loss = float("inf")
+
+        logs: list[dict] = []
+        try:
+            self.model.train()
+            it = iter(loader)
+            for step in range(steps):
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    it = iter(loader)
+                    batch = next(it)
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+
+                opt.zero_grad()
+                with self._autocast():
+                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                loss_val = loss.item()
+                if not math.isfinite(loss_val):
+                    warnings.warn(
+                        f"overfit_test hit a non-finite loss at step {step} - the model cannot memorize "
+                        f"this data (diagnostics: {getattr(self.hf_trainer, 'last_loss_diagnostics', None)})",
+                        stacklevel=2,
+                    )
+                    break
+                self._optimizer_step(loss, opt, sch)
+
+                self.global_step += 1
+                logs.append({"step": step, "loss": loss_val})
+                if progress_callback is not None:
+                    progress_callback(self.global_step, steps, loss_val)
+
+            first, last = logs[0]["loss"], logs[-1]["loss"]
+            tail = sum(r["loss"] for r in logs[-max(1, len(logs) // 10) :]) / max(1, len(logs) // 10)
+            print(f"overfit_test: {len(logs)} steps on {n} examples - loss {first:.4f} -> {tail:.4f} (last {last:.4f})")
+            return logs
+        finally:
+            self.model.load_state_dict(saved_model)
+            if saved_opt is not None:
+                self.optimizer.load_state_dict(saved_opt)
+            if saved_sch is not None:
+                self.scheduler.load_state_dict(saved_sch)
+            self.loader = saved_loader
+            self.global_step = saved_step
+            self.log_rows = saved_logs
+            self.best_loss = saved_best
+            self.eval_log_rows = saved_eval_logs
+            self.best_eval_loss = saved_best_eval
+
     # ---------------------------------------------------------------- train
     def _require_built(self):
         if self.model is None:
-            raise RuntimeError("call .build() before .train()/.check_per_modality_loss()")
+            raise RuntimeError("call .build() before .train()/.evaluate()/.check_per_modality_loss()")
 
     def train(
         self, progress_callback=None, resume: bool = True, memory_bank: KairosMultiCache | None = None
@@ -230,7 +410,8 @@ class KairosMultimodalPipeline:
                             cache_params = KairosMultiCache(self.model_config)
 
                     self.optimizer.zero_grad()
-                    loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
+                    with self._autocast():
+                        loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
                     loss_val = loss.item()
                     if use_memory_gate:
                         for scale_cache in cache_params.caches:
@@ -239,7 +420,7 @@ class KairosMultimodalPipeline:
                                     scale_cache.ssm_caches[layer_idx] = s.detach()
                         prev_cache = cache_params
                     if not math.isfinite(loss_val):
-                        # a corrupted batch can spike the
+                        # a corrupted batch can spike the loss; skip it
                         skipped_nonfinite += 1
                         consecutive_nan += 1
                         self._last_nonfinite_batch = batch
@@ -263,10 +444,7 @@ class KairosMultimodalPipeline:
                         continue
                     consecutive_nan = 0
 
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=tc.grad_clip)
-                    self.optimizer.step()
-                    self.scheduler.step()
+                    self._optimizer_step(loss, self.optimizer, self.scheduler)
 
                     epoch_loss += loss_val
                     self.global_step += 1
@@ -278,8 +456,16 @@ class KairosMultimodalPipeline:
                     if progress_callback is not None:
                         progress_callback(self.global_step, total_steps, loss_val)
 
+                    if tc.eval_every > 0 and self.global_step % tc.eval_every == 0:
+                        eval_row = self.evaluate()
+                        if eval_row is not None:
+                            print(
+                                f"[eval @ step {eval_row['step']}] loss {eval_row['loss']:.4f} "
+                                f"(best {self.best_eval_loss:.4f})"
+                            )
+
                     if self.global_step % tc.last_ckpt_every == 0:
-                        self._save(last_ckpt, loss_val, epoch)  # overwritten periodically: resumable, not every
+                        self._save(last_ckpt, loss_val, epoch)  # periodically overwritten, resumable
                     if self.global_step % tc.save_every == 0:
                         step_ckpt = self.ckpt_dir / f"step_{self.global_step:06d}.pt"
                         self._save(step_ckpt, loss_val, epoch)
@@ -298,6 +484,8 @@ class KairosMultimodalPipeline:
                         self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
 
             last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume
+            if tc.eval_every > 0:
+                self.evaluate()  # final eval on the converged weights
         finally:
             self.skipped_nonfinite_steps = skipped_nonfinite
             self.writer.flush()
@@ -344,7 +532,7 @@ class KairosMultimodalPipeline:
                 text_ids = row_ids[text_mask] if text_mask is not None else row_ids
                 try:
                     text_preview = self.tokenizer.decode(text_ids.tolist(), skip_special_tokens=True)[:200]
-                except Exception as e:  # noqa: BLE001 - best-effort preview, never block the inspection itself
+                except Exception as e:  # noqa: BLE001 - best-effort preview, never blocks inspection
                     text_preview = f"<decode failed: {e}>"
 
                 modality_counts = {}
@@ -369,13 +557,13 @@ class KairosMultimodalPipeline:
                         "modality_counts": modality_counts,
                         "token_id_range": (int(row_ids.min()), int(row_ids.max())),
                         "out_of_bounds": {
-                            "token_ids": oob_token.tolist(),  # positions with id outside [0,
-                            "modality_ids": oob_modality.tolist(),  # positions with id outside [0,
+                            "token_ids": oob_token.tolist(),  # ids outside [0, vocab)
+                            "modality_ids": oob_modality.tolist(),  # ids outside [0, num_modalities)
                         },
                         "text_preview": text_preview,
-                        "input_ids": row_ids.tolist(),  # raw ids, exactly what the
+                        "input_ids": row_ids.tolist(),  # raw ids, as fed to the model
                         "modality_ids": row_modality.tolist() if row_modality is not None else None,
-                        "top_token_ids": top_ids,  # [(id, count), ...] most frequent
+                        "top_token_ids": top_ids,  # most frequent ids
                         "max_repeat_run": {"id": max_run_id, "length": max_run_len},
                     }
                 )
@@ -388,10 +576,16 @@ class KairosMultimodalPipeline:
         for key in ("text_examples", "multimodal_examples"):
             if dc.get(key) is not None:
                 dc[key] = f"<{len(dc[key])} examples, omitted>"
+        edc = asdict(self.eval_data_config) if self.eval_data_config is not None else None
+        if edc is not None:
+            for key in ("text_examples", "multimodal_examples"):
+                if edc.get(key) is not None:
+                    edc[key] = f"<{len(edc[key])} examples, omitted>"
         return {
             "model_config": self.model_config.to_dict(),
             "train_config": asdict(self.train_config),
             "data_config": dc,
+            "eval_data_config": edc,
         }
 
     def _save(self, path: Path, loss_val: float, epoch: int = 1):
@@ -422,7 +616,7 @@ class KairosMultimodalPipeline:
         return ckpt
 
     def _safe_resume(self, path: Path) -> int:
-        # an incompatible checkpoint (different model_config) starts
+        # an incompatible checkpoint (different model_config) starts fresh
         try:
             ckpt = self.load_checkpoint(str(path))
             return ckpt.get("epoch", 1)
@@ -431,6 +625,27 @@ class KairosMultimodalPipeline:
             return 1
 
     # ------------------------------------------------------------- hf hub
+    def generate(self, prompt_ids, max_new_tokens=64, modality=Modality.TEXT, seed=None, **kwargs):
+        """Block-diffusion continuation of a token prompt; thin wrapper around ``KairosDiffusionGenerationMixin.generate`` handling device placement, modality ids and AMP; returns prompt + generated ids (decode with ``self.tokenizer.decode(...)``)."""
+        self._require_built()
+        if seed is not None:
+            torch.manual_seed(seed)
+        prompt = torch.as_tensor(prompt_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        modality_ids = torch.full_like(prompt, int(modality))
+        self.model.eval()
+        try:
+            with self._autocast():
+                out = self.model.generate(
+                    input_ids=prompt,
+                    modality_ids=modality_ids,
+                    max_new_tokens=max_new_tokens,
+                    **kwargs,
+                )
+        finally:
+            self.model.train()
+        sequences = out.sequences if hasattr(out, "sequences") else out
+        return sequences[0].tolist()
+
     def _push_checkpoint_to_hub(self, path: Path):
         from huggingface_hub import HfApi
 
@@ -452,13 +667,13 @@ class KairosMultimodalPipeline:
         # best-effort: no checkpoint on the repo
         try:
             return self.load_checkpoint_from_hub(repo_id)
-        except Exception:  # noqa: BLE001 — no checkpoint on the hub yet is not an error, just start fresh
+        except Exception:  # noqa: BLE001 — no hub checkpoint yet, start fresh
             return None
 
     def push_to_hub(
         self, repo_id: str, private: bool = False, license: str = "apache-2.0", subfolder: str | None = None
     ):
-        """Pushes model, config, checkpoints, tensorboard logs, training config, and a model card."""
+        """Pushes model, config, checkpoints, logs, and a model card to the hub."""
         from huggingface_hub import HfApi
 
         self._require_built()
@@ -473,7 +688,7 @@ class KairosMultimodalPipeline:
         # save_pretrained + upload_folder honors the subfolder
         export_dir = Path(self.train_config.run_dir) / "hf_export"
         export_dir.mkdir(parents=True, exist_ok=True)
-        # tied SWA/DeltaNet weights break save_pretrained's tied-weight
+        # tied SWA/DeltaNet weights break save_pretrained's tied-weight logic
         self.model_config.save_pretrained(str(export_dir))
         torch.save(self.model.state_dict(), export_dir / "pytorch_model.bin")
         api.upload_folder(repo_id=repo_id, folder_path=str(export_dir), path_in_repo=subfolder or ".")
@@ -515,7 +730,7 @@ class KairosMultimodalPipeline:
 
     # ------------------------------------------------------------- checks
     def check_per_modality_loss(self, n_batches: int = 1) -> dict[str, float]:
-        """Diffusion loss averaged per modality over n_batches, so a router-ignored modality can't."""
+        """Diffusion loss averaged per modality, so a router-ignored modality is caught."""
         self._require_built()
         self.model.eval()
         losses_by_modality: dict[str, list[float]] = defaultdict(list)
@@ -534,8 +749,6 @@ class KairosMultimodalPipeline:
         return {name: sum(v) / len(v) for name, v in losses_by_modality.items()}
 
     def _per_modality_loss_for_batch(self, batch: dict) -> dict[str, float]:
-        import torch.nn.functional as F
-
         x0 = batch["input_ids"]
         prompt_len = batch["prompt_len"]
         modality_ids = batch.get("modality_ids")
@@ -543,26 +756,11 @@ class KairosMultimodalPipeline:
         if modality_ids is None:
             return {}
 
-        eps = 1e-3
-        t = torch.rand(x0.size(0), device=x0.device)
-        p = (1 - eps) * t + eps
-        p = p[:, None].expand_as(x0)
-
-        noise_mask = torch.rand(x0.shape, device=x0.device) < p
-        for i in range(x0.size(0)):
-            noise_mask[i, : prompt_len[i]] = False
-        if pad_mask is not None:
-            noise_mask &= pad_mask.bool()
-
+        noise_mask, p = make_diffusion_mask(x0, prompt_len, pad_mask)
         if not noise_mask.any():
             return {}
 
-        xt = x0.clone()
-        noise = torch.randint_like(x0, self.model.lm_head.vocab_size)
-        xt[noise_mask] = noise[noise_mask]
-
-        logits = self.model(decoder_input_ids=xt, modality_ids=modality_ids).logits
-        per_token_loss = F.cross_entropy(logits[noise_mask], x0[noise_mask], reduction="none") / p[noise_mask]
+        per_token_loss, _ = compute_masked_diffusion_losses(self.model, x0, noise_mask, p, modality_ids)
 
         out = {}
         modality_at_noised = modality_ids[noise_mask]

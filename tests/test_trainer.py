@@ -23,11 +23,7 @@ def config(tokenizer):
         num_modalities=8,
         stride=1,
         num_scales=2,
-        # kept in sync: some transformers versions'
-        # reads n_routed_experts, others read num_local_experts —
-        # to the same value or the
-        # experts weight tensor size can disagree
-        # smaller than num_classes").
+        # keep both aliases in sync; different transformers versions read different fields
         num_local_experts=7,
         n_routed_experts=7,
         num_experts_per_tok=1,
@@ -56,7 +52,7 @@ def dense_model(dense_config, tokenizer):
 
 
 def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
-    """Regression: the trainer used to default every token to Modality.TEXT, ignoring modality_ids/mask."""
+    """Regression: trainer used to default every token to Modality.TEXT."""
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     examples = [
@@ -119,8 +115,7 @@ def test_compute_loss_never_noises_padding(model, tokenizer):
     trainer = KairosDiffusionTrainer(model=model)
     trainer.compute_loss(model, batch)
 
-    # compute_loss builds xt internally from a
-    # positions in the original batch tensor
+    # compute_loss must not mutate the original input batch
     assert torch.equal(batch["input_ids"], x0_before)
 
 

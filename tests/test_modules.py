@@ -139,18 +139,18 @@ def test_backbone_block_size_default_is_one():
 
 
 def test_backbone_block_size_one_matches_original_graph():
-    # S=1 must reproduce the pre-blocking AttnRes
+    # attnres_block_size=1 must reproduce the original AttnRes graph
     torch.manual_seed(0)
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=4, vocab_size=259, num_modalities=2, attnres_block_size=1)
     torch.manual_seed(42)
     model = KairosDiffusionBackbone(cfg)
     x = torch.randn(2, 6, 16)
 
-    # Reference: the original states=[x]; h=agg(states); x=layer(h);
+    # Reference: the original states=[x]; h=agg[i](states); x=layer(h);
     states = [x]
     xr = x
-    for layer in model.layers:
-        h = model.aggregator(states)
+    for i, layer in enumerate(model.layers):
+        h = model.aggregator[i](states)
         xr = layer(h)
         states.append(xr)
     expected = model.norm(xr)
@@ -222,14 +222,7 @@ def test_kairos_model_init(config):
 
 
 def test_post_init_is_called_and_initializes_all_parameters():
-    # regression test for the actual NaN
-    # self.post_init(), so DeepseekV3Experts' raw nn.Parameter(torch.empty(...)) weights
-    # (gate_up_proj/down_proj) were left as uninitialized memory
-    # construction alone, before any forward pass.
-    # finite immediately after construction, with no
-    # Uses num_modalities=8 (the real default) deliberately:
-    # `config` fixture) triggers an unrelated pre-existing
-    # construction with use_moe=True, which is a
+    # regression: post_init must initialize MoE torch.empty() weights, or params stay NaN
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -240,9 +233,7 @@ def test_post_init_is_called_and_initializes_all_parameters():
 
 
 def test_moe_expert_weights_are_not_uninitialized_memory():
-    # more targeted than the finite-check above:
-    # exactly 0.0 (freshly-allocated/zeroed pages), which would
-    # still being wrong (an all-zero expert
+    # stricter than the finite check: an all-zero (zeroed pages) expert is still wrong
     config = KairosConfig(
         d_model=32, n_heads=4, n_layers=2, vocab_size=259, use_moe=True, num_local_experts=2, num_experts_per_tok=1
     )
@@ -364,7 +355,7 @@ def test_dataset_with_wikitext(tokenizer):
 
     try:
         ds_raw = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train[:1%]")
-    except Exception as e:  # noqa: BLE001 — any network/HF-hub failure should skip, not fail the suite
+    except Exception as e:  # noqa: BLE001 — network/HF-hub failure should skip the suite
         pytest.skip(f"Dataset download failed: {e}")
     texts = ds_raw["text"]
     ds = KairosPretrainingDataset(texts, tokenizer, max_len=32)

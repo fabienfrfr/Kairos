@@ -5,9 +5,7 @@ import torch
 from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 
-# =========================
-# Fixtures
-# =========================
+# ========================= Fixtures =========================
 @pytest.fixture(scope="module")
 def tokenizer():
     return KairosTokenizer()
@@ -39,9 +37,7 @@ def sample_lidar():
     return pts
 
 
-# =========================
-# Vocab / backward compatibility
-# =========================
+# ========================= Vocab / backward compatibility =========================
 def test_vocab_size_is_291(tokenizer):
     """Regression: KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens to the."""
     assert len(tokenizer) == 291
@@ -81,9 +77,7 @@ def test_structural_and_modality_tokens_present(tokenizer):
         assert tid is not None and tid != tokenizer.unk_token_id, f"{tag} missing from vocab"
 
 
-# =========================
-# IMAGE: row-delimited, no header
-# =========================
+# ========================= IMAGE: row-delimited, no header =========================
 def test_image_roundtrip(tokenizer, sample_image):
     markers = KairosTokenizer.encode_image(sample_image)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
@@ -120,9 +114,7 @@ def test_image_decode_detects_truncated_row(tokenizer, sample_image):
         tokenizer.decode_image(decoded[0].data)
 
 
-# =========================
-# VIDEO: rows + <ENDFRAME>, fps supplied
-# =========================
+# ========================= VIDEO: rows + <ENDFRAME>, fps supplied =========================
 def test_video_roundtrip_with_stride(tokenizer, sample_video):
     markers = KairosTokenizer.encode_video(sample_video, stride=2)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.VIDEO, markers)])
@@ -155,9 +147,7 @@ def test_video_rejects_inconsistent_frame_shapes(tokenizer):
         tokenizer.decode_video(decoded[0].data)
 
 
-# =========================
-# AUDIO: periodic <TICK>, duration from tick
-# =========================
+# ========================= AUDIO: periodic <TICK>, duration from tick =========================
 def test_audio_roundtrip_and_duration(tokenizer, sample_audio):
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
@@ -175,16 +165,14 @@ def test_audio_tick_count(tokenizer, sample_audio):
     assert num_ticks == -(-len(sample_audio) // 16_000)  # ceil division
 
 
-# =========================
-# LIDAR: periodic <PTSEP>, fixed quantization bounds
-# =========================
+# ======================= LIDAR: <PTSEP>, fixed quantization bounds ========================
 def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     markers = KairosTokenizer.encode_lidar(sample_lidar)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.LIDAR, markers)])
     decoded = tokenizer.decode_multimodal(out["input_ids"])
     recon = tokenizer.decode_lidar(decoded[0].data)
     assert recon.shape == sample_lidar.shape
-    # quantization step over the FIXED xyz
+    # quantization step over the fixed xyz range
     xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
     max_step = (xyz_hi - xyz_lo) / 255
     assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
@@ -195,9 +183,7 @@ def test_lidar_rejects_wrong_shape():
         KairosTokenizer.encode_lidar(np.zeros((10, 3), dtype=np.float32))
 
 
-# =========================
-# encode_multimodal / decode_multimodal: mixed sequences
-# =========================
+# ==================== encode_multimodal / decode_multimodal: mixed seqs =====================
 def test_mixed_text_image_video_audio(tokenizer, sample_image, sample_video, sample_audio):
     segs = [
         MultimodalSegment(Modality.TEXT, b"a scene:"),

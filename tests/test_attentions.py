@@ -1,5 +1,10 @@
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 
+import pytest
 import torch
 
 from kairos.attentions import (
@@ -98,7 +103,7 @@ def test_swa_eager_vs_flex(monkeypatch):
         monkeypatch.setattr("attention.ATTN_IMPL", "flex")
         out_flex = attn(x, rope(x, pos))
         assert torch.allclose(out_eager, out_flex, atol=1e-3)
-    except Exception:  # noqa: BLE001, S110 — flex path is optional; any failure just skips this check
+    except Exception:  # noqa: BLE001, S110 — flex path optional; failure just skips
         pass
 
 
@@ -291,7 +296,7 @@ def test_deltanet_cache_effect():
 
 
 def test_deltanet_ssm_cache_used_even_without_conv_cache():
-    # regression: has_previous_state used to be gated
+    # regression: has_previous_state was wrongly gating the SSM path
     model = get_deltanet_model()
     x = torch.randn(1, 8, 32)
 
@@ -487,7 +492,7 @@ def test_supports_cu_seqlens_returns_false_for_none():
 
 
 def test_supports_cu_seqlens_returns_false_when_signature_unavailable():
-    # builtins raise ValueError from inspect.signature; must
+    # builtins raise ValueError in inspect.signature; handle it
     assert _supports_cu_seqlens(int) is False
 
 
@@ -515,6 +520,211 @@ def test_attention_without_layer_idx_warns_but_still_works(capsys):
 
 
 def test_current_backend_is_eager_on_cpu():
-    # documents/locks the CPU fallback this test
-    # the flex_attention path requires CUDA and
+    # flex_attention requires CUDA; lock the eager CPU fallback here
     assert ATTN_IMPL == "eager"
+
+
+def test_kairos_attn_backend_eager_override(tmp_path):
+    # KAIROS_ATTN_BACKEND=eager must force eager regardless of CUDA.
+    script = tmp_path / "check_backend.py"
+    script.write_text(
+        "import os\nos.environ['KAIROS_ATTN_BACKEND'] = 'eager'\nimport kairos.attentions as a\nprint(a.ATTN_IMPL)\n"
+    )
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    out = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": repo_root},
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "eager"
+
+
+def test_round_up_flex_block():
+    from kairos.attentions import _FLEX_BLOCK_SIZE, _round_up
+
+    assert _FLEX_BLOCK_SIZE == 128
+    assert _round_up(1, 128) == 128
+    assert _round_up(114, 128) == 128
+    assert _round_up(128, 128) == 128
+    assert _round_up(129, 128) == 256
+    assert _round_up(256, 128) == 256
+
+
+def test_build_flex_mask_bucketed_semantics():
+    # bucketed mask keeps the window and forces padded query rows to attend kv 0.
+    from kairos.attentions import build_flex_mask_bucketed
+
+    window = 2
+    bq = 8
+    q_len = 5
+    q_mask = torch.ones(2, bq, dtype=torch.bool)
+    q_mask[:, q_len:] = False
+    kv_mask = torch.ones(2, bq, dtype=torch.bool)
+    kv_mask[:, q_len:] = False
+    m = build_flex_mask_bucketed(window, q_mask, kv_mask, device="cpu")
+    assert m.kv_indices.shape[0] == 2
+    mask_mod = m.mask_mod
+    for q in range(q_len):
+        row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
+        lo, hi = max(0, q - window), min(q_len, q + window + 1)
+        assert row == [lo <= k < hi for k in range(bq)], q
+    for q in range(q_len, bq):
+        row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
+        assert row[0] is True and not any(row[1:]), q
+
+
+def test_flex_mask_bucketed_padded_per_row(monkeypatch):
+    # pad_mask from gather_active is per-row; the mask must respect each row's padding.
+    from kairos.attentions import KairosAttention
+
+    cfg = DummySWAConfig()
+    attn = KairosAttention(cfg, layer_idx=0)
+    pad = torch.ones(2, 5, dtype=torch.bool)
+    pad[1, 3:] = False  # row 1 has length 3
+    m = attn._flex_mask_bucketed_padded(8, pad, torch.device("cpu"))
+    f = m.mask_mod
+    for b, length in ((0, 5), (1, 3)):
+        for q in range(length):
+            row = [bool(f(b, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+            lo, hi = max(0, q - cfg.sliding_window_size), min(length, q + cfg.sliding_window_size + 1)
+            assert row == [lo <= k < hi for k in range(8)], (b, q)
+        for q in range(length, 8):
+            row = [bool(f(b, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+            assert row[0] is True and not any(row[1:]), (b, q)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or ATTN_IMPL != "flex",
+    reason="flex_attention requires a CUDA device",
+)
+class TestFlexAttentionBlockMask:
+    """Flex path (CUDA only): block masks must match the exact input length (114 vs 128)."""
+
+    def _attn(self, max_position_embeddings=128, layer_idx=0):
+        cfg = DummySWAConfig()
+        cfg.max_position_embeddings = max_position_embeddings
+        attn = KairosAttention(cfg, layer_idx=layer_idx)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        return attn, rope
+
+    def test_non_block_aligned_length_no_longer_raises(self):
+        # q_len=114 vs a 128-max block mask was the exact reported failure
+        attn, rope = self._attn()
+        for L in (114, 37, 64, 128):
+            x = torch.randn(2, L, 32, device="cuda")
+            pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+            out = attn(x, rope(x, pos))
+            assert out.shape == x.shape
+            assert not torch.isnan(out).any()
+
+    def test_padded_path_accepts_non_block_aligned_length(self):
+        attn, rope = self._attn()
+        L = 114
+        x = torch.randn(2, L, 32, device="cuda")
+        pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+        mask = torch.ones(2, L, dtype=torch.bool, device="cuda")
+        mask[:, -7:] = False
+        out = attn(x, rope(x, pos), attention_mask=mask)
+        assert out.shape == x.shape
+
+    def test_rectangular_mask_with_growing_kv_cache(self):
+        # during cached generation kv_len grows beyond q_len
+        cfg = DummySWAConfig()
+        cfg.sliding_window_size = 128  # no trimming during this test
+        attn = KairosAttention(cfg, layer_idx=0)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        cache = KairosCache(cfg)
+        L = 37
+        for step in range(2):
+            x = torch.randn(2, L, 32, device="cuda")
+            pos = torch.arange(step * L, step * L + L, device="cuda").unsqueeze(0).expand(2, -1)
+            out = attn(x, rope(x, pos), cache_params=cache, position_ids=pos)
+            assert out.shape == x.shape
+        assert cache._key_cache[0].size(1) == 2 * L
+
+    def test_flex_mask_cache_reuses_masks_per_length(self):
+        attn, _ = self._attn()
+        dev = torch.device("cuda")
+        m1 = attn._flex_mask(114, 114, dev)
+        m2 = attn._flex_mask(114, 114, dev)
+        assert m1 is m2
+        m3 = attn._flex_mask(114, 128, dev)
+        assert m3 is not m1
+        assert len(attn._flex_mask_cache) == 2
+
+    def test_flex_train_bucketed_matches_eager(self):
+        # training path (q_len == kv_len): padded to a 128 block, then cropped.
+        from kairos.attentions import apply_rotary_emb, eager_attention
+
+        cfg = DummySWAConfig()
+        attn = KairosAttention(cfg, layer_idx=0)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        L = 114
+        x = torch.randn(2, L, 32, device="cuda")
+        pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+        cos_sin = rope(x, pos)
+        out_flex = attn(x, cos_sin)
+
+        q = attn.q_proj(x).view(2, L, cfg.num_attention_heads, attn.head_dim)
+        k = attn.k_proj(x).view(2, L, cfg.num_key_value_heads, attn.head_dim)
+        v = attn.v_proj(x).view(2, L, cfg.num_key_value_heads, attn.head_dim)
+        cos, sin = cos_sin
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        eager = eager_attention(q, k, v, cfg.sliding_window_size)
+        eager = eager.reshape(2, L, -1)
+        out_eager = attn.out(eager)
+        assert torch.allclose(out_flex, out_eager, atol=1e-3)
+
+        # with padding: real rows match eager; padded q-rows attend kv 0 (finite).
+        mask = torch.ones(2, L, dtype=torch.bool, device="cuda")
+        mask[:, -7:] = False
+        out_flex_p = attn(x, cos_sin, attention_mask=mask)
+        assert not torch.isnan(out_flex_p).any()
+        q = attn.q_proj(x).view(2, L, cfg.num_attention_heads, attn.head_dim)
+        k = attn.k_proj(x).view(2, L, cfg.num_key_value_heads, attn.head_dim)
+        v = attn.v_proj(x).view(2, L, cfg.num_key_value_heads, attn.head_dim)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        eager_p = eager_attention(q, k, v, cfg.sliding_window_size, key_padding_mask=mask)
+        eager_p = attn.out(eager_p.reshape(2, L, -1))
+        assert torch.allclose(out_flex_p[:, :-7], eager_p[:, :-7], atol=1e-3)
+
+    def test_flex_train_bucketed_mask_reuse_across_lengths(self):
+        # 114 and 129 map to 128/256 buckets: mask must be reused per gathered length.
+        attn, _ = self._attn()
+        dev = torch.device("cuda")
+        m1 = attn._flex_mask_bucketed(128, 114, 2, dev)
+        m2 = attn._flex_mask_bucketed(128, 114, 2, dev)
+        assert m1 is m2
+        m3 = attn._flex_mask_bucketed(256, 129, 2, dev)
+        assert m3 is not m1
+        m4 = attn._flex_mask_bucketed(256, 129, 2, dev)
+        assert m3 is m4
+        assert len(attn._flex_mask_cache) == 2
+
+    def test_flex_matches_eager_on_cuda(self):
+        # parity check: flex (fixed) and eager must agree for the same windowed mask
+        from kairos.attentions import apply_rotary_emb, eager_attention
+
+        cfg = DummySWAConfig()
+        attn = KairosAttention(cfg, layer_idx=0)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        x = torch.randn(2, 114, 32, device="cuda")
+        pos = torch.arange(114, device="cuda").unsqueeze(0).expand(2, -1)
+        cos_sin = rope(x, pos)
+        out_flex = attn(x, cos_sin)
+
+        # manual eager equivalent: project + rotate + eager_attention
+        q = attn.q_proj(x).view(2, 114, cfg.num_attention_heads, attn.head_dim)
+        k = attn.k_proj(x).view(2, 114, cfg.num_key_value_heads, attn.head_dim)
+        v = attn.v_proj(x).view(2, 114, cfg.num_key_value_heads, attn.head_dim)
+        cos, sin = cos_sin
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        eager = eager_attention(q, k, v, cfg.sliding_window_size)
+        eager = eager.reshape(2, 114, -1)
+        out_eager = attn.out(eager)
+        assert torch.allclose(out_flex, out_eager, atol=1e-3)
