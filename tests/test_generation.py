@@ -6,7 +6,7 @@ from transformers.models.diffusion_gemma.generation_diffusion_gemma import Diffu
 
 os.environ.setdefault("KAIROS_ATTN_BACKEND", "eager")
 
-from kairos.modeling import KairosConfig, KairosDiffusionLLM
+from kairos.modeling import KairosConfig, KairosDiffusionFM
 from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 from kairos.tokenizer import KairosTokenizer, Modality
 
@@ -41,7 +41,7 @@ def tokenizer():
 @pytest.fixture
 def model(tokenizer):
     torch.manual_seed(0)
-    return KairosDiffusionLLM(make_config(), vocab_size=len(tokenizer))
+    return KairosDiffusionFM(make_config(), vocab_size=len(tokenizer))
 
 
 @pytest.fixture
@@ -99,8 +99,20 @@ def test_generate_batch_padded_prompts(model, tokenizer, text_modality):
     max_pl = max(len(p1), len(p2))
     batch = torch.cat(
         [
-            torch.cat([torch.tensor([p1], dtype=torch.long), torch.full((1, max_pl - len(p1)), tokenizer.pad_token_id, dtype=torch.long)], -1),
-            torch.cat([torch.tensor([p2], dtype=torch.long), torch.full((1, max_pl - len(p2)), tokenizer.pad_token_id, dtype=torch.long)], -1),
+            torch.cat(
+                [
+                    torch.tensor([p1], dtype=torch.long),
+                    torch.full((1, max_pl - len(p1)), tokenizer.pad_token_id, dtype=torch.long),
+                ],
+                -1,
+            ),
+            torch.cat(
+                [
+                    torch.tensor([p2], dtype=torch.long),
+                    torch.full((1, max_pl - len(p2)), tokenizer.pad_token_id, dtype=torch.long),
+                ],
+                -1,
+            ),
         ]
     )
     batch_mod = torch.full_like(batch, int(Modality.TEXT))
@@ -201,7 +213,7 @@ def test_generate_produces_valid_token_ids(model, text_prompt, text_modality):
 
 def test_generate_respects_configured_canvas_length(tokenizer, text_prompt):
     torch.manual_seed(0)
-    big_canvas = KairosDiffusionLLM(make_config(canvas_length=64), vocab_size=len(tokenizer))
+    big_canvas = KairosDiffusionFM(make_config(canvas_length=64), vocab_size=len(tokenizer))
     text_modality = torch.full_like(text_prompt, int(Modality.TEXT))
     out = big_canvas.generate(
         input_ids=text_prompt,

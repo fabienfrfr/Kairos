@@ -15,6 +15,7 @@ from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
 try:
     from .generation import KairosDiffusionGenerationMixin
 except ImportError:  # transformers < 5.15: training still works, generation does not
+
     class KairosDiffusionGenerationMixin:
         pass
 
@@ -463,7 +464,7 @@ class KairosOutput(CausalLMOutputWithPast):
     modality_logits: torch.FloatTensor = None
 
 
-class KairosDiffusionLLM(PreTrainedModel, KairosDiffusionGenerationMixin):
+class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
     def __init__(self, config, vocab_size=None, use_moe=None):
         super().__init__(config)
         if use_moe is None:

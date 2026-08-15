@@ -70,9 +70,9 @@ install from [github.com/fabienfrfr/Kairos](https://github.com/fabienfrfr/Kairos
 it to `PYTHONPATH`. Alternatively, skip `Auto*` and import the class directly:
 
 ```python
-from kairos.modeling import KairosDiffusionLLM
+from kairos.modeling import KairosDiffusionFM
 
-model = KairosDiffusionLLM.from_pretrained("{repo_id}")
+model = KairosDiffusionFM.from_pretrained("{repo_id}")
 ```
 
 ## Generation
@@ -101,10 +101,10 @@ print(tokenizer.decode(generated, skip_special_tokens=True))
 Directly on the model, reusing the DiffusionGemma knobs:
 
 ```python
-from kairos.modeling import KairosDiffusionLLM
+from kairos.modeling import KairosDiffusionFM
 from kairos.tokenizer import KairosTokenizer, Modality
 
-model = KairosDiffusionLLM.from_pretrained("{repo_id}")
+model = KairosDiffusionFM.from_pretrained("{repo_id}")
 tokenizer = KairosTokenizer()
 prompt = tokenizer.encode("The capital of France is", add_special_tokens=False)
 prompt = torch.as_tensor(prompt, dtype=torch.long).unsqueeze(0)

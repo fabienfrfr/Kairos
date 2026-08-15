@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .dataset import KairosPretrainingDataset
-from .modeling import KairosConfig, KairosDiffusionLLM, KairosMultiCache, gate_memory_bank
+from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer, compute_masked_diffusion_losses, make_diffusion_mask
 from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
@@ -46,6 +46,8 @@ class TrainConfig:
     eval_batches: int = 2  # eval batches per evaluation, capped; keep small
     grad_clip: float = 1.0
     mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows sharply as this shrinks
+    mask_p_max: float = 1.0  # ceiling of p; cap below 1.0 (e.g. 0.3) for an MAE-style fixed-rate curriculum stage
+    mask_reweight: bool = True  # divide CE by p; set False for plain CE (pairs with a capped mask_p_max)
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
@@ -90,7 +92,7 @@ class KairosMultimodalPipeline:
 
         self.device = train_config.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model: KairosDiffusionLLM | None = None
+        self.model: KairosDiffusionFM | None = None
         self.dataset: KairosPretrainingDataset | None = None
         self.loader: DataLoader | None = None
         self.eval_loader: DataLoader | None = None
@@ -177,7 +179,7 @@ class KairosMultimodalPipeline:
                 drop_last=False,
             )
 
-        self.model = KairosDiffusionLLM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
+        self.model = KairosDiffusionFM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
@@ -193,6 +195,8 @@ class KairosMultimodalPipeline:
             model=self.model, args=TrainingArguments(output_dir=str(run_dir), report_to=tc.report_to)
         )
         self.hf_trainer.mask_eps = tc.mask_eps
+        self.hf_trainer.mask_p_max = tc.mask_p_max
+        self.hf_trainer.mask_reweight = tc.mask_reweight
         self.writer = SummaryWriter(str(self.tb_dir))
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt:
@@ -288,8 +292,14 @@ class KairosMultimodalPipeline:
         lr: float = 1e-3,
         seed: int = 0,
         progress_callback=None,
+        mask_p_max: float | None = None,
+        mask_reweight: bool | None = None,
     ) -> list[dict]:
-        """Trains on a tiny subset to verify the model can memorize before a long run (a plateau high means a structural problem; non-destructive, restores model/optimizer/scheduler/loader state on return)."""
+        """Trains on a tiny subset to verify the model can memorize before a long run (a plateau high means a structural problem; non-destructive, restores model/optimizer/scheduler/loader state on return).
+
+        ``mask_p_max``/``mask_reweight`` temporarily override the trainer's masking curriculum for this call
+        only (e.g. MAE-style low, fixed-rate corruption vs. full diffusion), restored afterwards either way.
+        """
         self._require_built()
         from torch.utils.data import Subset
 
@@ -302,6 +312,12 @@ class KairosMultimodalPipeline:
         saved_best = self.best_loss
         saved_eval_logs = self.eval_log_rows
         saved_best_eval = self.best_eval_loss
+        saved_mask_p_max = self.hf_trainer.mask_p_max
+        saved_mask_reweight = self.hf_trainer.mask_reweight
+        if mask_p_max is not None:
+            self.hf_trainer.mask_p_max = mask_p_max
+        if mask_reweight is not None:
+            self.hf_trainer.mask_reweight = mask_reweight
 
         n = min(n_examples, len(self.dataset))
         if n == 0 or steps <= 0:
@@ -365,6 +381,8 @@ class KairosMultimodalPipeline:
             self.best_loss = saved_best
             self.eval_log_rows = saved_eval_logs
             self.best_eval_loss = saved_best_eval
+            self.hf_trainer.mask_p_max = saved_mask_p_max
+            self.hf_trainer.mask_reweight = saved_mask_reweight
 
     # ---------------------------------------------------------------- train
     def _require_built(self):

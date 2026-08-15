@@ -34,7 +34,7 @@
   <!-- build() -->
   <rect x="130" y="195" width="640" height="130" rx="8" class="box" fill="#f0fdf4"/>
   <text x="450" y="218" class="lbl" font-weight="bold">pipe.build()</text>
-  <text x="450" y="238" class="lbl-sm">KairosDiffusionLLM(model_config) → AdamW → CosineAnnealingLR</text>
+  <text x="450" y="238" class="lbl-sm">KairosDiffusionFM(model_config) → AdamW → CosineAnnealingLR</text>
   <text x="450" y="256" class="lbl-sm">ckpt_dir / tensorboard dir created</text>
   <text x="450" y="274" class="lbl-sm">training_config.json written (model_config + train_config + data_config)</text>
   <text x="450" y="292" class="lbl-sm">hub_repo_id set + hub_push_every_ckpt: create_repo() up front</text>

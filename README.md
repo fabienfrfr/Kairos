@@ -60,7 +60,7 @@ The choice of linear attention, specifically **DeltaNet**, is also driven by its
 
 | File | Role |
 |---|---|
-| `kairos/modeling.py` | `KairosConfig`, `KairosDiffusionLLM` (top-level model), DeltaNet/SWA blocks, MoE wiring, `KairosMemoryBank` |
+| `kairos/modeling.py` | `KairosConfig`, `KairosDiffusionFM` (top-level model), DeltaNet/SWA blocks, MoE wiring, `KairosMemoryBank` |
 | `kairos/attentions.py` | LiZAttention2 (shared QKV/O between SWA and DeltaNet), sliding-window kernel |
 | `kairos/tokenizer.py` | `KairosTokenizer` — shared byte-level codec for text/image/video/audio/lidar |
 | `kairos/dataset.py` | Pretraining/SFT/RL dataset builders, multimodal packing |

@@ -1,13 +1,17 @@
 import inspect
 import math
 import os
-import warnings
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
+
+from transformers.models.qwen3_next.modeling_qwen3_next import (
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
+)
 
 _ATTN_BACKEND = os.environ.get("KAIROS_ATTN_BACKEND", "auto").strip().lower()
 
@@ -51,11 +55,6 @@ try:
 except ImportError:
     chunk_gated_delta_rule = None
     fused_recurrent_gated_delta_rule = None
-
-from transformers.models.qwen3_next.modeling_qwen3_next import (
-    torch_chunk_gated_delta_rule,
-    torch_recurrent_gated_delta_rule,
-)
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -162,8 +161,10 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
 # Flex mask builder (bidir); flex block size - bucketing lengths up to it keeps the mask/kernel shape stable.
 _FLEX_BLOCK_SIZE = 128
 
+
 def _round_up(n, block):
     return ((n + block - 1) // block) * block
+
 
 def build_flex_mask(q_len, kv_len, window, device=None):
     def bidir_window(b, h, q_idx, kv_idx):
@@ -181,6 +182,7 @@ def build_flex_mask_padded(window, attention_mask):
 
     return create_block_mask(bidir_window_padded, B=B, H=None, Q_LEN=Lk, KV_LEN=Lk)
 
+
 def build_flex_mask_bucketed(window, q_mask, kv_mask, device=None):
     """Bucketed bidir window mask: fixed block shape, padded q-rows attend kv 0."""
     B, bq = kv_mask.shape
@@ -191,6 +193,7 @@ def build_flex_mask_bucketed(window, q_mask, kv_mask, device=None):
         return torch.where(q_mask[b, q_idx], in_window, kv_idx == 0)
 
     return create_block_mask(bidir_window_bucketed, B=B, H=None, Q_LEN=bq, KV_LEN=bq, device=device)
+
 
 # Kairos Attention (SWA bidirectional)
 class KairosAttention(nn.Module):
