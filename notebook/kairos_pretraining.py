@@ -82,9 +82,7 @@ def _():
     BUILD_LOCAL_IF_MISSING = False
 
     TEXT_SOURCE = "hf"  # "hf" (ffurfaro/keep-it-simple) or "inline" (tiny
-    TEXT_PCT = 10  # % of keep-it-simple to load. Was 2%: with TRAIN_MAE_EPOCHS=1 that's only a
-    # couple hundred optimizer steps for a from-scratch multiscale/MoE architecture - not enough
-    # to move loss off its near-random-init value (see TRAIN_MAE_EPOCHS below).
+    TEXT_PCT = 10  # % of keep-it-simple to load; was 2%, too little data for enough optimizer steps
 
     EVAL_PCT = 10  # % held out for eval
     return (
@@ -338,15 +336,11 @@ def _():
     # ---- two-stage curriculum: Stage 1 (MAE, fixed-rate bidirectional denoising, cheap/stable) bootstraps
     # the backbone, then Stage 2 (full diffusion, p up to 1.0, CE/p-weighted) resumes from Stage 1's weights
     # and fine-tunes on the real generative objective. Set *_EPOCHS = 0 to skip a stage entirely.
-    TRAIN_MAE_EPOCHS = 5  # was 1: on this small/tiny-batch setup 1 epoch is only ~tens-hundreds of
-    # steps, which is not enough for a from-scratch multiscale + MoE + hybrid-attention backbone to
-    # move off its near-random-init loss (ln(vocab_size) ~= 5.67 with the ByT5-based tokenizer's 291
-    # tokens - matches the reported "MAE stuck at 5"). Run OVERFIT_RUN below first: if that also
-    # plateaus well above 0 on 64 repeated examples, the bottleneck is capacity/lr, not step count.
+    TRAIN_MAE_EPOCHS = 5  # was 1, too few steps to leave the near-random-init loss (fixed codec bottleneck; see PyramidalPatchCodec)
     TRAIN_MAE_P_MAX = 0.3  # MAE stage ceiling on p: fixed-ish low corruption, easy/stable to optimize
     TRAIN_MAE_REWEIGHT = False  # plain CE in MAE stage: no 1/p variance blowup
 
-    TRAIN_DIFFUSION_EPOCHS = 5  # was 3, for the same reason as TRAIN_MAE_EPOCHS above
+    TRAIN_DIFFUSION_EPOCHS = 5  # was 3, same reasoning as TRAIN_MAE_EPOCHS
     TRAIN_MASK_P_MAX = 1.0  # Stage 2 ceiling on p: full diffusion, rows can be up to 100% noised
     TRAIN_MASK_REWEIGHT = True  # Stage 2: divide CE by p (standard masked-diffusion ELBO weighting)
 

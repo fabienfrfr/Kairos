@@ -342,9 +342,7 @@ class KairosEmbedding(nn.Module):
 
 
 class OutputHead(nn.Module):
-    """Predicts only the flat token stream. modality_id is an input (which backbone/scale a
-    position is routed to), never a prediction target - there is a single element to predict,
-    like byte-by-byte generation across modalities, not one head per input field."""
+    """Predicts the flat token stream only; modality_id is routing input, never a target."""
 
     def __init__(self, embedding: KairosEmbedding):
         super().__init__()
@@ -403,23 +401,10 @@ class CodecOutput:
     length: int
 
 
-class PyramidalLinearCodec(nn.Module):
-    """Parallel multi-scale codec with modality routing, built from linear patchify/unpatchify
-    instead of strided convolution.
-
-    A strided depthwise conv with a kernel narrower than its stride (the finest scale needs
-    kernel_size=1 at stride=3) only ever looks at one position in three and, on decode, writes
-    real values back at that same one-in-three position, leaving the other two literally zero
-    before fusion. That is a hard information bottleneck at the one place (the codec) it can't be
-    routed around, which is disproportionately costly for byte-level text where every position
-    matters.
-
-    Instead, each scale groups `patch = stride ** (level + 1)` consecutive positions and applies
-    a single Linear over the whole group both ways: encode reads all `patch` positions to produce
-    one token, decode writes a distinct value back to each of the `patch` positions. No position
-    is ever zero-filled; the only lossy step is the linear projection itself, same as any other
-    layer in the network.
-    """
+class PyramidalPatchCodec(nn.Module):
+    """Multi-scale codec via linear patchify/unpatchify: unlike a strided conv (kernel narrower
+    than stride, zero-filling most positions on decode), every position is a real linear
+    read/write, so no information is dropped at this unavoidable bottleneck."""
 
     def __init__(self, d_model, stride=5, num_scales=4):
         super().__init__()
@@ -471,7 +456,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         super().__init__(config)
         if use_moe is None:
             use_moe = config.use_moe
-        self.codec = PyramidalLinearCodec(d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales)
+        self.codec = PyramidalPatchCodec(d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales)
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:
             vocab_size = config.vocab_size

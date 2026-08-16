@@ -13,7 +13,7 @@ from kairos.modeling import (
     KairosDiffusionFM,
     KairosEmbedding,
     KairosMultiCache,
-    PyramidalLinearCodec,
+    PyramidalPatchCodec,
 )
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import KairosDiffusionTrainer, make_diffusion_mask
@@ -209,7 +209,7 @@ def test_token_embedding():
 
 
 def test_codec_roundtrip():
-    codec = PyramidalLinearCodec(32, stride=3)
+    codec = PyramidalPatchCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
     encoded = codec.encode(x)
     decoded = codec.decode(encoded)
@@ -219,7 +219,7 @@ def test_codec_roundtrip():
 def test_codec_roundtrip_length_not_a_multiple_of_any_patch():
     # 16 isn't a multiple of any of stride**1..4 = 3, 9, 27, 81: exercises the padding path
     # on every scale at once.
-    codec = PyramidalLinearCodec(32, stride=3, num_scales=4)
+    codec = PyramidalPatchCodec(32, stride=3, num_scales=4)
     x = torch.randn(2, 16, 32)
     decoded = codec.decode(codec.encode(x))
     assert decoded.shape == x.shape
@@ -229,7 +229,7 @@ def test_codec_decode_has_no_zeroed_positions():
     # regression: the old strided-conv codec left 2 out of every `stride` positions as a hard
     # zero after decode (kernel narrower than stride at the finest scale). The linear
     # patchify/unpatchify codec must give every position a real, nonzero contribution.
-    codec = PyramidalLinearCodec(32, stride=3, num_scales=4)
+    codec = PyramidalPatchCodec(32, stride=3, num_scales=4)
     x = torch.randn(2, 30, 32)
     decoded = codec.decode(codec.encode(x))
     per_position_norm = decoded.norm(dim=-1)
@@ -240,7 +240,7 @@ def test_codec_every_input_position_affects_every_output_position_in_its_patch()
     # a real linear layer over the whole patch means each of the `patch` reconstructed
     # positions has nonzero gradient w.r.t. every input position in that patch - unlike the
     # old kernel=1 conv, where only 1-in-`patch` positions carried any signal at all.
-    codec = PyramidalLinearCodec(4, stride=3, num_scales=1)
+    codec = PyramidalPatchCodec(4, stride=3, num_scales=1)
     x = torch.randn(1, 3, 4, requires_grad=True)
     decoded = codec.decode(codec.encode(x))
     decoded[0, 1].sum().backward()

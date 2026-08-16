@@ -38,9 +38,9 @@ def sample_lidar():
 
 
 # ========================= Vocab / backward compatibility =========================
-def test_vocab_size_is_291(tokenizer):
-    """Regression: KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens to the."""
-    assert len(tokenizer) == 291
+def test_vocab_size_is_4131(tokenizer):
+    """Regression: 259 base bytes/specials + 32 tags + 15 sub-blocks x 256 (3 IMG + 2 AUD + 8 LID + 2 SIG)."""
+    assert len(tokenizer) == 4131
 
 
 def test_no_native_bos(tokenizer):
@@ -50,6 +50,51 @@ def test_no_native_bos(tokenizer):
 def test_byte_offset_contiguous(tokenizer):
     assert tokenizer.convert_tokens_to_ids(chr(0)) == tokenizer._byte_offset
     assert tokenizer.convert_tokens_to_ids(chr(255)) == tokenizer._byte_offset + 255
+
+
+def test_image_and_text_bytes_use_disjoint_token_ids(tokenizer):
+    # regression: image/audio/lidar/signal bytes used to share the exact same ids as text bytes
+    text_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "text"))
+    img_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "IMG0"))
+    aud_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "AUD0"))
+    lid_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "LID0"))
+    sig_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "SIG0"))
+    all_blocks = [text_ids, img_ids, aud_ids, lid_ids, sig_ids]
+    assert sum(len(b) for b in all_blocks) == len(set().union(*all_blocks))
+
+
+def test_place_value_bytes_use_distinct_blocks_not_a_duplicated_one(tokenizer):
+    # the hi and lo byte of a 16-bit sample must NOT share a block (e.g. "LLRR" -> distinct
+    # L1/L2/R1/R2 tokens, not the same "L"/"R" token repeated) - each cycle position is disjoint
+    hi_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "AUD0"))
+    lo_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "AUD1"))
+    assert hi_ids.isdisjoint(lo_ids)
+
+
+def test_rgb_channels_use_distinct_blocks(tokenizer):
+    r_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "IMG0"))
+    g_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "IMG1"))
+    b_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "IMG2"))
+    assert r_ids.isdisjoint(g_ids) and g_ids.isdisjoint(b_ids) and r_ids.isdisjoint(b_ids)
+
+
+def test_signal_roundtrip_precision_beats_8bit(tokenizer):
+    # 16-bit place-value quantization must resolve a step far finer than the old 8-bit scheme
+    rng = np.random.default_rng(0)
+    values = rng.uniform(-1, 1, 200).astype(np.float32)
+    markers = KairosTokenizer.encode_signal(values)
+    ids = tokenizer._resolve_markers(markers)
+    recon = tokenizer.decode_signal(ids)
+    assert np.max(np.abs(recon - values)) < (2 / 255)  # much tighter than the old 8-bit step
+
+
+def test_signal_and_audio_use_different_token_blocks(tokenizer):
+    values = np.zeros(4, dtype=np.float32)
+    signal_ids = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values))
+    audio_ids = tokenizer._resolve_markers(KairosTokenizer.encode_audio(values))
+    byte_signal_ids = [i for i in signal_ids if i != tokenizer._tick_id]
+    byte_audio_ids = [i for i in audio_ids if i != tokenizer._tick_id]
+    assert set(byte_signal_ids).isdisjoint(byte_audio_ids)
 
 
 def test_plain_text_encode_decode_unchanged(tokenizer):
@@ -155,7 +200,8 @@ def test_audio_roundtrip_and_duration(tokenizer, sample_audio):
     recon, duration = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
     assert len(recon) == len(sample_audio)
     assert duration == pytest.approx(len(sample_audio) / KairosTokenizer.AUDIO_SAMPLE_RATE)
-    assert np.max(np.abs(recon - sample_audio)) < 1 / 127.5 + 1e-6
+    max_step = 2 / (256**2 - 1)  # 16-bit place-value quantization over [-1, 1]
+    assert np.max(np.abs(recon - sample_audio)) < max_step + 1e-6
 
 
 def test_audio_tick_count(tokenizer, sample_audio):
@@ -174,7 +220,7 @@ def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     assert recon.shape == sample_lidar.shape
     # quantization step over the fixed xyz range
     xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
-    max_step = (xyz_hi - xyz_lo) / 255
+    max_step = (xyz_hi - xyz_lo) / (256**2 - 1)  # 16-bit place-value quantization
     assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
 
 
@@ -269,9 +315,9 @@ def test_audio_decode_keeps_trailing_samples_without_final_tick_marker(tokenizer
     assert waveform.shape[0] == sample_audio.shape[0]
 
 
-def test_decode_lidar_rejects_payload_not_multiple_of_four(tokenizer):
-    ids = tokenizer._bytes_to_ids(b"\x00\x01\x02")  # 3 bytes, not a multiple
-    with pytest.raises(ValueError, match="not a multiple of 4"):
+def test_decode_lidar_rejects_payload_not_multiple_of_eight(tokenizer):
+    ids = tokenizer._bytes_to_ids(b"\x00\x01\x02")  # 3 bytes, not a multiple of 4 channels x 2 bytes
+    with pytest.raises(ValueError, match="not a multiple of 8"):
         tokenizer.decode_lidar(ids)
 
 

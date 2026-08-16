@@ -45,12 +45,36 @@ _CHANNEL_TAGS: dict[str, tuple[str, str]] = {
 
 _STRUCTURAL_TOKENS = ["<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"]
 
+# Raw-byte id blocks, one per (modality family, position-in-group), so distinct positions never
+# share a token id: 3 for IMG (R,G,B channels, shared by video), 2 for AUD (hi/lo byte of each
+# 16-bit sample), 8 for LID (4 point channels x hi/lo byte), 2 for SIG (hi/lo byte of each sample).
+_BLOCK_GROUPS = {"IMG": 3, "AUD": 2, "LID": 8, "SIG": 2}
+_SUBBLOCKS = [f"{family}{sub}" for family, n in _BLOCK_GROUPS.items() for sub in range(n)]
+_BLOCK_TOKENS = [f"<{sb}_{i}>" for sb in _SUBBLOCKS for i in range(256)]
+
 ALL_SPECIAL_TOKENS = (
     [t for pair in _MODALITY_TAGS.values() for t in pair]
     + [t for pair in _CHANNEL_TAGS.values() for t in pair]
     + _STRUCTURAL_TOKENS
     + ["<SEP>", "<MASK>"]
+    + _BLOCK_TOKENS
 )
+
+
+def _quantize_planes(x: np.ndarray, lo, hi, n_bytes: int) -> np.ndarray:
+    """Float in [lo, hi] -> n_bytes big-endian byte planes (place-value digits, like RGB channels), no single-byte rounding."""
+    levels = 256**n_bytes - 1
+    q = np.clip((np.asarray(x) - lo) / (hi - lo) * levels, 0, levels).astype(np.int64)
+    shifts = [(n_bytes - 1 - k) * 8 for k in range(n_bytes)]
+    return np.stack([(q >> s) & 0xFF for s in shifts], axis=-1).astype(np.uint8)
+
+
+def _dequantize_planes(planes: np.ndarray, lo, hi, n_bytes: int) -> np.ndarray:
+    """Inverse of `_quantize_planes`."""
+    levels = 256**n_bytes - 1
+    shifts = [(n_bytes - 1 - k) * 8 for k in range(n_bytes)]
+    q = sum(planes[..., k].astype(np.int64) << s for k, s in enumerate(shifts))
+    return q / levels * (hi - lo) + lo
 
 
 @dataclass
@@ -73,6 +97,7 @@ class KairosTokenizer(ByT5Tokenizer):
     LIDAR_POINTS_PER_GROUP = 32  # one <PTSEP> every N points
     LIDAR_XYZ_RANGE = (-100.0, 100.0)
     LIDAR_INTENSITY_RANGE = (0.0, 1.0)
+    SIGNAL_VALUE_RANGE = (-1.0, 1.0)  # state/action/imu channels are expected pre-clipped to this
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("extra_ids", 0)
@@ -84,16 +109,28 @@ class KairosTokenizer(ByT5Tokenizer):
         assert self.convert_tokens_to_ids(chr(255)) == self._byte_offset + 255, (
             "byte->id mapping is not contiguous — review _byte_offset calibration"
         )
+        self._block_offset = {}
+        for sb in _SUBBLOCKS:
+            offset = self.convert_tokens_to_ids(f"<{sb}_0>")
+            assert self.convert_tokens_to_ids(f"<{sb}_255>") == offset + 255, f"{sb} byte block not contiguous"
+            self._block_offset[sb] = offset
         self._endline_id = self.convert_tokens_to_ids("<ENDLINE>")
         self._endframe_id = self.convert_tokens_to_ids("<ENDFRAME>")
         self._tick_id = self.convert_tokens_to_ids("<TICK>")
         self._ptsep_id = self.convert_tokens_to_ids("<PTSEP>")
 
-    def _bytes_to_ids(self, raw: bytes) -> list[int]:
-        return [b + self._byte_offset for b in raw]
+    def _offsets(self, block) -> list[int]:
+        """block: "text", a single sub-block name, or a tuple/list of names cycled across bytes."""
+        names = [block] if isinstance(block, str) else block
+        return [self._byte_offset if b == "text" else self._block_offset[b] for b in names]
 
-    def _ids_to_bytes(self, ids: list[int]) -> bytes:
-        return bytes([max(0, i - self._byte_offset) & 0xFF for i in ids])
+    def _bytes_to_ids(self, raw: bytes, block: str = "text") -> list[int]:
+        offsets = self._offsets(block)
+        return [b + offsets[i % len(offsets)] for i, b in enumerate(raw)]
+
+    def _ids_to_bytes(self, ids: list[int], block: str = "text") -> bytes:
+        offsets = self._offsets(block)
+        return bytes([max(0, i - offsets[k % len(offsets)]) & 0xFF for k, i in enumerate(ids)])
 
     # ---------------- IMAGE: row-delimited, no header ----------------
     @classmethod
@@ -105,17 +142,21 @@ class KairosTokenizer(ByT5Tokenizer):
 
     @staticmethod
     def _encode_frame_rows(frame: np.ndarray) -> list:
+        channels = frame.shape[-1]
+        block_cycle = tuple(f"IMG{c}" for c in range(channels))  # one token block per channel (R,G,B,...)
         out = []
         for row in frame:
-            out.append(("bytes", row.tobytes()))
+            out.append(("bytes", row.tobytes(), block_cycle))
             out.append(("marker", "<ENDLINE>"))
         return out
 
     def _resolve_markers(self, marker_seq: list) -> list[int]:
         ids: list[int] = []
-        for kind, payload in marker_seq:
+        for entry in marker_seq:
+            kind, payload = entry[0], entry[1]
             if kind == "bytes":
-                ids.extend(self._bytes_to_ids(payload))
+                block = entry[2] if len(entry) > 2 else "text"
+                ids.extend(self._bytes_to_ids(payload, block))
             else:
                 ids.append(self.convert_tokens_to_ids(payload))
         return ids
@@ -141,7 +182,8 @@ class KairosTokenizer(ByT5Tokenizer):
         if w_bytes % channels != 0:
             raise ValueError(f"row byte length {w_bytes} not divisible by channels={channels}")
         w, h = w_bytes // channels, len(rows)
-        raw = self._ids_to_bytes([i for row in rows for i in row])
+        block_cycle = tuple(f"IMG{c}" for c in range(channels))
+        raw = self._ids_to_bytes([i for row in rows for i in row], block_cycle)
         return np.frombuffer(raw, dtype=np.uint8).reshape(h, w, channels)
 
     # ---------------- VIDEO: rows + <ENDFRAME> ----------------
@@ -177,21 +219,17 @@ class KairosTokenizer(ByT5Tokenizer):
         duration = stacked.shape[0] / fps if fps > 0 else float("nan")
         return stacked, duration
 
-    # ---------------- AUDIO: flat PCM + periodic
+    # ---------------- shared PCM codec: N-byte place-value quantization for 1D signals ----------------
     @classmethod
-    def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None) -> list:
-        if waveform.dtype != np.float32:
-            raise ValueError("encode_audio expects a float32 waveform in [-1, 1]")
-        tick_samples = tick_samples or cls.AUDIO_TICK_SAMPLES
-        pcm = np.clip(waveform * 127.5 + 127.5, 0, 255).astype(np.uint8)
+    def _encode_pcm(cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, block_cycle: tuple, n_bytes: int) -> list:
+        planes = _quantize_planes(values, lo, hi, n_bytes)  # (N, n_bytes), one distinct block per byte-plane
         out = []
-        for start in range(0, len(pcm), tick_samples):
-            out.append(("bytes", pcm[start : start + tick_samples].tobytes()))
+        for start in range(0, len(planes), tick_samples):
+            out.append(("bytes", planes[start : start + tick_samples].tobytes(), block_cycle))
             out.append(("marker", "<TICK>"))
         return out
 
-    def decode_audio(self, ids: list[int], tick_samples: int | None = None):
-        """Returns (waveform, duration_seconds); duration = len(waveform)/AUDIO_SAMPLE_RATE."""
+    def _decode_pcm(self, ids: list[int], lo: float, hi: float, block_cycle: tuple, n_bytes: int) -> np.ndarray:
         samples, current = [], []
         for i in ids:
             if i == self._tick_id:
@@ -201,13 +239,42 @@ class KairosTokenizer(ByT5Tokenizer):
                 current.append(i)
         if current:
             samples.extend(current)
-        pcm = np.frombuffer(self._ids_to_bytes(samples), dtype=np.uint8)
-        waveform = (pcm.astype(np.float32) - 127.5) / 127.5
+        raw = self._ids_to_bytes(samples, block_cycle)
+        if len(raw) % n_bytes != 0:
+            raise ValueError(f"payload ({len(raw)} bytes) not a multiple of n_bytes={n_bytes}")
+        planes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, n_bytes)
+        return _dequantize_planes(planes, lo, hi, n_bytes).astype(np.float32)
+
+    # ---------------- AUDIO: flat PCM + periodic <TICK>, n_bytes=2 (16-bit) by default ----------------
+    @classmethod
+    def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None, n_bytes: int = 2) -> list:
+        if waveform.dtype != np.float32:
+            raise ValueError("encode_audio expects a float32 waveform in [-1, 1]")
+        block_cycle = tuple(f"AUD{p}" for p in range(n_bytes))  # one token block per byte-plane (hi, lo, ...)
+        return cls._encode_pcm(waveform, -1.0, 1.0, tick_samples or cls.AUDIO_TICK_SAMPLES, block_cycle, n_bytes)
+
+    def decode_audio(self, ids: list[int], tick_samples: int | None = None, n_bytes: int = 2):
+        """Returns (waveform, duration_seconds); duration = len(waveform)/AUDIO_SAMPLE_RATE."""
+        block_cycle = tuple(f"AUD{p}" for p in range(n_bytes))
+        waveform = self._decode_pcm(ids, -1.0, 1.0, block_cycle, n_bytes)
         return waveform, len(waveform) / self.AUDIO_SAMPLE_RATE
 
-    # ---------------- LIDAR: point groups + fixed
+    # ------------- SIGNAL: generic control channel (state/action/imu), own token block -------------
     @classmethod
-    def encode_lidar(cls, points: np.ndarray, points_per_group: int | None = None) -> list:
+    def encode_signal(cls, values: np.ndarray, tick_samples: int | None = None, n_bytes: int = 2) -> list:
+        """Same place-value PCM scheme as audio, but its own block so control values never share ids with real audio or text."""
+        if values.dtype != np.float32:
+            raise ValueError("encode_signal expects a float32 array in [-1, 1]")
+        block_cycle = tuple(f"SIG{p}" for p in range(n_bytes))
+        return cls._encode_pcm(values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, block_cycle, n_bytes)
+
+    def decode_signal(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
+        block_cycle = tuple(f"SIG{p}" for p in range(n_bytes))
+        return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, block_cycle, n_bytes)
+
+    # ---------------- LIDAR: point groups + fixed quantization bounds, n_bytes=2 per channel ----------------
+    @classmethod
+    def encode_lidar(cls, points: np.ndarray, points_per_group: int | None = None, n_bytes: int = 2) -> list:
         if points.dtype != np.float32 or points.ndim != 2 or points.shape[-1] != 4:
             raise ValueError("encode_lidar expects a (N, 4) float32 array [x,y,z,intensity]")
         points_per_group = points_per_group or cls.LIDAR_POINTS_PER_GROUP
@@ -215,14 +282,15 @@ class KairosTokenizer(ByT5Tokenizer):
         int_lo, int_hi = cls.LIDAR_INTENSITY_RANGE
         lo = np.array([xyz_lo, xyz_lo, xyz_lo, int_lo], dtype=np.float32)
         hi = np.array([xyz_hi, xyz_hi, xyz_hi, int_hi], dtype=np.float32)
-        q = ((np.clip(points, lo, hi) - lo) / (hi - lo) * 255).astype(np.uint8)
+        planes = _quantize_planes(points, lo, hi, n_bytes)  # (N, 4, n_bytes)
+        block_cycle = tuple(f"LID{c * n_bytes + p}" for c in range(4) for p in range(n_bytes))  # one block per (channel, byte-plane)
         out = []
-        for start in range(0, len(q), points_per_group):
-            out.append(("bytes", q[start : start + points_per_group].tobytes()))
+        for start in range(0, len(planes), points_per_group):
+            out.append(("bytes", planes[start : start + points_per_group].tobytes(), block_cycle))
             out.append(("marker", "<PTSEP>"))
         return out
 
-    def decode_lidar(self, ids: list[int]) -> np.ndarray:
+    def decode_lidar(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
         """Dequantized via fixed LIDAR_XYZ_RANGE/LIDAR_INTENSITY_RANGE (lossy but header-free)."""
         point_bytes, current = [], []
         for i in ids:
@@ -233,15 +301,17 @@ class KairosTokenizer(ByT5Tokenizer):
                 current.append(i)
         if current:
             point_bytes.extend(current)
-        raw = self._ids_to_bytes(point_bytes)
-        if len(raw) % 4 != 0:
-            raise ValueError(f"lidar payload ({len(raw)} bytes) not a multiple of 4")
-        q = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4).astype(np.float32)
+        block_cycle = tuple(f"LID{c * n_bytes + p}" for c in range(4) for p in range(n_bytes))
+        raw = self._ids_to_bytes(point_bytes, block_cycle)
+        stride = 4 * n_bytes
+        if len(raw) % stride != 0:
+            raise ValueError(f"lidar payload ({len(raw)} bytes) not a multiple of {stride}")
+        planes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4, n_bytes)
         xyz_lo, xyz_hi = self.LIDAR_XYZ_RANGE
         int_lo, int_hi = self.LIDAR_INTENSITY_RANGE
         lo = np.array([xyz_lo, xyz_lo, xyz_lo, int_lo], dtype=np.float32)
         hi = np.array([xyz_hi, xyz_hi, xyz_hi, int_hi], dtype=np.float32)
-        return q / 255.0 * (hi - lo) + lo
+        return _dequantize_planes(planes, lo, hi, n_bytes)
 
     # ---------------- multimodal sequence assembly ----------------
     def encode_multimodal(self, segments: list[MultimodalSegment], max_len: int | None = None) -> dict:
@@ -309,4 +379,5 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# len(KairosTokenizer()) == 291 (259 base bytes + pad/eos/unk + locals)
+# len(KairosTokenizer()) == 259 base bytes/specials + 32 modality/channel/structural tags + 3840
+# per-position raw-byte block tokens (15 sub-blocks x 256: 3 IMG + 2 AUD + 8 LID + 2 SIG) == 4131
