@@ -47,8 +47,8 @@ _STRUCTURAL_TOKENS = ["<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"]
 
 # Raw-byte id blocks, one per (modality family, position-in-group), so distinct positions never
 # share a token id: 3 for IMG (R,G,B channels, shared by video), 2 for AUD (hi/lo byte of each
-# 16-bit sample), 8 for LID (4 point channels x hi/lo byte), 2 for SIG (hi/lo byte of each sample).
-_BLOCK_GROUPS = {"IMG": 3, "AUD": 2, "LID": 8, "SIG": 2}
+# 16-bit sample), 8 for LID (4 point channels x hi/lo byte), 2 each for ACT/STA (hi/lo byte).
+_BLOCK_GROUPS = {"IMG": 3, "AUD": 2, "LID": 8, "ACT": 2, "STA": 2}
 _SUBBLOCKS = [f"{family}{sub}" for family, n in _BLOCK_GROUPS.items() for sub in range(n)]
 _BLOCK_TOKENS = [f"<{sb}_{i}>" for sb in _SUBBLOCKS for i in range(256)]
 
@@ -259,17 +259,17 @@ class KairosTokenizer(ByT5Tokenizer):
         waveform = self._decode_pcm(ids, -1.0, 1.0, block_cycle, n_bytes)
         return waveform, len(waveform) / self.AUDIO_SAMPLE_RATE
 
-    # ------------- SIGNAL: generic control channel (state/action/imu), own token block -------------
+    # ------------- SIGNAL: generic control channel (state/action/imu), family picks its own token block -------------
     @classmethod
-    def encode_signal(cls, values: np.ndarray, tick_samples: int | None = None, n_bytes: int = 2) -> list:
-        """Same place-value PCM scheme as audio, but its own block so control values never share ids with real audio or text."""
+    def encode_signal(cls, values: np.ndarray, family: str, tick_samples: int | None = None, n_bytes: int = 2) -> list:
+        """Same place-value PCM scheme as audio, but its own block per family (e.g. "ACT" vs "STA") so channels never share ids."""
         if values.dtype != np.float32:
             raise ValueError("encode_signal expects a float32 array in [-1, 1]")
-        block_cycle = tuple(f"SIG{p}" for p in range(n_bytes))
+        block_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
         return cls._encode_pcm(values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, block_cycle, n_bytes)
 
-    def decode_signal(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
-        block_cycle = tuple(f"SIG{p}" for p in range(n_bytes))
+    def decode_signal(self, ids: list[int], family: str, n_bytes: int = 2) -> np.ndarray:
+        block_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
         return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, block_cycle, n_bytes)
 
     # ---------------- LIDAR: point groups + fixed quantization bounds, n_bytes=2 per channel ----------------
@@ -379,5 +379,5 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# len(KairosTokenizer()) == 259 base bytes/specials + 32 modality/channel/structural tags + 3840
-# per-position raw-byte block tokens (15 sub-blocks x 256: 3 IMG + 2 AUD + 8 LID + 2 SIG) == 4131
+# len(KairosTokenizer()) == 259 base bytes/specials + 32 modality/channel/structural tags + 4352
+# per-position raw-byte block tokens (17 sub-blocks x 256: 3 IMG + 2 AUD + 8 LID + 2 ACT + 2 STA) == 4643

@@ -393,14 +393,14 @@ def _(
     TRAIN_EVAL_BATCHES,
     TRAIN_EVAL_EVERY,
     TRAIN_LR,
-    TRAIN_MAX_LEN,
-    TRAIN_PACK,
     TRAIN_MAE_EPOCHS,
     TRAIN_MAE_P_MAX,
     TRAIN_MAE_REWEIGHT,
     TRAIN_MASK_EPS,
     TRAIN_MASK_P_MAX,
     TRAIN_MASK_REWEIGHT,
+    TRAIN_MAX_LEN,
+    TRAIN_PACK,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
     TRAIN_STRIDE,
@@ -459,36 +459,6 @@ def _(
 
 
 @app.cell
-def _(KairosMultimodalPipeline, data_config, mo, model_config, tokenizer, train_config_mae):
-    # Stage 1 (MAE): fixed-rate bidirectional denoising, no CE/p reweighting. Cheap sanity check that the
-    # backbone can learn/memorize at all, and a stable bootstrap before the harder full-diffusion objective.
-    # Writes checkpoints/last.pt in train_config_mae.run_dir, picked up by Stage 2 below via resume=True.
-    if train_config_mae.epochs > 0:
-        pipe_mae = KairosMultimodalPipeline(model_config, data_config, train_config_mae, tokenizer=tokenizer)
-        pipe_mae.build()
-
-        _total_steps = train_config_mae.epochs * len(pipe_mae.loader)
-        if mo.running_in_notebook():
-            with mo.status.progress_bar(total=_total_steps, title="mae_pretrain") as _bar:
-                _state = {"last_step": 0}
-
-                def _on_mae_step(step, total, loss_val):
-                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                    _state["last_step"] = step
-
-                mae_logs = pipe_mae.train(progress_callback=_on_mae_step, resume=True)
-        else:
-            from kairos.utils import make_progress_callback
-
-            mae_logs = pipe_mae.train(progress_callback=make_progress_callback(desc="mae_pretrain"), resume=True)
-
-        print(f"MAE stage complete - steps: {len(mae_logs)}  best avg-epoch loss: {pipe_mae.best_loss:.4f}")
-    else:
-        print("TRAIN_MAE_EPOCHS is 0 - skipping the MAE bootstrap stage")
-    return
-
-
-@app.cell
 def _(
     KairosMultimodalPipeline,
     data_config,
@@ -528,6 +498,43 @@ def _():
 def _(N_BENCH_STEPS, RUN_BENCHMARK, pipe):
     cost_summary = pipe.summary(benchmark=RUN_BENCHMARK, n_bench_steps=N_BENCH_STEPS)
     print(cost_summary)
+    return
+
+
+@app.cell
+def _(
+    KairosMultimodalPipeline,
+    data_config,
+    mo,
+    model_config,
+    tokenizer,
+    train_config_mae,
+):
+    # Stage 1 (MAE): fixed-rate bidirectional denoising, no CE/p reweighting. Cheap sanity check that the
+    # backbone can learn/memorize at all, and a stable bootstrap before the harder full-diffusion objective.
+    # Writes checkpoints/last.pt in train_config_mae.run_dir, picked up by Stage 2 below via resume=True.
+    if train_config_mae.epochs > 0:
+        pipe_mae = KairosMultimodalPipeline(model_config, data_config, train_config_mae, tokenizer=tokenizer)
+        pipe_mae.build()
+
+        _total_steps = train_config_mae.epochs * len(pipe_mae.loader)
+        if mo.running_in_notebook():
+            with mo.status.progress_bar(total=_total_steps, title="mae_pretrain") as _bar:
+                _state = {"last_step": 0}
+
+                def _on_mae_step(step, total, loss_val):
+                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
+                    _state["last_step"] = step
+
+                mae_logs = pipe_mae.train(progress_callback=_on_mae_step, resume=True)
+        else:
+            from kairos.utils import make_progress_callback
+
+            mae_logs = pipe_mae.train(progress_callback=make_progress_callback(desc="mae_pretrain"), resume=True)
+
+        print(f"MAE stage complete - steps: {len(mae_logs)}  best avg-epoch loss: {pipe_mae.best_loss:.4f}")
+    else:
+        print("TRAIN_MAE_EPOCHS is 0 - skipping the MAE bootstrap stage")
     return
 
 

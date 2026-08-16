@@ -174,12 +174,12 @@ class KairosPretrainingDataset(Dataset):
 
         if modality == "imu":
             flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
-            return [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(flat))]
+            return [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(flat, family="STA"))]
 
         if modality == "control":
             sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
-            action_markers = KairosTokenizer.encode_signal(arrays["action"], tick_samples=sample_rate)
-            state_markers = KairosTokenizer.encode_signal(arrays["state"], tick_samples=sample_rate)
+            action_markers = KairosTokenizer.encode_signal(arrays["action"], family="ACT", tick_samples=sample_rate)
+            state_markers = KairosTokenizer.encode_signal(arrays["state"], family="STA", tick_samples=sample_rate)
             segments = []
             if caption:
                 segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))

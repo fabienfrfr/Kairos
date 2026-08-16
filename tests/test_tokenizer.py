@@ -38,9 +38,9 @@ def sample_lidar():
 
 
 # ========================= Vocab / backward compatibility =========================
-def test_vocab_size_is_4131(tokenizer):
-    """Regression: 259 base bytes/specials + 32 tags + 15 sub-blocks x 256 (3 IMG + 2 AUD + 8 LID + 2 SIG)."""
-    assert len(tokenizer) == 4131
+def test_vocab_size_is_4643(tokenizer):
+    """Regression: 259 base bytes/specials + 32 tags + 17 sub-blocks x 256 (3 IMG + 2 AUD + 8 LID + 2 ACT + 2 STA)."""
+    assert len(tokenizer) == 4643
 
 
 def test_no_native_bos(tokenizer):
@@ -58,8 +58,9 @@ def test_image_and_text_bytes_use_disjoint_token_ids(tokenizer):
     img_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "IMG0"))
     aud_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "AUD0"))
     lid_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "LID0"))
-    sig_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "SIG0"))
-    all_blocks = [text_ids, img_ids, aud_ids, lid_ids, sig_ids]
+    act_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "ACT0"))
+    sta_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "STA0"))
+    all_blocks = [text_ids, img_ids, aud_ids, lid_ids, act_ids, sta_ids]
     assert sum(len(b) for b in all_blocks) == len(set().union(*all_blocks))
 
 
@@ -78,19 +79,26 @@ def test_rgb_channels_use_distinct_blocks(tokenizer):
     assert r_ids.isdisjoint(g_ids) and g_ids.isdisjoint(b_ids) and r_ids.isdisjoint(b_ids)
 
 
+def test_action_and_state_use_disjoint_token_blocks(tokenizer):
+    # action and state are semantically different control channels, must not share ids either
+    act_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "ACT0"))
+    sta_ids = set(tokenizer._bytes_to_ids(bytes(range(256)), "STA0"))
+    assert act_ids.isdisjoint(sta_ids)
+
+
 def test_signal_roundtrip_precision_beats_8bit(tokenizer):
     # 16-bit place-value quantization must resolve a step far finer than the old 8-bit scheme
     rng = np.random.default_rng(0)
     values = rng.uniform(-1, 1, 200).astype(np.float32)
-    markers = KairosTokenizer.encode_signal(values)
+    markers = KairosTokenizer.encode_signal(values, family="ACT")
     ids = tokenizer._resolve_markers(markers)
-    recon = tokenizer.decode_signal(ids)
+    recon = tokenizer.decode_signal(ids, family="ACT")
     assert np.max(np.abs(recon - values)) < (2 / 255)  # much tighter than the old 8-bit step
 
 
 def test_signal_and_audio_use_different_token_blocks(tokenizer):
     values = np.zeros(4, dtype=np.float32)
-    signal_ids = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values))
+    signal_ids = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values, family="ACT"))
     audio_ids = tokenizer._resolve_markers(KairosTokenizer.encode_audio(values))
     byte_signal_ids = [i for i in signal_ids if i != tokenizer._tick_id]
     byte_audio_ids = [i for i in audio_ids if i != tokenizer._tick_id]
