@@ -51,6 +51,7 @@ _STRUCTURAL_TOKENS = ["<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"]
 _BLOCK_GROUPS = {"IMG": 3, "AUD": 2, "LID": 8, "ACT": 2, "STA": 2}
 _SUBBLOCKS = [f"{family}{sub}" for family, n in _BLOCK_GROUPS.items() for sub in range(n)]
 _BLOCK_TOKENS = [f"<{sb}_{i}>" for sb in _SUBBLOCKS for i in range(256)]
+NUM_OCTET_FAMILIES = len(_SUBBLOCKS) + 1  # +1 for the "text/other" catch-all family (id 0)
 
 ALL_SPECIAL_TOKENS = (
     [t for pair in _MODALITY_TAGS.values() for t in pair]
@@ -98,6 +99,7 @@ class KairosTokenizer(ByT5Tokenizer):
     LIDAR_XYZ_RANGE = (-100.0, 100.0)
     LIDAR_INTENSITY_RANGE = (0.0, 1.0)
     SIGNAL_VALUE_RANGE = (-1.0, 1.0)  # state/action/imu channels are expected pre-clipped to this
+    NUM_OCTET_FAMILIES = NUM_OCTET_FAMILIES
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("extra_ids", 0)
@@ -118,6 +120,12 @@ class KairosTokenizer(ByT5Tokenizer):
         self._endframe_id = self.convert_tokens_to_ids("<ENDFRAME>")
         self._tick_id = self.convert_tokens_to_ids("<TICK>")
         self._ptsep_id = self.convert_tokens_to_ids("<PTSEP>")
+
+        # per-token id -> octet-family id (0 = text/other, 1..N = one per _SUBBLOCKS entry)
+        self.octet_family_ids = torch.zeros(len(self), dtype=torch.long)
+        for family_idx, sb in enumerate(_SUBBLOCKS, start=1):
+            offset = self._block_offset[sb]
+            self.octet_family_ids[offset : offset + 256] = family_idx
 
     def _offsets(self, block) -> list[int]:
         """block: "text", a single sub-block name, or a tuple/list of names cycled across bytes."""

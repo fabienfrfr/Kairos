@@ -348,3 +348,23 @@ def test_decode_multimodal_skips_unrecognized_leading_tokens(tokenizer):
     assert len(segments) == 1
     assert segments[0].modality is Modality.TEXT
     assert segments[0].data == b"hi"
+
+
+def test_octet_family_ids_shape_and_range(tokenizer):
+    assert tokenizer.octet_family_ids.shape == (len(tokenizer),)
+    assert tokenizer.octet_family_ids.max().item() == KairosTokenizer.NUM_OCTET_FAMILIES - 1
+
+
+def test_octet_family_ids_distinguish_rgb_and_place_value(tokenizer):
+    # R, G, B and audio hi/lo must map to different family ids, matching their distinct token blocks
+    r_id = tokenizer._bytes_to_ids(bytes([0]), "IMG0")[0]
+    g_id = tokenizer._bytes_to_ids(bytes([0]), "IMG1")[0]
+    aud_hi_id = tokenizer._bytes_to_ids(bytes([0]), "AUD0")[0]
+    aud_lo_id = tokenizer._bytes_to_ids(bytes([0]), "AUD1")[0]
+    families = tokenizer.octet_family_ids[[r_id, g_id, aud_hi_id, aud_lo_id]]
+    assert len(set(families.tolist())) == 4
+
+
+def test_octet_family_ids_text_bytes_are_family_zero(tokenizer):
+    text_id = tokenizer.convert_tokens_to_ids(chr(65))
+    assert tokenizer.octet_family_ids[text_id].item() == 0

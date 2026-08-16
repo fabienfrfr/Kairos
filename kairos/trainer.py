@@ -20,16 +20,17 @@ def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0):
 
 
 def compute_masked_diffusion_losses(model, x0, noise_mask, p, modality_ids=None, cache_params=None, reweight=True):
-    """Noises ``x0`` on ``noise_mask`` and returns per-token loss (``CE / p`` if ``reweight``, else plain CE)."""
+    """Noises ``x0`` on ``noise_mask``, returns (per-token CE, logits, octet_logits or None)."""
     xt = x0.clone()
     noise = torch.randint_like(x0, model.lm_head.vocab_size)
     xt[noise_mask] = noise[noise_mask]
 
-    logits = model(decoder_input_ids=xt, modality_ids=modality_ids, cache_params=cache_params).logits
-    per_token_loss = F.cross_entropy(logits[noise_mask], x0[noise_mask], reduction="none")
+    # logits_mask: only project noised positions - lm_head cost scales with vocab_size
+    out = model(decoder_input_ids=xt, modality_ids=modality_ids, cache_params=cache_params, logits_mask=noise_mask)
+    per_token_loss = F.cross_entropy(out.logits, x0[noise_mask], reduction="none")
     if reweight:
         per_token_loss = per_token_loss / p[noise_mask]
-    return per_token_loss, logits
+    return per_token_loss, out.logits, out.octet_logits
 
 
 class KairosDiffusionTrainer(Trainer):
@@ -42,6 +43,8 @@ class KairosDiffusionTrainer(Trainer):
     # (e.g. 0.3) for an MAE-style fixed-rate corruption curriculum stage. Expose via TrainConfig.mask_p_max.
     mask_reweight: bool = True  # divide CE by p (standard masked-diffusion ELBO weighting). Set False for
     # plain CE (standard MAE loss, no variance blow-up at low p) — pairs naturally with a capped mask_p_max.
+    octet_family_ids: torch.Tensor | None = None  # token id -> octet-family id lookup, set by pipeline
+    octet_loss_weight: float = 0.1  # weight of the auxiliary octet-family classification loss
 
     def compute_loss(self, model, inputs, return_outputs=False, cache_params=None):
         x0 = inputs["input_ids"]
@@ -58,10 +61,13 @@ class KairosDiffusionTrainer(Trainer):
                 if len(row_idx) > 0:
                     noise_mask[i, row_idx[0]] = True
 
-        per_token_loss, logits = compute_masked_diffusion_losses(
+        per_token_loss, logits, octet_logits = compute_masked_diffusion_losses(
             model, x0, noise_mask, p, modality_ids, cache_params, reweight=self.mask_reweight
         )
         loss = per_token_loss.mean()
+        if octet_logits is not None and self.octet_family_ids is not None:
+            targets = self.octet_family_ids.to(x0.device)[x0[noise_mask]]
+            loss = loss + self.octet_loss_weight * F.cross_entropy(octet_logits, targets)
 
         if not torch.isfinite(loss):
             # capture context here (access to logits/inputs)

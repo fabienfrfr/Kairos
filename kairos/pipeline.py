@@ -197,6 +197,8 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_eps = tc.mask_eps
         self.hf_trainer.mask_p_max = tc.mask_p_max
         self.hf_trainer.mask_reweight = tc.mask_reweight
+        if self.model_config.predict_octet_family:
+            self.hf_trainer.octet_family_ids = self.tokenizer.octet_family_ids
         self.writer = SummaryWriter(str(self.tb_dir))
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt:
@@ -778,7 +780,7 @@ class KairosMultimodalPipeline:
         if not noise_mask.any():
             return {}
 
-        per_token_loss, _ = compute_masked_diffusion_losses(self.model, x0, noise_mask, p, modality_ids)
+        per_token_loss, _, _ = compute_masked_diffusion_losses(self.model, x0, noise_mask, p, modality_ids)
 
         out = {}
         modality_at_noised = modality_ids[noise_mask]

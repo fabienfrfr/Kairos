@@ -47,6 +47,8 @@ class KairosConfig(PretrainedConfig):
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
         self.codec_tie_weights = kwargs.get("codec_tie_weights", False)
+        self.predict_octet_family = kwargs.get("predict_octet_family", True)
+        self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer.NUM_OCTET_FAMILIES
 
         default_scales = {0: [0, 1], 1: [1, 2], 2: [2, 3]}
         for m in range(self.num_modalities):
@@ -343,17 +345,20 @@ class KairosEmbedding(nn.Module):
 
 
 class OutputHead(nn.Module):
-    """Predicts the flat token stream only; modality_id is routing input, never a target."""
+    """Predicts the token stream; optionally an auxiliary octet-family id too (see below)."""
 
-    def __init__(self, embedding: KairosEmbedding):
+    def __init__(self, embedding: KairosEmbedding, num_octet_families: int = 0):
         super().__init__()
         d_model = embedding.token_embed.embedding_dim
         self.vocab_size = embedding.token_embed.num_embeddings
         self.token_head = nn.Linear(d_model, self.vocab_size, bias=False)
         self.token_head.weight = embedding.token_embed.weight
+        self.octet_head = nn.Linear(d_model, num_octet_families) if num_octet_families > 0 else None
 
     def forward(self, h):
-        return self.token_head(h)
+        token_logits = self.token_head(h)
+        octet_logits = self.octet_head(h) if self.octet_head is not None else None
+        return token_logits, octet_logits
 
 
 class KairosScaleRouter(nn.Module):
@@ -403,9 +408,12 @@ class CodecOutput:
 
 
 class PyramidalPatchCodec(nn.Module):
-    """Multi-scale codec via linear patchify/unpatchify: unlike a strided conv (kernel narrower
-    than stride, zero-filling most positions on decode), every position is a real linear
-    read/write, so no information is dropped at this unavoidable bottleneck."""
+    """Multi-scale codec via depthwise patchify/unpatchify (MobileNet-style: per-channel mixing
+    within a patch here, cross-channel mixing left to `fusion` below). Cost is O(patch * d_model)
+    per scale instead of O(patch * d_model^2) for a dense patch Linear - patch grows exponentially
+    across scales (stride**level), so the dense version's compute is dominated by its few, huge,
+    rarely-used deepest-scale matrices. Every position still gets a real, distinct read/write
+    (unlike the old strided conv, which zero-filled most positions on decode)."""
 
     def __init__(self, d_model, stride=5, num_scales=4, tie_weights=False):
         super().__init__()
@@ -413,12 +421,17 @@ class PyramidalPatchCodec(nn.Module):
         self.num_scales = num_scales
         self.tie_weights = tie_weights
         self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
-        self.encoders = nn.ModuleList(nn.Linear(d_model * patch, d_model) for patch in self.patch_sizes)
-        if tie_weights:
-            # decode reuses each encoder's weight transposed (like tied input/output embeddings); only the bias is decode-specific
-            self.decoder_biases = nn.ParameterList(nn.Parameter(torch.zeros(d_model * patch)) for patch in self.patch_sizes)
-        else:
-            self.decoders = nn.ModuleList(nn.Linear(d_model, d_model * patch) for patch in self.patch_sizes)
+        self.encode_w = nn.ParameterList(nn.Parameter(torch.empty(patch, d_model)) for patch in self.patch_sizes)
+        self.encode_b = nn.ParameterList(nn.Parameter(torch.zeros(d_model)) for _ in self.patch_sizes)
+        if not tie_weights:
+            # decode has its own (patch, d_model) weight; tied mode reuses encode_w instead (see _decode_weight)
+            self.decode_w = nn.ParameterList(nn.Parameter(torch.empty(patch, d_model)) for patch in self.patch_sizes)
+        self.decode_b = nn.ParameterList(nn.Parameter(torch.zeros(patch, d_model)) for patch in self.patch_sizes)
+        for w in self.encode_w:
+            nn.init.normal_(w, std=w.shape[0] ** -0.5)  # ~unit output variance for a patch-sized weighted sum
+        if not tie_weights:
+            for w in self.decode_w:
+                nn.init.normal_(w, std=1.0)
         self.norm = KairosNorm(d_model * num_scales)
         self.fusion = nn.Linear(d_model * num_scales, d_model)
 
@@ -428,27 +441,27 @@ class PyramidalPatchCodec(nn.Module):
         remainder = length % patch
         return F.pad(x, (0, 0, 0, patch - remainder)) if remainder else x
 
-    def _decode_scale(self, scale, idx):
-        if self.tie_weights:
-            return F.linear(scale, self.encoders[idx].weight.t(), self.decoder_biases[idx])
-        return self.decoders[idx](scale)
+    def _decode_weight(self, idx):
+        return self.encode_w[idx] if self.tie_weights else self.decode_w[idx]
 
     def encode(self, x):
         length = x.shape[1]
         scales = []
-        for patch, encoder in zip(self.patch_sizes, self.encoders):
+        for patch, w, b in zip(self.patch_sizes, self.encode_w, self.encode_b):
             padded = self._pad_to_multiple(x, patch)
             batch, padded_len, d_model = padded.shape
-            grouped = padded.reshape(batch, padded_len // patch, patch * d_model)
-            scales.append(encoder(grouped))
+            grouped = padded.reshape(batch, padded_len // patch, patch, d_model)
+            scales.append(torch.einsum("bgpd,pd->bgd", grouped, w) + b)
         return CodecOutput(scales=scales, length=length)
 
     def decode(self, encoded):
         length = encoded.length
         reconstructed = []
         for idx, (scale, patch) in enumerate(zip(encoded.scales, self.patch_sizes)):
-            batch, num_groups, _ = scale.shape
-            expanded = self._decode_scale(scale, idx).reshape(batch, num_groups * patch, -1)
+            w, b = self._decode_weight(idx), self.decode_b[idx]  # each (patch, d_model)
+            expanded = scale.unsqueeze(2) * w + b  # (batch, groups, patch, d_model), one real value per position
+            batch, groups, _, d_model = expanded.shape
+            expanded = expanded.reshape(batch, groups * patch, d_model)
             if expanded.shape[1] < length:
                 expanded = F.pad(expanded, (0, 0, 0, length - expanded.shape[1]))
             reconstructed.append(expanded[:, :length])
@@ -460,6 +473,7 @@ class PyramidalPatchCodec(nn.Module):
 @dataclass
 class KairosOutput(CausalLMOutputWithPast):
     encoder_last_hidden_state: torch.FloatTensor = None
+    octet_logits: torch.FloatTensor = None
 
 
 class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
@@ -487,7 +501,8 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
             self.memory_gate = None
         self.rotary = KairosRotaryEmbedding(config, config.head_dim)
         self.norm = KairosNorm(config.hidden_size)
-        self.lm_head = OutputHead(self.embedding)
+        n_octet = config.num_octet_families if config.predict_octet_family else 0
+        self.lm_head = OutputHead(self.embedding, num_octet_families=n_octet)
         self.post_init()  # triggers _init_weights on every submodule/parameter
 
     def _init_weights(self, module):
@@ -508,6 +523,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         attention_mask=None,
         self_conditioning_logits=None,
         cache_params=None,
+        logits_mask=None,
         **kwargs,
     ):
         x = decoder_input_ids if decoder_input_ids is not None else input_ids
@@ -545,5 +561,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         decoded = CodecOutput(scales=features, length=encoded.length)
         h = self.codec.decode(decoded)
         h = self.norm(h)
-        token_logits = self.lm_head(h)
-        return KairosOutput(logits=token_logits, past_key_values=cache_params)
+        # heads cost scales with vocab_size, so restrict to logits_mask positions when given
+        h = h[logits_mask] if logits_mask is not None else h
+        token_logits, octet_logits = self.lm_head(h)
+        return KairosOutput(logits=token_logits, octet_logits=octet_logits, past_key_values=cache_params)

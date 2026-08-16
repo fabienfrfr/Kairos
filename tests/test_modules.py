@@ -247,6 +247,17 @@ def test_codec_every_input_position_affects_every_output_position_in_its_patch()
     assert (x.grad.abs().sum(dim=-1) > 0).all()
 
 
+def test_codec_cost_is_linear_not_quadratic_in_d_model():
+    # depthwise patchify: params/FLOPs are O(patch * d_model), not O(patch * d_model^2) like a
+    # dense patch->d_model Linear. Doubling d_model should roughly double the codec's param count,
+    # not quadruple it.
+    small = PyramidalPatchCodec(32, stride=3, num_scales=4)
+    big = PyramidalPatchCodec(64, stride=3, num_scales=4)
+    n_small = sum(p.numel() for n, p in small.named_parameters() if not n.startswith(("norm", "fusion")))
+    n_big = sum(p.numel() for n, p in big.named_parameters() if not n.startswith(("norm", "fusion")))
+    assert n_big < n_small * 3  # well under the 4x a dense (patch*d_model^2) codec would give
+
+
 def test_codec_tie_weights_roundtrip_and_fewer_params():
     free = PyramidalPatchCodec(32, stride=3, num_scales=2, tie_weights=False)
     tied = PyramidalPatchCodec(32, stride=3, num_scales=2, tie_weights=True)
@@ -257,12 +268,16 @@ def test_codec_tie_weights_roundtrip_and_fewer_params():
     assert n_tied < n_free  # decode weight matrices are reused from encode, only biases are extra
 
 
-def test_codec_tie_weights_decoder_uses_encoder_weight_transposed():
+def test_codec_tie_weights_decoder_reuses_encoder_weight():
     codec = PyramidalPatchCodec(4, stride=3, num_scales=1, tie_weights=True)
     x = torch.randn(1, 3, 4)
-    scale = codec.encode(x).scales[0]
-    manual = scale @ codec.encoders[0].weight + codec.decoder_biases[0]
-    assert torch.allclose(codec._decode_scale(scale, 0), manual, atol=1e-6)
+    encoded = codec.encode(x)
+    scale = encoded.scales[0]
+    manual = scale.unsqueeze(2) * codec.encode_w[0] + codec.decode_b[0]  # decode should reuse encode_w, not a separate weight
+    manual = manual.reshape(1, 3, 4)
+    manual = codec.fusion(codec.norm(manual))
+    assert torch.allclose(codec.decode(encoded), manual, atol=1e-6)
+    assert not hasattr(codec, "decode_w")  # tied mode must not allocate a separate decode weight at all
 
 
 def test_kairos_model_init(config):
@@ -316,6 +331,61 @@ def test_kairos_model_forward_with_self_conditioning(config):
     logits = torch.randn(2, 16, 259)
     out = model(input_ids=x, self_conditioning_logits=logits)
     assert out.logits.shape == (2, 16, 259)
+
+
+def test_kairos_model_forward_logits_mask_restricts_lm_head_to_selected_positions():
+    # training only ever needs logits at the noised positions; logits_mask must skip lm_head's
+    # (vocab-sized, so expensive) projection everywhere else instead of computing and discarding it
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 100, (2, 16))
+    mask = torch.zeros(2, 16, dtype=torch.bool)
+    mask[0, :3] = True
+    mask[1, 5:8] = True
+    out = model(input_ids=x, logits_mask=mask)
+    assert out.logits.shape == (mask.sum().item(), 100)
+
+
+def test_kairos_model_forward_logits_mask_matches_full_forward_at_those_positions():
+    # restricting to logits_mask must be a pure optimization: same numbers as a full forward, just fewer of them
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    model.eval()
+    x = torch.randint(0, 100, (2, 16))
+    mask = torch.zeros(2, 16, dtype=torch.bool)
+    mask[0, :3] = True
+    mask[1, 5:8] = True
+    with torch.no_grad():
+        full = model(input_ids=x).logits
+        restricted = model(input_ids=x, logits_mask=mask).logits
+    assert torch.allclose(full[mask], restricted, atol=1e-5)
+
+
+def test_octet_family_head_off_by_default_config_flag():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, predict_octet_family=False)
+    model = KairosDiffusionFM(cfg)
+    assert model.lm_head.octet_head is None
+    x = torch.randint(0, 100, (2, 8))
+    assert model(input_ids=x).octet_logits is None
+
+
+def test_octet_family_head_on_produces_logits_of_right_shape():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=5)
+    model = KairosDiffusionFM(cfg)
+    assert model.lm_head.octet_head is not None
+    x = torch.randint(0, 100, (2, 8))
+    out = model(input_ids=x)
+    assert out.octet_logits.shape == (2, 8, 5)
+
+
+def test_octet_family_head_respects_logits_mask_too():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=5)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 100, (2, 8))
+    mask = torch.zeros(2, 8, dtype=torch.bool)
+    mask[0, :2] = True
+    out = model(input_ids=x, logits_mask=mask)
+    assert out.octet_logits.shape == (2, 5)
 
 
 def test_kairos_cache_get_ssm_cache_roundtrip(config):
