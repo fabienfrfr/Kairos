@@ -46,6 +46,7 @@ class KairosConfig(PretrainedConfig):
         self.num_modalities = kwargs.get("num_modalities", 8)
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
+        self.codec_tie_weights = kwargs.get("codec_tie_weights", False)
 
         default_scales = {0: [0, 1], 1: [1, 2], 2: [2, 3]}
         for m in range(self.num_modalities):
@@ -406,13 +407,18 @@ class PyramidalPatchCodec(nn.Module):
     than stride, zero-filling most positions on decode), every position is a real linear
     read/write, so no information is dropped at this unavoidable bottleneck."""
 
-    def __init__(self, d_model, stride=5, num_scales=4):
+    def __init__(self, d_model, stride=5, num_scales=4, tie_weights=False):
         super().__init__()
         self.stride = stride
         self.num_scales = num_scales
+        self.tie_weights = tie_weights
         self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
         self.encoders = nn.ModuleList(nn.Linear(d_model * patch, d_model) for patch in self.patch_sizes)
-        self.decoders = nn.ModuleList(nn.Linear(d_model, d_model * patch) for patch in self.patch_sizes)
+        if tie_weights:
+            # decode reuses each encoder's weight transposed (like tied input/output embeddings); only the bias is decode-specific
+            self.decoder_biases = nn.ParameterList(nn.Parameter(torch.zeros(d_model * patch)) for patch in self.patch_sizes)
+        else:
+            self.decoders = nn.ModuleList(nn.Linear(d_model, d_model * patch) for patch in self.patch_sizes)
         self.norm = KairosNorm(d_model * num_scales)
         self.fusion = nn.Linear(d_model * num_scales, d_model)
 
@@ -421,6 +427,11 @@ class PyramidalPatchCodec(nn.Module):
         length = x.shape[1]
         remainder = length % patch
         return F.pad(x, (0, 0, 0, patch - remainder)) if remainder else x
+
+    def _decode_scale(self, scale, idx):
+        if self.tie_weights:
+            return F.linear(scale, self.encoders[idx].weight.t(), self.decoder_biases[idx])
+        return self.decoders[idx](scale)
 
     def encode(self, x):
         length = x.shape[1]
@@ -435,9 +446,9 @@ class PyramidalPatchCodec(nn.Module):
     def decode(self, encoded):
         length = encoded.length
         reconstructed = []
-        for scale, decoder, patch in zip(encoded.scales, self.decoders, self.patch_sizes):
+        for idx, (scale, patch) in enumerate(zip(encoded.scales, self.patch_sizes)):
             batch, num_groups, _ = scale.shape
-            expanded = decoder(scale).reshape(batch, num_groups * patch, -1)
+            expanded = self._decode_scale(scale, idx).reshape(batch, num_groups * patch, -1)
             if expanded.shape[1] < length:
                 expanded = F.pad(expanded, (0, 0, 0, length - expanded.shape[1]))
             reconstructed.append(expanded[:, :length])
@@ -456,7 +467,9 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         super().__init__(config)
         if use_moe is None:
             use_moe = config.use_moe
-        self.codec = PyramidalPatchCodec(d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales)
+        self.codec = PyramidalPatchCodec(
+            d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales, tie_weights=config.codec_tie_weights
+        )
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:
             vocab_size = config.vocab_size

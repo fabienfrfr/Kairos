@@ -247,6 +247,24 @@ def test_codec_every_input_position_affects_every_output_position_in_its_patch()
     assert (x.grad.abs().sum(dim=-1) > 0).all()
 
 
+def test_codec_tie_weights_roundtrip_and_fewer_params():
+    free = PyramidalPatchCodec(32, stride=3, num_scales=2, tie_weights=False)
+    tied = PyramidalPatchCodec(32, stride=3, num_scales=2, tie_weights=True)
+    x = torch.randn(2, 16, 32)
+    assert tied.decode(tied.encode(x)).shape == x.shape
+    n_free = sum(p.numel() for p in free.parameters())
+    n_tied = sum(p.numel() for p in tied.parameters())
+    assert n_tied < n_free  # decode weight matrices are reused from encode, only biases are extra
+
+
+def test_codec_tie_weights_decoder_uses_encoder_weight_transposed():
+    codec = PyramidalPatchCodec(4, stride=3, num_scales=1, tie_weights=True)
+    x = torch.randn(1, 3, 4)
+    scale = codec.encode(x).scales[0]
+    manual = scale @ codec.encoders[0].weight + codec.decoder_biases[0]
+    assert torch.allclose(codec._decode_scale(scale, 0), manual, atol=1e-6)
+
+
 def test_kairos_model_init(config):
     model = KairosDiffusionFM(config)
     assert model is not None
