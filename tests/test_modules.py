@@ -821,3 +821,57 @@ def test_model_diffusion_stability_with_cache(config):
     outs = [model(input_ids=x_m, cache_params=cache.clone()).logits for _ in range(5)]
     for o in outs[1:]:
         assert torch.allclose(outs[0], o, atol=1e-5)
+
+
+def test_share_backbones_reduces_param_count():
+    cfg_sep = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=False,
+    )
+    cfg_share = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=True,
+    )
+    model_sep = KairosDiffusionFM(cfg_sep, vocab_size=100)
+    model_share = KairosDiffusionFM(cfg_share, vocab_size=100)
+    n_sep = sum(p.numel() for p in model_sep.parameters())
+    n_share = sum(p.numel() for p in model_share.parameters())
+    assert n_share < n_sep
+    # shared must have exactly num_scales× fewer backbone params
+    n_backbone = sum(p.numel() for p in model_sep.backbones[0].parameters())
+    assert n_sep - n_share == n_backbone * (cfg_sep.num_scales - 1)
+
+
+def test_share_backbones_forward_output_shape():
+    cfg = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=True,
+    )
+    model = KairosDiffusionFM(cfg, vocab_size=100)
+    x = torch.randint(0, 100, (2, 16))
+    out = model(input_ids=x)
+    assert out.logits.shape == (2, 16, 100)
+    assert not torch.isnan(out.logits).any()
+
+
+def test_share_backbones_backward():
+    cfg = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=True,
+    )
+    model = KairosDiffusionFM(cfg, vocab_size=100)
+    x = torch.randint(0, 100, (2, 8))
+    out = model(input_ids=x)
+    out.logits.mean().backward()
+    grads = [p.grad for p in model.parameters() if p.requires_grad]
+    assert any(g is not None for g in grads)
+
+
+def test_share_backbones_all_scales_use_same_module():
+    cfg = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=4, num_modalities=2,
+        share_backbones=True,
+    )
+    model = KairosDiffusionFM(cfg, vocab_size=100)
+    for i in range(1, len(model.backbones)):
+        assert model.backbones[i] is model.backbones[0]

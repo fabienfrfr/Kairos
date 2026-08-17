@@ -475,18 +475,20 @@ def build_control():
     ds = load_dataset("ffurfaro/PixelBytes-OptimalControl", split="train", streaming=True)
     ds = ds.cast_column("audio", Audio(decode=False))
 
+    out_samples = int(AUDIO_SECONDS * AUDIO_SAMPLE_RATE)
+
     def process(row):
         audio = row.get("audio")
         if audio is None or not audio.get("bytes"):
             return None
         try:
-            arr, sample_rate = _decode_audio_bytes(audio["bytes"], layout="stereo")
+            arr, _ = _decode_audio_bytes(audio["bytes"], layout="stereo", rate=AUDIO_SAMPLE_RATE)
         except Exception:  # noqa: BLE001 — skip a handful of malformed/unsupported clips
             return None
         if arr.shape[0] != 2 or arr.shape[1] < 2:
             return None
-        state, state_peak = _peak_normalize(arr[1])
-        action, action_peak = _peak_normalize(arr[0])
+        state, state_peak = _peak_normalize(_time_stretch_to_fixed_length(arr[1], out_samples))
+        action, action_peak = _peak_normalize(_time_stretch_to_fixed_length(arr[0], out_samples))
         # stereo layout: channel 0 = action, channel 1 = state
         return make_row(
             "control",
@@ -494,7 +496,7 @@ def build_control():
             caption=json.dumps(_parse_control_params(str(row.get("text", "")))),
             state=state,
             action=action,
-            sample_rate=sample_rate,
+            sample_rate=AUDIO_SAMPLE_RATE,
             state_peak_scale=state_peak,
             action_peak_scale=action_peak,
         )

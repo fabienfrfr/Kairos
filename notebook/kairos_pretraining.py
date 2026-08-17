@@ -250,6 +250,7 @@ def _():
     CFG_SHARED_EXPERTS = 1
     CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
     CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
+    CFG_SHARE_BACKBONES = True  # share one backbone across all scales (saves ~75% params)
     return (
         CFG_ATTNRES_BLOCK,
         CFG_D_MODEL,
@@ -259,6 +260,7 @@ def _():
         CFG_NUM_SCALES,
         CFG_N_HEADS,
         CFG_N_LAYERS,
+        CFG_SHARE_BACKBONES,
         CFG_SHARED_EXPERTS,
         CFG_STRIDE,
         CFG_USE_MEMORY_BANK,
@@ -291,6 +293,7 @@ def _(
     CFG_NUM_SCALES,
     CFG_N_HEADS,
     CFG_N_LAYERS,
+    CFG_SHARE_BACKBONES,
     CFG_SHARED_EXPERTS,
     CFG_STRIDE,
     CFG_USE_MEMORY_BANK,
@@ -318,8 +321,9 @@ def _(
         use_moe=use_moe,
         attnres_block_size=CFG_ATTNRES_BLOCK,
         use_memory_gate=CFG_USE_MEMORY_BANK,
+        share_backbones=CFG_SHARE_BACKBONES,
     )
-    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}")
+    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}")
     return (model_config,)
 
 
@@ -483,6 +487,14 @@ def _(KairosMultimodalPipeline, data_config, mo, model_config, tokenizer, train_
             mae_logs = pipe_mae.train(progress_callback=make_progress_callback(desc="mae_pretrain"), resume=True)
 
         print(f"MAE stage complete - steps: {len(mae_logs)}  best avg-epoch loss: {pipe_mae.best_loss:.4f}")
+        del pipe_mae
+        import gc
+        gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except OSError:
+            pass
     else:
         print("TRAIN_MAE_EPOCHS is 0 - skipping the MAE bootstrap stage")
     return

@@ -136,7 +136,9 @@ class KairosMultimodalPipeline:
     # ------------------------------------------------------------------ build
     def _build_dataset(self, data_config: DataConfig | None = None) -> KairosPretrainingDataset:
         dc = data_config or self.data_config
-        examples = list(dc.text_examples or []) + list(dc.multimodal_examples or [])
+        text_ex = dc.text_examples or []
+        multi_ex = dc.multimodal_examples or []
+        examples = list(text_ex) + list(multi_ex) if text_ex else list(multi_ex)
         if examples:
             return KairosPretrainingDataset(
                 multimodal_examples=examples,

@@ -1,3 +1,4 @@
+import array
 import io
 import json
 import random
@@ -80,7 +81,7 @@ class KairosPretrainingDataset(Dataset):
         for i in range(0, len(token_ids), self.max_len):
             ids_chunk = token_ids[i : i + self.max_len]
             mod_chunk = modality_ids[i : i + self.max_len]
-            fam_chunk = family_ids[i : i + self.max_len]
+            fam_chunk = list(family_ids[i : i + self.max_len])
             pad_len = self.target_len - len(ids_chunk)
             ids_chunk = ids_chunk + [self.tokenizer.pad_token_id] * pad_len
             mod_chunk = mod_chunk + [int(Modality.TEXT)] * pad_len
@@ -92,11 +93,12 @@ class KairosPretrainingDataset(Dataset):
         """Run each (ids, modality_ids, family_ids) triple through self._chunk and flatten."""
         all_input_ids, all_modality_ids, all_family_ids, all_masks = [], [], [], []
         if self.pack:
-            packed_ids, packed_mods, packed_fams = [], [], []
+            packed_ids, packed_mods = [], []
+            packed_fams = array.array("B")  # uint8 — family ids are 0..255, saves ~27x vs Python ints
             for ids, mods, fams in chunk_sources:
                 packed_ids += ids
                 packed_mods += mods
-                packed_fams += fams
+                packed_fams.extend(fams)
             chunk_sources = [(packed_ids, packed_mods, packed_fams)]
         for ids, mods, fams in chunk_sources:
             for ids_chunk, mod_chunk, fam_chunk, mask in self._chunk(ids, mods, fams):

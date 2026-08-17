@@ -107,6 +107,7 @@ class KairosConfig(PretrainedConfig):
 
         # v3 Block-AttnRes: windows prior layer outputs
         self.attnres_block_size = kwargs.get("attnres_block_size", 1)
+        self.share_backbones = kwargs.get("share_backbones", False)
 
         # block-diffusion generation: one canvas of this many tokens per outer loop
         self.canvas_length = kwargs.get("canvas_length", 128)
@@ -562,9 +563,14 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         self.embedding = KairosEmbedding(
             vocab_size=vocab_size, d_model=config.hidden_size, num_octet_families=n_octet
         )
-        self.backbones = nn.ModuleList(
-            [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
-        )
+        share = getattr(config, "share_backbones", False)
+        if share:
+            shared = KairosDiffusionBackbone(config=config, use_moe=use_moe)
+            self.backbones = nn.ModuleList([shared] * self.codec.num_scales)
+        else:
+            self.backbones = nn.ModuleList(
+                [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
+            )
         if getattr(config, "use_memory_gate", False):
             head_dim = config.hidden_size // config.num_attention_heads
             state_dim = config.num_attention_heads * head_dim * 2 * head_dim
