@@ -336,7 +336,7 @@ def _():
     # ---- two-stage curriculum: Stage 1 (MAE, fixed-rate bidirectional denoising, cheap/stable) bootstraps
     # the backbone, then Stage 2 (full diffusion, p up to 1.0, CE/p-weighted) resumes from Stage 1's weights
     # and fine-tunes on the real generative objective. Set *_EPOCHS = 0 to skip a stage entirely.
-    TRAIN_MAE_EPOCHS = 5  # was 1, too few steps to leave the near-random-init loss (fixed codec bottleneck; see PyramidalPatchCodec)
+    TRAIN_MAE_EPOCHS = 5  # was 1, too few steps to leave the near-random-init loss (fixed codec bottleneck; see PyramidalCodec)
     TRAIN_MAE_P_MAX = 0.3  # MAE stage ceiling on p: fixed-ish low corruption, easy/stable to optimize
     TRAIN_MAE_REWEIGHT = False  # plain CE in MAE stage: no 1/p variance blowup
 

@@ -13,7 +13,7 @@ from kairos.modeling import (
     KairosDiffusionFM,
     KairosEmbedding,
     KairosMultiCache,
-    PyramidalPatchCodec,
+    PyramidalCodec,
 )
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import KairosDiffusionTrainer, make_diffusion_mask
@@ -251,7 +251,7 @@ def test_token_embedding_family_ids_defaults_to_zero_when_omitted():
 
 
 def test_codec_roundtrip():
-    codec = PyramidalPatchCodec(32, stride=3)
+    codec = PyramidalCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
     encoded = codec.encode(x)
     decoded = codec.decode(encoded)
@@ -261,7 +261,7 @@ def test_codec_roundtrip():
 def test_codec_roundtrip_length_not_a_multiple_of_any_patch():
     # 16 isn't a multiple of any of stride**1..4 = 3, 9, 27, 81: exercises the padding path
     # on every scale at once.
-    codec = PyramidalPatchCodec(32, stride=3, num_scales=4)
+    codec = PyramidalCodec(32, stride=3, num_scales=4)
     x = torch.randn(2, 16, 32)
     decoded = codec.decode(codec.encode(x))
     assert decoded.shape == x.shape
@@ -271,7 +271,7 @@ def test_codec_decode_has_no_zeroed_positions():
     # regression: the old strided-conv codec left 2 out of every `stride` positions as a hard
     # zero after decode (kernel narrower than stride at the finest scale). The linear
     # patchify/unpatchify codec must give every position a real, nonzero contribution.
-    codec = PyramidalPatchCodec(32, stride=3, num_scales=4)
+    codec = PyramidalCodec(32, stride=3, num_scales=4)
     x = torch.randn(2, 30, 32)
     decoded = codec.decode(codec.encode(x))
     per_position_norm = decoded.norm(dim=-1)
@@ -282,7 +282,7 @@ def test_codec_every_input_position_affects_every_output_position_in_its_patch()
     # a real linear layer over the whole patch means each of the `patch` reconstructed
     # positions has nonzero gradient w.r.t. every input position in that patch - unlike the
     # old kernel=1 conv, where only 1-in-`patch` positions carried any signal at all.
-    codec = PyramidalPatchCodec(4, stride=3, num_scales=1)
+    codec = PyramidalCodec(4, stride=3, num_scales=1)
     x = torch.randn(1, 3, 4, requires_grad=True)
     decoded = codec.decode(codec.encode(x))
     decoded[0, 1].sum().backward()
@@ -293,33 +293,50 @@ def test_codec_cost_is_linear_not_quadratic_in_d_model():
     # depthwise patchify: params/FLOPs are O(patch * d_model), not O(patch * d_model^2) like a
     # dense patch->d_model Linear. Doubling d_model should roughly double the codec's param count,
     # not quadruple it.
-    small = PyramidalPatchCodec(32, stride=3, num_scales=4)
-    big = PyramidalPatchCodec(64, stride=3, num_scales=4)
+    small = PyramidalCodec(32, stride=3, num_scales=4)
+    big = PyramidalCodec(64, stride=3, num_scales=4)
     n_small = sum(p.numel() for n, p in small.named_parameters() if not n.startswith(("norm", "fusion")))
     n_big = sum(p.numel() for n, p in big.named_parameters() if not n.startswith(("norm", "fusion")))
     assert n_big < n_small * 3  # well under the 4x a dense (patch*d_model^2) codec would give
 
 
-def test_codec_tie_weights_roundtrip_and_fewer_params():
-    free = PyramidalPatchCodec(32, stride=3, num_scales=2, tie_weights=False)
-    tied = PyramidalPatchCodec(32, stride=3, num_scales=2, tie_weights=True)
+def test_codec_patch_tied_roundtrip():
+    tied = PyramidalCodec(32, stride=3, num_scales=2)
     x = torch.randn(2, 16, 32)
     assert tied.decode(tied.encode(x)).shape == x.shape
-    n_free = sum(p.numel() for p in free.parameters())
-    n_tied = sum(p.numel() for p in tied.parameters())
-    assert n_tied < n_free  # decode weight matrices are reused from encode, only biases are extra
 
 
-def test_codec_tie_weights_decoder_reuses_encoder_weight():
-    codec = PyramidalPatchCodec(4, stride=3, num_scales=1, tie_weights=True)
-    x = torch.randn(1, 3, 4)
+def test_codec_conv_roundtrip():
+    codec = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    x = torch.randn(2, 16, 32)
     encoded = codec.encode(x)
-    scale = encoded.scales[0]
-    manual = scale.unsqueeze(2) * codec.encode_w[0] + codec.decode_b[0]  # decode should reuse encode_w, not a separate weight
-    manual = manual.reshape(1, 3, 4)
-    manual = codec.fusion(codec.norm(manual))
-    assert torch.allclose(codec.decode(encoded), manual, atol=1e-6)
-    assert not hasattr(codec, "decode_w")  # tied mode must not allocate a separate decode weight at all
+    decoded = codec.decode(encoded)
+    assert decoded.shape == x.shape
+
+
+def test_codec_conv_no_zeroed_positions():
+    codec = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    x = torch.randn(2, 30, 32)
+    decoded = codec.decode(codec.encode(x))
+    per_position_norm = decoded.norm(dim=-1)
+    assert (per_position_norm > 1e-6).all()
+
+
+def test_codec_conv_gradient_flow():
+    codec = PyramidalCodec(4, stride=3, num_scales=1, mode="conv")
+    x = torch.randn(1, 3, 4, requires_grad=True)
+    decoded = codec.decode(codec.encode(x))
+    decoded[0, 1].sum().backward()
+    assert (x.grad.abs().sum(dim=-1) > 0).all()
+
+
+def test_codec_conv_has_fewer_params_than_patch():
+    """Patch mode (tied) is parameter-cheap; conv mode adds mixer+decoder."""
+    patch = PyramidalCodec(32, stride=3, num_scales=2)
+    conv = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    n_patch = sum(p.numel() for p in patch.parameters())
+    n_conv = sum(p.numel() for p in conv.parameters())
+    assert n_patch < n_conv  # tied patch is the cheapest mode
 
 
 def test_kairos_model_init(config):

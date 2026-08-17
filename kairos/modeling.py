@@ -57,7 +57,7 @@ class KairosConfig(PretrainedConfig):
         self.num_modalities = kwargs.get("num_modalities", 8)
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
-        self.codec_tie_weights = kwargs.get("codec_tie_weights", False)
+        self.codec_mode = kwargs.get("codec_mode", "patch")
         self.predict_octet_family = kwargs.get("predict_octet_family", True)
         self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
@@ -420,33 +420,54 @@ class CodecOutput:
     length: int
 
 
-class PyramidalPatchCodec(nn.Module):
-    """Multi-scale codec via depthwise patchify/unpatchify (MobileNet-style: per-channel mixing
-    within a patch here, cross-channel mixing left to `fusion` below). Cost is O(patch * d_model)
-    per scale instead of O(patch * d_model^2) for a dense patch Linear - patch grows exponentially
-    across scales (stride**level), so the dense version's compute is dominated by its few, huge,
-    rarely-used deepest-scale matrices. Every position still gets a real, distinct read/write
-    (unlike the old strided conv, which zero-filled most positions on decode)."""
+class PyramidalCodec(nn.Module):
+    """Multi-scale encode/decode via patch or conv. mode='patch': full linear
+    per patch (tied weights, every position gets a real read/write). mode='conv':
+    depthwise conv1d + 1x1 mixer, parameter-efficient but still expressive."""
 
-    def __init__(self, d_model, stride=5, num_scales=4, tie_weights=False, norm_eps=1e-6):
+    def __init__(self, d_model, stride=5, num_scales=4, mode="patch", norm_eps=1e-6):
         super().__init__()
+        assert mode in ("patch", "conv"), f"mode must be 'patch' or 'conv', got {mode!r}"
         self.stride = stride
         self.num_scales = num_scales
-        self.tie_weights = tie_weights
+        self.mode = mode
         self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
-        self.encode_w = nn.ParameterList(nn.Parameter(torch.empty(patch, d_model)) for patch in self.patch_sizes)
-        self.encode_b = nn.ParameterList(nn.Parameter(torch.zeros(d_model)) for _ in self.patch_sizes)
-        if not tie_weights:
-            # decode has its own (patch, d_model) weight; tied mode reuses encode_w instead (see _decode_weight)
-            self.decode_w = nn.ParameterList(nn.Parameter(torch.empty(patch, d_model)) for patch in self.patch_sizes)
-        self.decode_b = nn.ParameterList(nn.Parameter(torch.zeros(patch, d_model)) for patch in self.patch_sizes)
-        for w in self.encode_w:
-            nn.init.normal_(w, std=w.shape[0] ** -0.5)  # ~unit output variance for a patch-sized weighted sum
-        if not tie_weights:
-            for w in self.decode_w:
-                nn.init.normal_(w, std=1.0)
+
+        if mode == "patch":
+            self._init_patch(d_model)
+        else:
+            self._init_conv(d_model)
+
         self.norm = KairosNorm(d_model * num_scales, eps=norm_eps)
         self.fusion = nn.Linear(d_model * num_scales, d_model)
+
+    def _init_patch(self, d_model):
+        """Linear patchify/unpatchify with tied encode/decode weights."""
+        self.encode_w = nn.ParameterList(
+            nn.Parameter(torch.empty(patch, d_model)) for patch in self.patch_sizes
+        )
+        self.encode_b = nn.ParameterList(
+            nn.Parameter(torch.zeros(d_model)) for _ in self.patch_sizes
+        )
+        for w in self.encode_w:
+            nn.init.normal_(w, std=w.shape[0] ** -0.5)
+
+    def _init_conv(self, d_model):
+        """Depthwise conv1d encoder + 1x1 mixer, 1x1 conv decoder."""
+        self.encoders = nn.ModuleList()
+        self.mixers = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        for patch in self.patch_sizes:
+            self.encoders.append(
+                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch,
+                          groups=d_model, bias=True)
+            )
+            self.mixers.append(
+                nn.Conv1d(d_model, d_model, kernel_size=1, bias=True)
+            )
+            self.decoders.append(
+                nn.Conv1d(d_model, d_model * patch, kernel_size=1, bias=True)
+            )
 
     @staticmethod
     def _pad_to_multiple(x, patch):
@@ -454,11 +475,13 @@ class PyramidalPatchCodec(nn.Module):
         remainder = length % patch
         return F.pad(x, (0, 0, 0, patch - remainder)) if remainder else x
 
-    def _decode_weight(self, idx):
-        return self.encode_w[idx] if self.tie_weights else self.decode_w[idx]
-
     def encode(self, x):
         length = x.shape[1]
+        if self.mode == "patch":
+            return self._encode_patch(x, length)
+        return self._encode_conv(x, length)
+
+    def _encode_patch(self, x, length):
         scales = []
         for patch, w, b in zip(self.patch_sizes, self.encode_w, self.encode_b):
             padded = self._pad_to_multiple(x, patch)
@@ -467,17 +490,46 @@ class PyramidalPatchCodec(nn.Module):
             scales.append(torch.einsum("bgpd,pd->bgd", grouped, w) + b)
         return CodecOutput(scales=scales, length=length)
 
+    def _encode_conv(self, x, length):
+        scales = []
+        for patch, encoder, mixer in zip(self.patch_sizes, self.encoders, self.mixers):
+            padded = self._pad_to_multiple(x, patch)
+            h = padded.transpose(1, 2)        # (B,D,L)
+            h = encoder(h)                     # (B,D,G)
+            h = mixer(h)                       # (B,D,G)
+            scales.append(h.transpose(1, 2))   # (B,G,D)
+        return CodecOutput(scales=scales, length=length)
+
     def decode(self, encoded):
         length = encoded.length
+        if self.mode == "patch":
+            return self._decode_patch(encoded, length)
+        return self._decode_conv(encoded, length)
+
+    def _decode_patch(self, encoded, length):
         reconstructed = []
         for idx, (scale, patch) in enumerate(zip(encoded.scales, self.patch_sizes)):
-            w, b = self._decode_weight(idx), self.decode_b[idx]  # each (patch, d_model)
-            expanded = scale.unsqueeze(2) * w + b  # (batch, groups, patch, d_model), one real value per position
-            batch, groups, _, d_model = expanded.shape
-            expanded = expanded.reshape(batch, groups * patch, d_model)
+            w, b = self.encode_w[idx], self.encode_b[idx]
+            expanded = scale.unsqueeze(2) * w + b
+            expanded = expanded.reshape(expanded.shape[0], -1, expanded.shape[-1])
             if expanded.shape[1] < length:
                 expanded = F.pad(expanded, (0, 0, 0, length - expanded.shape[1]))
             reconstructed.append(expanded[:, :length])
+        h = torch.cat(reconstructed, dim=-1)
+        h = self.norm(h)
+        return self.fusion(h)
+
+    def _decode_conv(self, encoded, length):
+        reconstructed = []
+        for scale, decoder, patch in zip(encoded.scales, self.decoders, self.patch_sizes):
+            h = scale.transpose(1, 2)               # (B,D,G)
+            h = decoder(h)                           # (B,D*patch,G)
+            batch, channels, groups = h.shape
+            d_model = channels // patch
+            h = h.view(batch, d_model, patch, groups) # (B,D,patch,G)
+            h = h.permute(0, 3, 2, 1)                # (B,G,patch,D)
+            h = h.reshape(batch, groups * patch, d_model) # (B,L,D)
+            reconstructed.append(h[:, :length])
         h = torch.cat(reconstructed, dim=-1)
         h = self.norm(h)
         return self.fusion(h)
@@ -494,11 +546,11 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         super().__init__(config)
         if use_moe is None:
             use_moe = config.use_moe
-        self.codec = PyramidalPatchCodec(
+        self.codec = PyramidalCodec(
             d_model=config.hidden_size,
             stride=config.stride,
             num_scales=config.num_scales,
-            tie_weights=config.codec_tie_weights,
+            mode=config.codec_mode,
             norm_eps=config.rms_norm_eps,
         )
         self.router = KairosScaleRouter(config.modality_scales)
