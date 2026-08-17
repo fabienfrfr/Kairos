@@ -77,36 +77,43 @@ class KairosPretrainingDataset(Dataset):
         self.ds.set_format("torch")
 
     def _chunk(self, token_ids, modality_ids, family_ids):
-        """Fixed-length windowing shared by text and multimodal, padded to self.target_len."""
+        """Fixed-length windowing shared by text and multimodal, padded to self.target_len.
+
+        token_ids/modality_ids/family_ids may be plain lists or array.array — always
+        materialize the final chunk as a plain list, since that's what pyarrow/torch
+        expect downstream and a single target_len-sized list is cheap either way.
+        """
         for i in range(0, len(token_ids), self.max_len):
-            ids_chunk = token_ids[i : i + self.max_len]
-            mod_chunk = modality_ids[i : i + self.max_len]
+            ids_chunk = list(token_ids[i : i + self.max_len])
+            mod_chunk = list(modality_ids[i : i + self.max_len])
             fam_chunk = list(family_ids[i : i + self.max_len])
             pad_len = self.target_len - len(ids_chunk)
-            ids_chunk = ids_chunk + [self.tokenizer.pad_token_id] * pad_len
-            mod_chunk = mod_chunk + [int(Modality.TEXT)] * pad_len
-            fam_chunk = fam_chunk + [0] * pad_len
+            ids_chunk += [self.tokenizer.pad_token_id] * pad_len
+            mod_chunk += [int(Modality.TEXT)] * pad_len
+            fam_chunk += [0] * pad_len
             mask = [1] * (len(ids_chunk) - pad_len) + [0] * pad_len
             yield ids_chunk, mod_chunk, fam_chunk, mask
 
     def _collect_chunks(self, chunk_sources):
-        """Run each (ids, modality_ids, family_ids) triple through self._chunk and flatten."""
-        all_input_ids, all_modality_ids, all_family_ids, all_masks = [], [], [], []
+        """Run each (ids, modality_ids, family_ids) triple through self._chunk and flatten.
+
+        Yields one chunk at a time instead of building giant Python lists in RAM —
+        callers should feed this straight into Dataset.from_generator.
+        """
         if self.pack:
-            packed_ids, packed_mods = [], []
-            packed_fams = array.array("B")  # uint8 — family ids are 0..255, saves ~27x vs Python ints
+            # "H" (uint16, 2 bytes) covers vocab sizes up to 65536 — plenty for 291.
+            # "B" (uint8, 1 byte) covers modality/family ids. Both are ~14-28x cheaper
+            # than a Python int per element, which is what a plain list stores.
+            packed_ids = array.array("H")
+            packed_mods = array.array("B")
+            packed_fams = array.array("B")
             for ids, mods, fams in chunk_sources:
-                packed_ids += ids
-                packed_mods += mods
+                packed_ids.extend(ids)
+                packed_mods.extend(mods)
                 packed_fams.extend(fams)
             chunk_sources = [(packed_ids, packed_mods, packed_fams)]
         for ids, mods, fams in chunk_sources:
-            for ids_chunk, mod_chunk, fam_chunk, mask in self._chunk(ids, mods, fams):
-                all_input_ids.append(ids_chunk)
-                all_modality_ids.append(mod_chunk)
-                all_family_ids.append(fam_chunk)
-                all_masks.append(mask)
-        return all_input_ids, all_modality_ids, all_family_ids, all_masks
+            yield from self._chunk(ids, mods, fams)
 
     def preprocess(self, examples):
         prompts = examples.get("prompt", [""] * len(examples["text"]))
@@ -123,7 +130,14 @@ class KairosPretrainingDataset(Dataset):
                     continue
                 yield tokens, [int(Modality.TEXT)] * len(tokens), [0] * len(tokens)
 
-        all_input_ids, all_modality_ids, all_family_ids, all_masks = self._collect_chunks(sources())
+        # still one batch's worth at a time (this runs inside ds.map(batched=True)),
+        # so materializing here is fine — arrow already chunks across batches.
+        all_input_ids, all_modality_ids, all_family_ids, all_masks = [], [], [], []
+        for ids_chunk, mod_chunk, fam_chunk, mask in self._collect_chunks(sources()):
+            all_input_ids.append(ids_chunk)
+            all_modality_ids.append(mod_chunk)
+            all_family_ids.append(fam_chunk)
+            all_masks.append(mask)
         return {
             "input_ids": all_input_ids,
             "modality_ids": all_modality_ids,
@@ -215,16 +229,22 @@ class KairosPretrainingDataset(Dataset):
                     "octet_family_ids"
                 ].tolist()
 
-        all_input_ids, all_modality_ids, all_family_ids, all_masks = self._collect_chunks(sources())
-        self.ds = HFDataset.from_dict(
-            {
-                "input_ids": all_input_ids,
-                "modality_ids": all_modality_ids,
-                "octet_family_ids": all_family_ids,
-                "mask": all_masks,
-                "prompt_len": [0] * len(all_input_ids),
-            }
-        )
+        def rows():
+            # one dict per row, streamed straight to the arrow writer — nothing
+            # accumulates for the full dataset in Python memory at any point.
+            for ids_chunk, mod_chunk, fam_chunk, mask in self._collect_chunks(sources()):
+                yield {
+                    "input_ids": ids_chunk,
+                    "modality_ids": mod_chunk,
+                    "octet_family_ids": fam_chunk,
+                    "mask": mask,
+                    "prompt_len": 0,
+                }
+
+        # writer_batch_size caps how many rows sit in the arrow write buffer at once
+        # (default is 1000, already reasonable, but explicit here since it's the knob
+        # to turn down further if RAM is still tight with very long/heavy sequences).
+        self.ds = HFDataset.from_generator(rows, writer_batch_size=256)
         self.ds.set_format("torch")
 
     def __getitem__(self, idx):
