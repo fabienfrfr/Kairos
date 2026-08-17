@@ -59,7 +59,7 @@ def all_kinds_examples(rng):
 def test_text_only_schema(tokenizer):
     ds = KairosPretrainingDataset(texts=["hello world"], tokenizer=tokenizer, max_len=64, stride=1)
     item = ds[0]
-    assert set(item.keys()) == {"input_ids", "modality_ids", "mask", "prompt_len"}
+    assert set(item.keys()) == {"input_ids", "modality_ids", "mask", "prompt_len", "octet_family_ids"}
     assert set(item["modality_ids"].tolist()) <= {int(Modality.TEXT)}
 
 

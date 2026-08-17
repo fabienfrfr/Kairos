@@ -64,7 +64,7 @@ class KairosDiffusionGenerationMixin:
         max_new_tokens = cfg.max_new_tokens
         max_denoising_steps = cfg.max_denoising_steps
         text_mod = int(config.text_modality_id)
-        vocab_size = config.vocab_size
+        vocab_size = self.embedding.token_embed.num_embeddings
 
         if modality_ids is None:
             modality_ids = torch.full_like(input_ids, text_mod)

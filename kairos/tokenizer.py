@@ -45,21 +45,27 @@ _CHANNEL_TAGS: dict[str, tuple[str, str]] = {
 
 _STRUCTURAL_TOKENS = ["<ENDLINE>", "<ENDFRAME>", "<TICK>", "<PTSEP>"]
 
-# Raw-byte id blocks, one per (modality family, position-in-group), so distinct positions never
-# share a token id: 3 for IMG (R,G,B channels, shared by video), 2 for AUD (hi/lo byte of each
-# 16-bit sample), 8 for LID (4 point channels x hi/lo byte), 2 each for ACT/STA (hi/lo byte).
-_BLOCK_GROUPS = {"IMG": 3, "AUD": 2, "LID": 8, "ACT": 2, "STA": 2}
-_SUBBLOCKS = [f"{family}{sub}" for family, n in _BLOCK_GROUPS.items() for sub in range(n)]
-_BLOCK_TOKENS = [f"<{sb}_{i}>" for sb in _SUBBLOCKS for i in range(256)]
-NUM_OCTET_FAMILIES = len(_SUBBLOCKS) + 1  # +1 for the "text/other" catch-all family (id 0)
-
 ALL_SPECIAL_TOKENS = (
     [t for pair in _MODALITY_TAGS.values() for t in pair]
     + [t for pair in _CHANNEL_TAGS.values() for t in pair]
     + _STRUCTURAL_TOKENS
     + ["<SEP>", "<MASK>"]
-    + _BLOCK_TOKENS
 )
+
+# Octet-family ids: WHICH byte-plane/channel a position's *value* belongs to, carried as a small
+# parallel stream (octet_family_ids) instead of inflating the main token vocab. Byte values 0-255
+# are shared by every modality (a value id never encodes "which family" by itself); the family
+# tells the model whether that value is e.g. an image R channel byte, an audio hi byte, etc.
+# Family 0 is the catch-all for text and structural/marker tokens.
+_FAMILY_NAMES = (
+    [f"IMG{c}" for c in range(3)]  # R, G, B (shared by video)
+    + [f"AUD{p}" for p in range(2)]  # hi, lo byte of a 16-bit audio sample
+    + [f"LID{i}" for i in range(8)]  # 4 point channels x hi/lo byte
+    + [f"ACT{p}" for p in range(2)]  # hi, lo byte of a 16-bit action sample
+    + [f"STA{p}" for p in range(2)]  # hi, lo byte of a 16-bit state sample
+)
+_FAMILY_ID = {name: idx + 1 for idx, name in enumerate(_FAMILY_NAMES)}  # 0 reserved for text/other
+NUM_OCTET_FAMILIES = len(_FAMILY_NAMES) + 1
 
 
 def _quantize_planes(x: np.ndarray, lo, hi, n_bytes: int) -> np.ndarray:
@@ -106,39 +112,29 @@ class KairosTokenizer(ByT5Tokenizer):
         super().__init__(*args, **kwargs)
         self.add_special_tokens({"additional_special_tokens": ALL_SPECIAL_TOKENS})
 
-        # byte -> id offset, calibrated empirically
+        # byte -> id offset, calibrated empirically; shared by every modality (value only, no family)
         self._byte_offset = self.convert_tokens_to_ids(chr(0))
         assert self.convert_tokens_to_ids(chr(255)) == self._byte_offset + 255, (
             "byte->id mapping is not contiguous — review _byte_offset calibration"
         )
-        self._block_offset = {}
-        for sb in _SUBBLOCKS:
-            offset = self.convert_tokens_to_ids(f"<{sb}_0>")
-            assert self.convert_tokens_to_ids(f"<{sb}_255>") == offset + 255, f"{sb} byte block not contiguous"
-            self._block_offset[sb] = offset
         self._endline_id = self.convert_tokens_to_ids("<ENDLINE>")
         self._endframe_id = self.convert_tokens_to_ids("<ENDFRAME>")
         self._tick_id = self.convert_tokens_to_ids("<TICK>")
         self._ptsep_id = self.convert_tokens_to_ids("<PTSEP>")
 
-        # per-token id -> octet-family id (0 = text/other, 1..N = one per _SUBBLOCKS entry)
-        self.octet_family_ids = torch.zeros(len(self), dtype=torch.long)
-        for family_idx, sb in enumerate(_SUBBLOCKS, start=1):
-            offset = self._block_offset[sb]
-            self.octet_family_ids[offset : offset + 256] = family_idx
+    def _bytes_to_ids(self, raw: bytes) -> list[int]:
+        return [b + self._byte_offset for b in raw]
 
-    def _offsets(self, block) -> list[int]:
-        """block: "text", a single sub-block name, or a tuple/list of names cycled across bytes."""
-        names = [block] if isinstance(block, str) else block
-        return [self._byte_offset if b == "text" else self._block_offset[b] for b in names]
+    def _ids_to_bytes(self, ids: list[int]) -> bytes:
+        return bytes([max(0, i - self._byte_offset) & 0xFF for i in ids])
 
-    def _bytes_to_ids(self, raw: bytes, block: str = "text") -> list[int]:
-        offsets = self._offsets(block)
-        return [b + offsets[i % len(offsets)] for i, b in enumerate(raw)]
-
-    def _ids_to_bytes(self, ids: list[int], block: str = "text") -> bytes:
-        offsets = self._offsets(block)
-        return bytes([max(0, i - offsets[k % len(offsets)]) & 0xFF for k, i in enumerate(ids)])
+    @staticmethod
+    def _family_ids_for(n: int, family_cycle: tuple | None) -> list[int]:
+        """n values -> parallel octet-family ids, cycling family_cycle (or all-0 if None)."""
+        if not family_cycle:
+            return [0] * n
+        cycle = [_FAMILY_ID[name] for name in family_cycle]
+        return [cycle[i % len(cycle)] for i in range(n)]
 
     # ---------------- IMAGE: row-delimited, no header ----------------
     @classmethod
@@ -151,23 +147,27 @@ class KairosTokenizer(ByT5Tokenizer):
     @staticmethod
     def _encode_frame_rows(frame: np.ndarray) -> list:
         channels = frame.shape[-1]
-        block_cycle = tuple(f"IMG{c}" for c in range(channels))  # one token block per channel (R,G,B,...)
+        family_cycle = tuple(f"IMG{c}" for c in range(channels))  # R, G, B, ...
         out = []
         for row in frame:
-            out.append(("bytes", row.tobytes(), block_cycle))
+            out.append(("bytes", row.tobytes(), family_cycle))
             out.append(("marker", "<ENDLINE>"))
         return out
 
-    def _resolve_markers(self, marker_seq: list) -> list[int]:
+    def _resolve_markers(self, marker_seq: list) -> tuple[list[int], list[int]]:
+        """Returns (ids, octet_family_ids), both the same length."""
         ids: list[int] = []
+        families: list[int] = []
         for entry in marker_seq:
             kind, payload = entry[0], entry[1]
             if kind == "bytes":
-                block = entry[2] if len(entry) > 2 else "text"
-                ids.extend(self._bytes_to_ids(payload, block))
+                family_cycle = entry[2] if len(entry) > 2 else None
+                ids.extend(self._bytes_to_ids(payload))
+                families.extend(self._family_ids_for(len(payload), family_cycle))
             else:
                 ids.append(self.convert_tokens_to_ids(payload))
-        return ids
+                families.append(0)  # structural markers are family 0 (text/other)
+        return ids, families
 
     def decode_image(self, ids: list[int], channels: int | None = None) -> np.ndarray:
         """Dimensions recovered by counting <ENDLINE> markers; raises on bad row lengths."""
@@ -190,8 +190,7 @@ class KairosTokenizer(ByT5Tokenizer):
         if w_bytes % channels != 0:
             raise ValueError(f"row byte length {w_bytes} not divisible by channels={channels}")
         w, h = w_bytes // channels, len(rows)
-        block_cycle = tuple(f"IMG{c}" for c in range(channels))
-        raw = self._ids_to_bytes([i for row in rows for i in row], block_cycle)
+        raw = self._ids_to_bytes([i for row in rows for i in row])
         return np.frombuffer(raw, dtype=np.uint8).reshape(h, w, channels)
 
     # ---------------- VIDEO: rows + <ENDFRAME> ----------------
@@ -229,15 +228,15 @@ class KairosTokenizer(ByT5Tokenizer):
 
     # ---------------- shared PCM codec: N-byte place-value quantization for 1D signals ----------------
     @classmethod
-    def _encode_pcm(cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, block_cycle: tuple, n_bytes: int) -> list:
-        planes = _quantize_planes(values, lo, hi, n_bytes)  # (N, n_bytes), one distinct block per byte-plane
+    def _encode_pcm(cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, family_cycle: tuple, n_bytes: int) -> list:
+        planes = _quantize_planes(values, lo, hi, n_bytes)  # (N, n_bytes), one family id per byte-plane
         out = []
         for start in range(0, len(planes), tick_samples):
-            out.append(("bytes", planes[start : start + tick_samples].tobytes(), block_cycle))
+            out.append(("bytes", planes[start : start + tick_samples].tobytes(), family_cycle))
             out.append(("marker", "<TICK>"))
         return out
 
-    def _decode_pcm(self, ids: list[int], lo: float, hi: float, block_cycle: tuple, n_bytes: int) -> np.ndarray:
+    def _decode_pcm(self, ids: list[int], lo: float, hi: float, n_bytes: int) -> np.ndarray:
         samples, current = [], []
         for i in ids:
             if i == self._tick_id:
@@ -247,7 +246,7 @@ class KairosTokenizer(ByT5Tokenizer):
                 current.append(i)
         if current:
             samples.extend(current)
-        raw = self._ids_to_bytes(samples, block_cycle)
+        raw = self._ids_to_bytes(samples)
         if len(raw) % n_bytes != 0:
             raise ValueError(f"payload ({len(raw)} bytes) not a multiple of n_bytes={n_bytes}")
         planes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, n_bytes)
@@ -258,27 +257,25 @@ class KairosTokenizer(ByT5Tokenizer):
     def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None, n_bytes: int = 2) -> list:
         if waveform.dtype != np.float32:
             raise ValueError("encode_audio expects a float32 waveform in [-1, 1]")
-        block_cycle = tuple(f"AUD{p}" for p in range(n_bytes))  # one token block per byte-plane (hi, lo, ...)
-        return cls._encode_pcm(waveform, -1.0, 1.0, tick_samples or cls.AUDIO_TICK_SAMPLES, block_cycle, n_bytes)
+        family_cycle = tuple(f"AUD{p}" for p in range(n_bytes))  # hi, lo, ...
+        return cls._encode_pcm(waveform, -1.0, 1.0, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes)
 
     def decode_audio(self, ids: list[int], tick_samples: int | None = None, n_bytes: int = 2):
         """Returns (waveform, duration_seconds); duration = len(waveform)/AUDIO_SAMPLE_RATE."""
-        block_cycle = tuple(f"AUD{p}" for p in range(n_bytes))
-        waveform = self._decode_pcm(ids, -1.0, 1.0, block_cycle, n_bytes)
+        waveform = self._decode_pcm(ids, -1.0, 1.0, n_bytes)
         return waveform, len(waveform) / self.AUDIO_SAMPLE_RATE
 
-    # ------------- SIGNAL: generic control channel (state/action/imu), family picks its own token block -------------
+    # ------------- SIGNAL: generic control channel (state/action/imu), family picks its own id family -------------
     @classmethod
     def encode_signal(cls, values: np.ndarray, family: str, tick_samples: int | None = None, n_bytes: int = 2) -> list:
-        """Same place-value PCM scheme as audio, but its own block per family (e.g. "ACT" vs "STA") so channels never share ids."""
+        """Same place-value PCM scheme as audio, tagged with its own family (e.g. "ACT" vs "STA")."""
         if values.dtype != np.float32:
             raise ValueError("encode_signal expects a float32 array in [-1, 1]")
-        block_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
-        return cls._encode_pcm(values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, block_cycle, n_bytes)
+        family_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
+        return cls._encode_pcm(values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes)
 
-    def decode_signal(self, ids: list[int], family: str, n_bytes: int = 2) -> np.ndarray:
-        block_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
-        return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, block_cycle, n_bytes)
+    def decode_signal(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
+        return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, n_bytes)
 
     # ---------------- LIDAR: point groups + fixed quantization bounds, n_bytes=2 per channel ----------------
     @classmethod
@@ -291,10 +288,10 @@ class KairosTokenizer(ByT5Tokenizer):
         lo = np.array([xyz_lo, xyz_lo, xyz_lo, int_lo], dtype=np.float32)
         hi = np.array([xyz_hi, xyz_hi, xyz_hi, int_hi], dtype=np.float32)
         planes = _quantize_planes(points, lo, hi, n_bytes)  # (N, 4, n_bytes)
-        block_cycle = tuple(f"LID{c * n_bytes + p}" for c in range(4) for p in range(n_bytes))  # one block per (channel, byte-plane)
+        family_cycle = tuple(f"LID{c * n_bytes + p}" for c in range(4) for p in range(n_bytes))
         out = []
         for start in range(0, len(planes), points_per_group):
-            out.append(("bytes", planes[start : start + points_per_group].tobytes(), block_cycle))
+            out.append(("bytes", planes[start : start + points_per_group].tobytes(), family_cycle))
             out.append(("marker", "<PTSEP>"))
         return out
 
@@ -309,8 +306,7 @@ class KairosTokenizer(ByT5Tokenizer):
                 current.append(i)
         if current:
             point_bytes.extend(current)
-        block_cycle = tuple(f"LID{c * n_bytes + p}" for c in range(4) for p in range(n_bytes))
-        raw = self._ids_to_bytes(point_bytes, block_cycle)
+        raw = self._ids_to_bytes(point_bytes)
         stride = 4 * n_bytes
         if len(raw) % stride != 0:
             raise ValueError(f"lidar payload ({len(raw)} bytes) not a multiple of {stride}")
@@ -323,9 +319,10 @@ class KairosTokenizer(ByT5Tokenizer):
 
     # ---------------- multimodal sequence assembly ----------------
     def encode_multimodal(self, segments: list[MultimodalSegment], max_len: int | None = None) -> dict:
-        """Returns aligned {"input_ids", "modality_ids"} tensors; padding uses Modality.TEXT."""
+        """Returns aligned {input_ids, modality_ids, octet_family_ids}; padding uses Modality.TEXT / family 0."""
         all_ids: list[int] = []
         all_modality: list[int] = []
+        all_family: list[int] = []
 
         for seg in segments:
             open_tag, close_tag = _MODALITY_TAGS[seg.modality]
@@ -334,28 +331,35 @@ class KairosTokenizer(ByT5Tokenizer):
 
             if seg.modality is Modality.TEXT:
                 body_ids = self.encode(seg.data.decode("utf-8"), add_special_tokens=False)
+                body_families = [0] * len(body_ids)
             else:
-                body_ids = self._resolve_markers(seg.data)
+                body_ids, body_families = self._resolve_markers(seg.data)
 
             if seg.channel is not None:
                 c_open, c_close = _CHANNEL_TAGS[seg.channel]
                 body_ids = [self.convert_tokens_to_ids(c_open)] + body_ids + [self.convert_tokens_to_ids(c_close)]
+                body_families = [0] + body_families + [0]
 
             seg_ids = [open_id] + body_ids + [close_id]
+            seg_families = [0] + body_families + [0]
             all_ids.extend(seg_ids)
             all_modality.extend([int(seg.modality)] * len(seg_ids))
+            all_family.extend(seg_families)
 
         if max_len is not None:
             all_ids = all_ids[:max_len]
             all_modality = all_modality[:max_len]
+            all_family = all_family[:max_len]
             pad_len = max_len - len(all_ids)
             if pad_len > 0:
                 all_ids += [self.pad_token_id] * pad_len
                 all_modality += [int(Modality.TEXT)] * pad_len
+                all_family += [0] * pad_len
 
         return {
             "input_ids": torch.tensor(all_ids, dtype=torch.long),
             "modality_ids": torch.tensor(all_modality, dtype=torch.long),
+            "octet_family_ids": torch.tensor(all_family, dtype=torch.long),
         }
 
     def decode_multimodal(self, input_ids: torch.Tensor) -> list[MultimodalSegment]:
@@ -387,5 +391,6 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# len(KairosTokenizer()) == 259 base bytes/specials + 32 modality/channel/structural tags + 4352
-# per-position raw-byte block tokens (17 sub-blocks x 256: 3 IMG + 2 AUD + 8 LID + 2 ACT + 2 STA) == 4643
+# len(KairosTokenizer()) == 259 base bytes/specials + 30 modality/channel/structural tags == 289.
+# The (up to) 17 "which byte/channel" families live in a separate small octet_family_ids stream
+# (see NUM_OCTET_FAMILIES), not in the main vocab - that's what keeps this vocab small.

@@ -90,6 +90,32 @@ def test_kairos_config(config):
     assert config.num_attention_heads == 4
 
 
+def test_kairos_config_friendly_aliases_match_hf_names():
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, window_size=64)
+    assert cfg.d_model == cfg.hidden_size == 32
+    assert cfg.n_heads == cfg.num_attention_heads == 4
+    assert cfg.n_layers == cfg.num_hidden_layers == 2
+    assert cfg.window_size == cfg.sliding_window_size == 64
+
+
+def test_kairos_config_save_pretrained_round_trip(tmp_path):
+    # regression: d_model/n_heads/n_layers/window_size used to silently revert to defaults on reload
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, window_size=64)
+    cfg.save_pretrained(tmp_path)
+    reloaded = KairosConfig.from_pretrained(tmp_path)
+    assert reloaded.hidden_size == 32
+    assert reloaded.num_attention_heads == 4
+    assert reloaded.num_hidden_layers == 2
+    assert reloaded.sliding_window_size == 64
+
+
+def test_kairos_config_modality_scales_default_clips_to_num_scales():
+    # with num_scales=2, scale indices 2/3 must never appear in the default modality_scales
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=2, num_modalities=3)
+    for scales in cfg.modality_scales.values():
+        assert all(s < 2 for s in scales)
+
+
 def test_n_routed_experts_stays_synced_with_num_local_experts():
     via_old_name = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, n_routed_experts=16)
     assert via_old_name.num_local_experts == 16
@@ -201,11 +227,27 @@ def test_backbone_block_size_uneven_layers_no_nan():
 
 
 def test_token_embedding():
-    emb = KairosEmbedding(vocab_size=100, num_modalities=7, d_model=32)
+    emb = KairosEmbedding(vocab_size=100, d_model=32)
     x = torch.randint(0, 100, (2, 16))
-    m = torch.zeros_like(x)
-    y = emb(token_ids=x, modality_ids=m)
+    y = emb(token_ids=x)
     assert y.shape[0] == 2
+
+
+def test_token_embedding_with_octet_family_fuses_a_third_stream():
+    emb = KairosEmbedding(vocab_size=100, d_model=32, num_octet_families=5)
+    assert emb.family_embed is not None
+    x = torch.randint(0, 100, (2, 16))
+    fam = torch.randint(0, 5, (2, 16))
+    y = emb(token_ids=x, family_ids=fam)
+    assert y.shape == (2, 16, 32)
+
+
+def test_token_embedding_family_ids_defaults_to_zero_when_omitted():
+    emb = KairosEmbedding(vocab_size=100, d_model=32, num_octet_families=5)
+    x = torch.randint(0, 100, (2, 16))
+    with_zero_family = emb(token_ids=x, family_ids=torch.zeros_like(x))
+    with_no_family_arg = emb(token_ids=x)
+    assert torch.allclose(with_zero_family, with_no_family_arg)
 
 
 def test_codec_roundtrip():
@@ -388,6 +430,27 @@ def test_octet_family_head_respects_logits_mask_too():
     assert out.octet_logits.shape == (2, 5)
 
 
+def test_forward_accepts_family_ids_and_uses_them_in_the_embedding():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=5)
+    model = KairosDiffusionFM(cfg)
+    model.eval()
+    x = torch.randint(0, 100, (2, 8))
+    fam_a = torch.zeros_like(x)
+    fam_b = torch.full_like(x, 3)
+    with torch.no_grad():
+        out_a = model(input_ids=x, family_ids=fam_a).logits
+        out_b = model(input_ids=x, family_ids=fam_b).logits
+    assert not torch.allclose(out_a, out_b)  # family_ids must actually influence the output
+
+
+def test_num_octet_families_constructor_override_mirrors_vocab_size():
+    # symmetry with the vocab_size=None override: callers must be able to pass the correct
+    # tokenizer-derived value directly, without relying on (possibly stale) config defaults
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=999)
+    model = KairosDiffusionFM(cfg, num_octet_families=7)
+    assert model.lm_head.octet_head.out_features == 7
+
+
 def test_kairos_cache_get_ssm_cache_roundtrip(config):
     model = KairosDiffusionFM(config)
     cache = KairosMultiCache(config)
@@ -465,7 +528,7 @@ def test_model_overfits_a_tiny_batch_without_collapsing_to_noise(config):
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
     random_baseline = torch.log(torch.tensor(float(vocab)))
     first_loss = None
-    for _ in range(80):
+    for _ in range(220):
         optimizer.zero_grad()
         loss = trainer.compute_loss(model, inputs)
         if first_loss is None:

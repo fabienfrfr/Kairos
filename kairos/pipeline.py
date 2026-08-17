@@ -48,6 +48,7 @@ class TrainConfig:
     mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows sharply as this shrinks
     mask_p_max: float = 1.0  # ceiling of p; cap below 1.0 (e.g. 0.3) for an MAE-style fixed-rate curriculum stage
     mask_reweight: bool = True  # divide CE by p; set False for plain CE (pairs with a capped mask_p_max)
+    octet_loss_weight: float = 1.0  # weight of the octet-family loss; family is part of token identity now
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
@@ -179,7 +180,9 @@ class KairosMultimodalPipeline:
                 drop_last=False,
             )
 
-        self.model = KairosDiffusionFM(self.model_config, vocab_size=len(self.tokenizer)).to(self.device)
+        self.model = KairosDiffusionFM(
+            self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
+        ).to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
@@ -197,8 +200,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_eps = tc.mask_eps
         self.hf_trainer.mask_p_max = tc.mask_p_max
         self.hf_trainer.mask_reweight = tc.mask_reweight
-        if self.model_config.predict_octet_family:
-            self.hf_trainer.octet_family_ids = self.tokenizer.octet_family_ids
+        self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
         self.writer = SummaryWriter(str(self.tb_dir))
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt:
@@ -780,7 +782,7 @@ class KairosMultimodalPipeline:
         if not noise_mask.any():
             return {}
 
-        per_token_loss, _, _ = compute_masked_diffusion_losses(self.model, x0, noise_mask, p, modality_ids)
+        per_token_loss, _, _, _ = compute_masked_diffusion_losses(self.model, x0, noise_mask, p, modality_ids)
 
         out = {}
         modality_at_noised = modality_ids[noise_mask]

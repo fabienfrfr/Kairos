@@ -9,7 +9,7 @@ from datasets import Dataset as HFDataset
 from datasets import concatenate_datasets, get_dataset_config_names, load_dataset
 from torch.utils.data import Dataset
 
-from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
+from .tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 MAX_LEN = 3 * 2048
 
@@ -75,32 +75,36 @@ class KairosPretrainingDataset(Dataset):
         self.ds = self.ds.map(self.preprocess, batched=True, remove_columns=self.ds.column_names)
         self.ds.set_format("torch")
 
-    def _chunk(self, token_ids, modality_ids):
+    def _chunk(self, token_ids, modality_ids, family_ids):
         """Fixed-length windowing shared by text and multimodal, padded to self.target_len."""
         for i in range(0, len(token_ids), self.max_len):
             ids_chunk = token_ids[i : i + self.max_len]
             mod_chunk = modality_ids[i : i + self.max_len]
+            fam_chunk = family_ids[i : i + self.max_len]
             pad_len = self.target_len - len(ids_chunk)
             ids_chunk = ids_chunk + [self.tokenizer.pad_token_id] * pad_len
             mod_chunk = mod_chunk + [int(Modality.TEXT)] * pad_len
+            fam_chunk = fam_chunk + [0] * pad_len
             mask = [1] * (len(ids_chunk) - pad_len) + [0] * pad_len
-            yield ids_chunk, mod_chunk, mask
+            yield ids_chunk, mod_chunk, fam_chunk, mask
 
     def _collect_chunks(self, chunk_sources):
-        """Run each (ids, modality_ids) pair through self._chunk and flatten into three lists;."""
-        all_input_ids, all_modality_ids, all_masks = [], [], []
+        """Run each (ids, modality_ids, family_ids) triple through self._chunk and flatten."""
+        all_input_ids, all_modality_ids, all_family_ids, all_masks = [], [], [], []
         if self.pack:
-            packed_ids, packed_mods = [], []
-            for ids, mods in chunk_sources:
+            packed_ids, packed_mods, packed_fams = [], [], []
+            for ids, mods, fams in chunk_sources:
                 packed_ids += ids
                 packed_mods += mods
-            chunk_sources = [(packed_ids, packed_mods)]
-        for ids, mods in chunk_sources:
-            for ids_chunk, mod_chunk, mask in self._chunk(ids, mods):
+                packed_fams += fams
+            chunk_sources = [(packed_ids, packed_mods, packed_fams)]
+        for ids, mods, fams in chunk_sources:
+            for ids_chunk, mod_chunk, fam_chunk, mask in self._chunk(ids, mods, fams):
                 all_input_ids.append(ids_chunk)
                 all_modality_ids.append(mod_chunk)
+                all_family_ids.append(fam_chunk)
                 all_masks.append(mask)
-        return all_input_ids, all_modality_ids, all_masks
+        return all_input_ids, all_modality_ids, all_family_ids, all_masks
 
     def preprocess(self, examples):
         prompts = examples.get("prompt", [""] * len(examples["text"]))
@@ -115,12 +119,13 @@ class KairosPretrainingDataset(Dataset):
                 tokens = self.tokenizer.encode(merged, add_special_tokens=False)
                 if not tokens:
                     continue
-                yield tokens, [int(Modality.TEXT)] * len(tokens)
+                yield tokens, [int(Modality.TEXT)] * len(tokens), [0] * len(tokens)
 
-        all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
+        all_input_ids, all_modality_ids, all_family_ids, all_masks = self._collect_chunks(sources())
         return {
             "input_ids": all_input_ids,
             "modality_ids": all_modality_ids,
+            "octet_family_ids": all_family_ids,
             "mask": all_masks,
             "prompt_len": [0] * len(all_input_ids),
         }
@@ -204,13 +209,16 @@ class KairosPretrainingDataset(Dataset):
                     warnings.warn(f"skipping corrupt example ({e}); {skipped} skipped so far", stacklevel=2)
                     continue
                 encoded = self.tokenizer.encode_multimodal(segments)
-                yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist()
+                yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist(), encoded[
+                    "octet_family_ids"
+                ].tolist()
 
-        all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
+        all_input_ids, all_modality_ids, all_family_ids, all_masks = self._collect_chunks(sources())
         self.ds = HFDataset.from_dict(
             {
                 "input_ids": all_input_ids,
                 "modality_ids": all_modality_ids,
+                "octet_family_ids": all_family_ids,
                 "mask": all_masks,
                 "prompt_len": [0] * len(all_input_ids),
             }

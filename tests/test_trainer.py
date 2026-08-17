@@ -94,7 +94,7 @@ def test_octet_family_loss_adds_to_total_when_configured(dense_model, tokenizer)
     trainer = KairosDiffusionTrainer(model=dense_model)
     torch.manual_seed(1)
     loss_without = trainer.compute_loss(dense_model, batch)
-    trainer.octet_family_ids = tokenizer.octet_family_ids
+    batch["octet_family_ids"] = torch.zeros_like(x0)
     torch.manual_seed(1)
     loss_with = trainer.compute_loss(dense_model, batch)
     assert not torch.allclose(loss_without, loss_with)
@@ -230,9 +230,9 @@ def test_compute_masked_diffusion_losses_reweight_true_divides_by_p(dense_model)
     p = torch.full_like(x0, fill_value=5, dtype=torch.float)  # p=5 everywhere (unrealistic but isolates the /p math)
 
     torch.manual_seed(0)  # same noise for both calls, otherwise /p math is masked by fresh noise draws
-    reweighted, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    reweighted, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
     torch.manual_seed(0)
-    plain, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+    plain, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
 
     assert torch.allclose(reweighted, plain / 5, atol=1e-5)
 
@@ -245,7 +245,7 @@ def test_compute_masked_diffusion_losses_reweight_false_is_plain_ce(dense_model)
     noise_mask[:, 2:5] = True
     p = torch.full_like(x0, fill_value=1e-3, dtype=torch.float)  # tiny p: /p would explode if reweight were on
 
-    plain, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+    plain, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
     assert torch.isfinite(plain).all()
     assert plain.max() < 50  # sane CE range for a small vocab, no 1/p blowup
 
