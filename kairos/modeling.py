@@ -422,9 +422,7 @@ class CodecOutput:
 
 
 class PyramidalCodec(nn.Module):
-    """Multi-scale encode/decode via patch or conv. mode='patch': full linear
-    per patch (tied weights, every position gets a real read/write). mode='conv':
-    depthwise conv1d + 1x1 mixer, parameter-efficient but still expressive."""
+    """Multi-scale encode/decode: mode='patch' (nn.Linear per scale) or 'conv' (cuDNN, faster)."""
 
     def __init__(self, d_model, stride=5, num_scales=4, mode="patch", norm_eps=1e-6):
         super().__init__()
@@ -443,15 +441,13 @@ class PyramidalCodec(nn.Module):
         self.fusion = nn.Linear(d_model * num_scales, d_model)
 
     def _init_patch(self, d_model):
-        """Linear patchify/unpatchify with tied encode/decode weights."""
-        self.encode_w = nn.ParameterList(
-            nn.Parameter(torch.empty(patch, d_model)) for patch in self.patch_sizes
+        """Linear(patch*d_model, d_model) per scale; decode reuses the same weight, transposed."""
+        self.encode_lin = nn.ModuleList(
+            nn.Linear(patch * d_model, d_model) for patch in self.patch_sizes
         )
-        self.encode_b = nn.ParameterList(
-            nn.Parameter(torch.zeros(d_model)) for _ in self.patch_sizes
+        self.decode_b = nn.ParameterList(
+            nn.Parameter(torch.zeros(patch * d_model)) for patch in self.patch_sizes
         )
-        for w in self.encode_w:
-            nn.init.normal_(w, std=w.shape[0] ** -0.5)
 
     def _init_conv(self, d_model):
         """Depthwise conv1d encoder + 1x1 mixer, 1x1 conv decoder."""
@@ -484,11 +480,11 @@ class PyramidalCodec(nn.Module):
 
     def _encode_patch(self, x, length):
         scales = []
-        for patch, w, b in zip(self.patch_sizes, self.encode_w, self.encode_b):
+        for patch, lin in zip(self.patch_sizes, self.encode_lin):
             padded = self._pad_to_multiple(x, patch)
             batch, padded_len, d_model = padded.shape
-            grouped = padded.reshape(batch, padded_len // patch, patch, d_model)
-            scales.append(torch.einsum("bgpd,pd->bgd", grouped, w) + b)
+            grouped = padded.reshape(batch, padded_len // patch, patch * d_model)
+            scales.append(lin(grouped))
         return CodecOutput(scales=scales, length=length)
 
     def _encode_conv(self, x, length):
@@ -510,9 +506,10 @@ class PyramidalCodec(nn.Module):
     def _decode_patch(self, encoded, length):
         reconstructed = []
         for idx, (scale, patch) in enumerate(zip(encoded.scales, self.patch_sizes)):
-            w, b = self.encode_w[idx], self.encode_b[idx]
-            expanded = scale.unsqueeze(2) * w + b
-            expanded = expanded.reshape(expanded.shape[0], -1, expanded.shape[-1])
+            lin, decode_b = self.encode_lin[idx], self.decode_b[idx]
+            # tied weights: same Linear, transposed (F.linear -> addmm).
+            expanded = F.linear(scale, lin.weight.t(), decode_b)
+            expanded = expanded.reshape(expanded.shape[0], -1, lin.in_features // patch)
             if expanded.shape[1] < length:
                 expanded = F.pad(expanded, (0, 0, 0, length - expanded.shape[1]))
             reconstructed.append(expanded[:, :length])

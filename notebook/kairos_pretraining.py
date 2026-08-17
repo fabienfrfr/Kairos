@@ -251,8 +251,10 @@ def _():
     CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
     CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     CFG_SHARE_BACKBONES = True  # share one backbone across all scales (saves ~75% params)
+    CFG_CODEC_MODE = "conv"  # "conv" (fast, cuDNN) or "patch" (nn.Linear per scale)
     return (
         CFG_ATTNRES_BLOCK,
+        CFG_CODEC_MODE,
         CFG_D_MODEL,
         CFG_EXPERTS,
         CFG_EXPERTS_PER_TOK,
@@ -286,6 +288,7 @@ def _(Modality):
 @app.cell
 def _(
     CFG_ATTNRES_BLOCK,
+    CFG_CODEC_MODE,
     CFG_D_MODEL,
     CFG_EXPERTS,
     CFG_EXPERTS_PER_TOK,
@@ -322,8 +325,9 @@ def _(
         attnres_block_size=CFG_ATTNRES_BLOCK,
         use_memory_gate=CFG_USE_MEMORY_BANK,
         share_backbones=CFG_SHARE_BACKBONES,
+        codec_mode=CFG_CODEC_MODE,
     )
-    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}")
+    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE}")
     return (model_config,)
 
 
