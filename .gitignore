@@ -1,5 +1,6 @@
 uv.lock
 project_structure.json
+project_structure*
 /.vscode
 /data
 /checkpoints
