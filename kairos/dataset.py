@@ -266,13 +266,12 @@ class KairosPretrainingDataset(Dataset):
             # and any dataset-construction-time errors never surface) while still returning a
             # dataset that looks fine. A dataset is rebuilt from live Python examples every time
             # this is called, so a stale cache hit is never correct here — force a fresh
-            # fingerprint each call, and skip on-disk caching altogether.
+            # fingerprint each call. Do NOT set keep_in_memory=True to "solve" this: that forces
+            # the whole table into a real in-process buffer instead of the memory-mapped file
+            # backing from_generator uses by default, which defeats the entire point of
+            # streaming this through the writer in the first place on any real-sized dataset.
             self.ds = HFDataset.from_generator(
-                rows,
-                features=_MULTIMODAL_FEATURES,
-                writer_batch_size=256,
-                keep_in_memory=True,
-                fingerprint=uuid.uuid4().hex,
+                rows, features=_MULTIMODAL_FEATURES, writer_batch_size=256, fingerprint=uuid.uuid4().hex
             )
         except ValueError as e:
             # from_generator can still fail on a truly empty stream even with an explicit
