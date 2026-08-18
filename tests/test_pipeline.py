@@ -287,7 +287,8 @@ def test_run_config_dict_contains_train_and_data_params(built_pipeline):
 def test_run_config_dict_sanitizes_raw_examples(built_pipeline):
     d = built_pipeline.run_config_dict()
     json.dumps(d)  # must be JSON-serializable, not raise
-    assert "omitted" in str(d["data_config"].get("text_examples") or d["data_config"].get("multimodal_examples"))
+    value = str(d["data_config"].get("text_examples") or d["data_config"].get("multimodal_examples"))
+    assert "omitted" in value or "freed after tokenizing" in value
 
 
 def test_training_config_json_written_at_build(built_pipeline):

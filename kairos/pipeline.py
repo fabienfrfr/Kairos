@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import math
 import random
@@ -40,6 +41,10 @@ class DataConfig:
     shuffle: bool = True
     drop_last: bool = True
     pack: bool = False  # concatenate samples before chunking so
+    num_workers: int | None = None  # None: 4 if batch_size > 1 else 0. Set explicitly to
+    # override — e.g. 0 on a memory-constrained machine, since each DataLoader worker forks
+    # (copy-on-write) the whole parent process, and CPython refcounting on touched objects
+    # can turn that into real, non-shared memory growth per worker over time.
 
 
 @dataclass
@@ -137,6 +142,8 @@ class KairosMultimodalPipeline:
 
     @property
     def _num_workers(self) -> int:
+        if self.data_config.num_workers is not None:
+            return self.data_config.num_workers
         return 4 if self.data_config.batch_size > 1 else 0
 
     # ------------------------------------------------------------------ build
@@ -144,24 +151,41 @@ class KairosMultimodalPipeline:
         dc = data_config or self.data_config
         text_ex = dc.text_examples or []
         multi_ex = dc.multimodal_examples or []
-        examples = list(text_ex) + list(multi_ex) if text_ex else list(multi_ex)
+        # chain instead of list+list: avoids holding a second full-length copy of the
+        # combined examples in memory just to hand it to KairosPretrainingDataset, which
+        # only needs to iterate it once.
+        examples = list(itertools.chain(text_ex, multi_ex)) if text_ex or multi_ex else []
         if examples:
-            return KairosPretrainingDataset(
+            ds = KairosPretrainingDataset(
                 multimodal_examples=examples,
                 tokenizer=self.tokenizer,
                 max_len=dc.max_len,
                 stride=dc.stride,
                 pack=dc.pack,
             )
-        if dc.multimodal_path:
-            return KairosPretrainingDataset(
+        elif dc.multimodal_path:
+            ds = KairosPretrainingDataset(
                 multimodal_path=dc.multimodal_path,
                 tokenizer=self.tokenizer,
                 max_len=dc.max_len,
                 stride=dc.stride,
                 pack=dc.pack,
             )
-        raise ValueError("DataConfig needs multimodal_examples, text_examples, and/or multimodal_path")
+        else:
+            raise ValueError("DataConfig needs multimodal_examples, text_examples, and/or multimodal_path")
+
+        # The dataset above is now fully tokenized and arrow-backed (memory-mapped) — the raw
+        # examples that fed it are no longer needed, but dc.text_examples/multimodal_examples
+        # would otherwise sit retained on self.data_config for the pipeline's entire lifetime
+        # (training, benchmarking, checkpointing...), and get re-inherited by every DataLoader
+        # worker process on fork. Free them here, right after they've served their purpose.
+        # Stash counts first so run_config_dict() can still report how many examples were used.
+        dc._text_examples_count = len(text_ex) or None
+        dc._multimodal_examples_count = len(multi_ex) or None
+        dc.text_examples = None
+        dc.multimodal_examples = None
+        del examples, text_ex, multi_ex
+        return ds
 
     def build(self) -> KairosMultimodalPipeline:
         """Wires up dataset, model, optimizer, scheduler, and (if resuming later) the checkpoint."""
@@ -631,14 +655,22 @@ class KairosMultimodalPipeline:
     def run_config_dict(self) -> dict:
         """model/train/data config as a plain JSON-safe dict — the actual hyperparameters behind."""
         dc = asdict(self.data_config)
-        for key in ("text_examples", "multimodal_examples"):
+        for key, count_attr in (("text_examples", "_text_examples_count"), ("multimodal_examples", "_multimodal_examples_count")):
             if dc.get(key) is not None:
                 dc[key] = f"<{len(dc[key])} examples, omitted>"
+            elif getattr(self.data_config, count_attr, None):
+                # already freed by _build_dataset (see there) — report the count we stashed.
+                dc[key] = f"<{getattr(self.data_config, count_attr)} examples, freed after tokenizing>"
         edc = asdict(self.eval_data_config) if self.eval_data_config is not None else None
         if edc is not None:
-            for key in ("text_examples", "multimodal_examples"):
+            for key, count_attr in (
+                ("text_examples", "_text_examples_count"),
+                ("multimodal_examples", "_multimodal_examples_count"),
+            ):
                 if edc.get(key) is not None:
                     edc[key] = f"<{len(edc[key])} examples, omitted>"
+                elif getattr(self.eval_data_config, count_attr, None):
+                    edc[key] = f"<{getattr(self.eval_data_config, count_attr)} examples, freed after tokenizing>"
         return {
             "model_config": self.model_config.to_dict(),
             "train_config": asdict(self.train_config),

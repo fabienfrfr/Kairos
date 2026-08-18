@@ -54,6 +54,7 @@ def _():
     from kairos.modeling import KairosConfig
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
+    from kairos.utils import make_progress_callback
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
@@ -67,6 +68,7 @@ def _():
         Modality,
         Path,
         TrainConfig,
+        make_progress_callback,
         pd,
         random,
         tokenizer,
@@ -262,8 +264,8 @@ def _():
         CFG_NUM_SCALES,
         CFG_N_HEADS,
         CFG_N_LAYERS,
-        CFG_SHARE_BACKBONES,
         CFG_SHARED_EXPERTS,
+        CFG_SHARE_BACKBONES,
         CFG_STRIDE,
         CFG_USE_MEMORY_BANK,
     )
@@ -296,8 +298,8 @@ def _(
     CFG_NUM_SCALES,
     CFG_N_HEADS,
     CFG_N_LAYERS,
-    CFG_SHARE_BACKBONES,
     CFG_SHARED_EXPERTS,
+    CFG_SHARE_BACKBONES,
     CFG_STRIDE,
     CFG_USE_MEMORY_BANK,
     KairosConfig,
@@ -401,14 +403,14 @@ def _(
     TRAIN_EVAL_BATCHES,
     TRAIN_EVAL_EVERY,
     TRAIN_LR,
-    TRAIN_MAX_LEN,
-    TRAIN_PACK,
     TRAIN_MAE_EPOCHS,
     TRAIN_MAE_P_MAX,
     TRAIN_MAE_REWEIGHT,
     TRAIN_MASK_EPS,
     TRAIN_MASK_P_MAX,
     TRAIN_MASK_REWEIGHT,
+    TRAIN_MAX_LEN,
+    TRAIN_PACK,
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
     TRAIN_STRIDE,
@@ -464,44 +466,6 @@ def _(
         hub_subfolder=HUB_SUBFOLDER,
     )
     return data_config, eval_data_config, train_config, train_config_mae
-
-
-@app.cell
-def _(KairosMultimodalPipeline, data_config, mo, model_config, tokenizer, train_config_mae):
-    # Stage 1 (MAE): fixed-rate bidirectional denoising, no CE/p reweighting. Cheap sanity check that the
-    # backbone can learn/memorize at all, and a stable bootstrap before the harder full-diffusion objective.
-    # Writes checkpoints/last.pt in train_config_mae.run_dir, picked up by Stage 2 below via resume=True.
-    if train_config_mae.epochs > 0:
-        pipe_mae = KairosMultimodalPipeline(model_config, data_config, train_config_mae, tokenizer=tokenizer)
-        pipe_mae.build()
-
-        _total_steps = train_config_mae.epochs * len(pipe_mae.loader)
-        if mo.running_in_notebook():
-            with mo.status.progress_bar(total=_total_steps, title="mae_pretrain") as _bar:
-                _state = {"last_step": 0}
-
-                def _on_mae_step(step, total, loss_val):
-                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                    _state["last_step"] = step
-
-                mae_logs = pipe_mae.train(progress_callback=_on_mae_step, resume=True)
-        else:
-            from kairos.utils import make_progress_callback
-
-            mae_logs = pipe_mae.train(progress_callback=make_progress_callback(desc="mae_pretrain"), resume=True)
-
-        print(f"MAE stage complete - steps: {len(mae_logs)}  best avg-epoch loss: {pipe_mae.best_loss:.4f}")
-        del pipe_mae
-        import gc
-        gc.collect()
-        try:
-            import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except OSError:
-            pass
-    else:
-        print("TRAIN_MAE_EPOCHS is 0 - skipping the MAE bootstrap stage")
-    return
 
 
 @app.cell
@@ -607,6 +571,7 @@ def _(
     OVERFIT_STEPS,
     TRAIN_MAE_P_MAX,
     TRAIN_MAE_REWEIGHT,
+    make_progress_callback,
     mo,
     pipe,
 ):
@@ -630,8 +595,6 @@ def _(
                     mask_reweight=TRAIN_MAE_REWEIGHT,
                 )
         else:
-            from kairos.utils import make_progress_callback
-
             _oflogs_mae = pipe.overfit_test(
                 n_examples=OVERFIT_EXAMPLES,
                 steps=OVERFIT_STEPS,
@@ -651,6 +614,7 @@ def _(
     OVERFIT_STEPS,
     TRAIN_MASK_P_MAX,
     TRAIN_MASK_REWEIGHT,
+    make_progress_callback,
     mo,
     pipe,
 ):
@@ -674,8 +638,6 @@ def _(
                     mask_reweight=TRAIN_MASK_REWEIGHT,
                 )
         else:
-            from kairos.utils import make_progress_callback
-
             _oflogs_diffusion = pipe.overfit_test(
                 n_examples=OVERFIT_EXAMPLES,
                 steps=OVERFIT_STEPS,
@@ -689,14 +651,58 @@ def _(
 
 
 @app.cell
+def _(
+    KairosMultimodalPipeline,
+    data_config,
+    make_progress_callback,
+    mo,
+    model_config,
+    tokenizer,
+    train_config_mae,
+):
+    # Stage 1 (MAE): fixed-rate bidirectional denoising, no CE/p reweighting. Cheap sanity check that the
+    # backbone can learn/memorize at all, and a stable bootstrap before the harder full-diffusion objective.
+    # Writes checkpoints/last.pt in train_config_mae.run_dir, picked up by Stage 2 below via resume=True.
+    if train_config_mae.epochs > 0:
+        pipe_mae = KairosMultimodalPipeline(model_config, data_config, train_config_mae, tokenizer=tokenizer)
+        pipe_mae.build()
+
+        _total_steps = train_config_mae.epochs * len(pipe_mae.loader)
+        if mo.running_in_notebook():
+            with mo.status.progress_bar(total=_total_steps, title="mae_pretrain") as _bar:
+                _state = {"last_step": 0}
+
+                def _on_mae_step(step, total, loss_val):
+                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
+                    _state["last_step"] = step
+
+                mae_logs = pipe_mae.train(progress_callback=_on_mae_step, resume=True)
+        else:
+            mae_logs = pipe_mae.train(progress_callback=make_progress_callback(desc="mae_pretrain"), resume=True)
+
+        print(f"MAE stage complete - steps: {len(mae_logs)}  best avg-epoch loss: {pipe_mae.best_loss:.4f}")
+        del pipe_mae
+        import gc
+        gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except OSError:
+            pass
+    else:
+        print("TRAIN_MAE_EPOCHS is 0 - skipping the MAE bootstrap stage")
+    return
+
+
+@app.cell
 def _():
-    FORCE_RESTART = False  # Stage 2 must resume=True (FORCE_RESTART=False) to pick up Stage 1's MAE weights;
+    FORCE_RESTART = True  # Stage 2 must resume=True (FORCE_RESTART=False) to pick up Stage 1's MAE weights;
     # setting this True skips that bridge and (re)trains Stage 2 from a freshly random-initialized model.
     return (FORCE_RESTART,)
 
 
 @app.cell
-def _(FORCE_RESTART, mo, pipe):
+def _(FORCE_RESTART, make_progress_callback, mo, pipe):
     _resumed = not FORCE_RESTART and (pipe.ckpt_dir / "last.pt").exists()
     if _resumed:
         print(f"found last.pt in {pipe.ckpt_dir} - resuming")
@@ -715,8 +721,6 @@ def _(FORCE_RESTART, mo, pipe):
 
             logs = pipe.train(progress_callback=_on_step, resume=not FORCE_RESTART)
     else:
-        from kairos.utils import make_progress_callback
-
         logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
 
     print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
