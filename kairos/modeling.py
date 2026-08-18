@@ -57,7 +57,7 @@ class KairosConfig(PretrainedConfig):
         self.num_modalities = kwargs.get("num_modalities", 8)
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
-        self.codec_mode = kwargs.get("codec_mode", "patch")
+        self.codec_mode = kwargs.get("codec_mode", "conv")
         self.predict_octet_family = kwargs.get("predict_octet_family", True)
         self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
@@ -450,21 +450,22 @@ class PyramidalCodec(nn.Module):
         )
 
     def _init_conv(self, d_model):
-        """Depthwise conv1d encoder + 1x1 mixer, 1x1 conv decoder."""
+        """Depthwise conv1d encoder + 1x1 mixer; decoder mirrors it (depthwise transpose + mixer)."""
         self.encoders = nn.ModuleList()
         self.mixers = nn.ModuleList()
         self.decoders = nn.ModuleList()
+        self.decode_mixers = nn.ModuleList()
         for patch in self.patch_sizes:
             self.encoders.append(
-                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch,
-                          groups=d_model, bias=True)
+                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
             )
-            self.mixers.append(
-                nn.Conv1d(d_model, d_model, kernel_size=1, bias=True)
-            )
+            self.mixers.append(nn.Conv1d(d_model, d_model, kernel_size=1, bias=True))
+            # depthwise transpose conv: O(patch * d_model), not the O(patch * d_model^2) that
+            # a dense Conv1d(d_model, d_model*patch, k=1) decoder would cost.
             self.decoders.append(
-                nn.Conv1d(d_model, d_model * patch, kernel_size=1, bias=True)
+                nn.ConvTranspose1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
             )
+            self.decode_mixers.append(nn.Conv1d(d_model, d_model, kernel_size=1, bias=True))
 
     @staticmethod
     def _pad_to_multiple(x, patch):
@@ -519,15 +520,11 @@ class PyramidalCodec(nn.Module):
 
     def _decode_conv(self, encoded, length):
         reconstructed = []
-        for scale, decoder, patch in zip(encoded.scales, self.decoders, self.patch_sizes):
-            h = scale.transpose(1, 2)               # (B,D,G)
-            h = decoder(h)                           # (B,D*patch,G)
-            batch, channels, groups = h.shape
-            d_model = channels // patch
-            h = h.view(batch, d_model, patch, groups) # (B,D,patch,G)
-            h = h.permute(0, 3, 2, 1)                # (B,G,patch,D)
-            h = h.reshape(batch, groups * patch, d_model) # (B,L,D)
-            reconstructed.append(h[:, :length])
+        for scale, decoder, mixer, patch in zip(encoded.scales, self.decoders, self.decode_mixers, self.patch_sizes):
+            h = scale.transpose(1, 2)   # (B,D,G)
+            h = decoder(h)              # (B,D,G*patch) — depthwise, expands the length dim only
+            h = mixer(h)                # (B,D,L) — 1x1 conv mixes channels, O(d_model^2)
+            reconstructed.append(h.transpose(1, 2)[:, :length])  # (B,L,D)
         h = torch.cat(reconstructed, dim=-1)
         h = self.norm(h)
         return self.fusion(h)

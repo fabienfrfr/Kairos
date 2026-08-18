@@ -345,12 +345,23 @@ def test_codec_conv_gradient_flow():
 
 
 def test_codec_conv_has_fewer_params_than_patch():
-    """Patch mode (tied) is parameter-cheap; conv mode adds mixer+decoder."""
+    """conv mode is depthwise (O(patch*d_model)); patch mode is dense (O(patch*d_model^2)),
+    so conv is the cheaper mode, especially at larger patch sizes."""
     patch = PyramidalCodec(32, stride=3, num_scales=2)
     conv = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
     n_patch = sum(p.numel() for p in patch.parameters())
     n_conv = sum(p.numel() for p in conv.parameters())
-    assert n_patch < n_conv  # tied patch is the cheapest mode
+    assert n_conv < n_patch
+
+
+def test_codec_conv_decoder_is_depthwise_not_dense():
+    """Guards against the O(patch*d_model^2) 1x1-conv decoder regression: a depthwise
+    ConvTranspose1d's params scale with d_model, not d_model^2."""
+    small = PyramidalCodec(32, stride=5, num_scales=1, mode="conv")
+    big = PyramidalCodec(64, stride=5, num_scales=1, mode="conv")
+    n_small = sum(p.numel() for p in small.decoders.parameters())
+    n_big = sum(p.numel() for p in big.decoders.parameters())
+    assert n_big < n_small * 3  # well under the 4x a dense (patch*d_model^2) decoder would give
 
 
 def test_kairos_model_init(config):

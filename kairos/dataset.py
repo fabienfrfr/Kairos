@@ -2,6 +2,7 @@ import array
 import io
 import json
 import random
+import uuid
 import warnings
 
 import numpy as np
@@ -259,7 +260,20 @@ class KairosPretrainingDataset(Dataset):
         # An explicit schema (features=) lets this succeed even when every example is
         # skipped (zero rows) — from_generator can't infer a schema from nothing.
         try:
-            self.ds = HFDataset.from_generator(rows, features=_MULTIMODAL_FEATURES, writer_batch_size=256)
+            # from_generator caches its output to disk keyed by a fingerprint of the generator
+            # function, and a second call with a similarly-shaped generator can silently reuse
+            # that cache — skipping our generator entirely (so any skip-warnings never fire,
+            # and any dataset-construction-time errors never surface) while still returning a
+            # dataset that looks fine. A dataset is rebuilt from live Python examples every time
+            # this is called, so a stale cache hit is never correct here — force a fresh
+            # fingerprint each call, and skip on-disk caching altogether.
+            self.ds = HFDataset.from_generator(
+                rows,
+                features=_MULTIMODAL_FEATURES,
+                writer_batch_size=256,
+                keep_in_memory=True,
+                fingerprint=uuid.uuid4().hex,
+            )
         except ValueError as e:
             # from_generator can still fail on a truly empty stream even with an explicit
             # schema (no arrow shard gets written at all) — build the empty dataset directly.

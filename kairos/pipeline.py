@@ -20,7 +20,13 @@ from .dataset import KairosPretrainingDataset
 from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import KairosDiffusionTrainer, compute_masked_diffusion_losses, make_diffusion_mask
-from .utils import TrainingSummary, locate_first_nonfinite_module, training_summary
+from .utils import (
+    DetailedMemoryReport,
+    TrainingSummary,
+    detailed_memory_report,
+    locate_first_nonfinite_module,
+    training_summary,
+)
 
 
 @dataclass
@@ -249,6 +255,34 @@ class KairosMultimodalPipeline:
             if benchmark:
                 self.model.load_state_dict(model_state)
                 self.optimizer.load_state_dict(optimizer_state)
+
+    # ------------------------------------------------------------ memory report
+    def memory_report(self) -> DetailedMemoryReport:
+        """Real measured memory for one train step (params/grads/optimizer/activations/RSS),
+        as opposed to summary()'s estimates. Runs one real step then restores model/optimizer
+        state, same as summary(benchmark=True)."""
+        self._require_built()
+        model_state = copy.deepcopy(self.model.state_dict())
+        optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+        loader_iter = iter(self.loader)
+        batch = next(loader_iter)
+        batch = {k: v.to(self.device) for k, v in batch.items()}
+
+        def loss_fn():
+            return self.hf_trainer.compute_loss(self.model, batch)
+
+        try:
+            return detailed_memory_report(
+                self.model,
+                self.optimizer,
+                loss_fn,
+                self.device,
+                autocast_ctx=self._autocast,
+                scaler=self.scaler,
+            )
+        finally:
+            self.model.load_state_dict(model_state)
+            self.optimizer.load_state_dict(optimizer_state)
 
     # ---------------------------------------------------------------- eval
     def evaluate(self, step: int | None = None) -> dict | None:

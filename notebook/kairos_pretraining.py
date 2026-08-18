@@ -548,6 +548,15 @@ def _(N_BENCH_STEPS, RUN_BENCHMARK, pipe):
 
 
 @app.cell
+def _(RUN_BENCHMARK, pipe):
+    # one-off diagnostic, same spirit as pipe.summary(): runs a single real step then
+    # restores model/optimizer state. Do NOT call this inside the training loop.
+    if RUN_BENCHMARK:
+        print(pipe.memory_report())
+    return
+
+
+@app.cell
 def _(pd, pipe):
     # visualize the tokenized input exactly as
     # post-collation) - use this to rule
