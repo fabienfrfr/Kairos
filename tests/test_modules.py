@@ -289,21 +289,35 @@ def test_codec_every_input_position_affects_every_output_position_in_its_patch()
     assert (x.grad.abs().sum(dim=-1) > 0).all()
 
 
-def test_codec_cost_is_linear_not_quadratic_in_d_model():
-    # depthwise patchify: params/FLOPs are O(patch * d_model), not O(patch * d_model^2) like a
-    # dense patch->d_model Linear. Doubling d_model should roughly double the codec's param count,
-    # not quadruple it.
+def test_codec_cost_is_quadratic_in_d_model():
+    # dense patch*d_model -> d_model Linear: params are O(patch * d_model^2), so doubling
+    # d_model should roughly quadruple the codec's param count (excluding norm/fusion).
     small = PyramidalCodec(32, stride=3, num_scales=4)
     big = PyramidalCodec(64, stride=3, num_scales=4)
     n_small = sum(p.numel() for n, p in small.named_parameters() if not n.startswith(("norm", "fusion")))
     n_big = sum(p.numel() for n, p in big.named_parameters() if not n.startswith(("norm", "fusion")))
-    assert n_big < n_small * 3  # well under the 4x a dense (patch*d_model^2) codec would give
+    assert 3 * n_small < n_big < 5 * n_small
 
 
 def test_codec_patch_tied_roundtrip():
     tied = PyramidalCodec(32, stride=3, num_scales=2)
     x = torch.randn(2, 16, 32)
     assert tied.decode(tied.encode(x)).shape == x.shape
+
+
+def test_codec_patch_uses_nn_linear():
+    codec = PyramidalCodec(32, stride=3, num_scales=2)
+    assert all(isinstance(lin, torch.nn.Linear) for lin in codec.encode_lin)
+
+
+def test_codec_patch_decode_reuses_encode_weight_transposed():
+    codec = PyramidalCodec(8, stride=3, num_scales=1)
+    lin = codec.encode_lin[0]
+    x = torch.randn(1, 3, 8)
+    scale = codec.encode(x).scales[0]
+    expected = torch.nn.functional.linear(scale, lin.weight.t(), codec.decode_b[0])
+    decoded = codec._decode_patch(codec.encode(x), length=3)
+    assert torch.allclose(decoded, codec.fusion(codec.norm(expected.reshape(1, 3, 8))))
 
 
 def test_codec_conv_roundtrip():

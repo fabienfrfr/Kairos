@@ -7,12 +7,24 @@ import warnings
 import numpy as np
 import torch
 from datasets import Dataset as HFDataset
-from datasets import concatenate_datasets, get_dataset_config_names, load_dataset
+from datasets import Features, Sequence, Value, concatenate_datasets, get_dataset_config_names, load_dataset
 from torch.utils.data import Dataset
 
 from .tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 MAX_LEN = 3 * 2048
+
+# explicit schema for _build_multimodal: lets from_generator build a (possibly empty)
+# dataset without inferring types from a first row, and gives a stable column order.
+_MULTIMODAL_FEATURES = Features(
+    {
+        "input_ids": Sequence(Value("int64")),
+        "modality_ids": Sequence(Value("int64")),
+        "octet_family_ids": Sequence(Value("int64")),
+        "mask": Sequence(Value("int64")),
+        "prompt_len": Value("int64"),
+    }
+)
 
 
 class NonFiniteDataError(ValueError):
@@ -215,14 +227,14 @@ class KairosPretrainingDataset(Dataset):
         if self.tokenizer is None:
             self.tokenizer = KairosTokenizer()
 
+        skip_messages = []  # populated during iteration, warned about after (see below)
+
         def sources():
-            skipped = 0
             for ex in examples:
                 try:
                     segments = self._segments_for(ex)
                 except NonFiniteDataError as e:
-                    skipped += 1
-                    warnings.warn(f"skipping corrupt example ({e}); {skipped} skipped so far", stacklevel=2)
+                    skip_messages.append(str(e))
                     continue
                 encoded = self.tokenizer.encode_multimodal(segments)
                 yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist(), encoded[
@@ -244,8 +256,33 @@ class KairosPretrainingDataset(Dataset):
         # writer_batch_size caps how many rows sit in the arrow write buffer at once
         # (default is 1000, already reasonable, but explicit here since it's the knob
         # to turn down further if RAM is still tight with very long/heavy sequences).
-        self.ds = HFDataset.from_generator(rows, writer_batch_size=256)
+        # An explicit schema (features=) lets this succeed even when every example is
+        # skipped (zero rows) — from_generator can't infer a schema from nothing.
+        try:
+            self.ds = HFDataset.from_generator(rows, features=_MULTIMODAL_FEATURES, writer_batch_size=256)
+        except ValueError as e:
+            # from_generator can still fail on a truly empty stream even with an explicit
+            # schema (no arrow shard gets written at all) — build the empty dataset directly.
+            if "corresponds to no data" in str(e):
+                self.ds = HFDataset.from_dict(
+                    {"input_ids": [], "modality_ids": [], "octet_family_ids": [], "mask": [], "prompt_len": []},
+                    features=_MULTIMODAL_FEATURES,
+                )
+            else:
+                raise
+        except Exception as e:
+            # datasets wraps generator errors in DatasetGenerationError — surface the
+            # original exception (e.g. the ValueError from an unknown modality) instead.
+            cause = e.__cause__ or e.__context__
+            if isinstance(cause, ValueError):
+                raise cause from None
+            raise
         self.ds.set_format("torch")
+
+        # warn here, not inside sources(): warnings emitted from within the generator
+        # that from_generator consumes don't reliably propagate to the caller.
+        for i, msg in enumerate(skip_messages, 1):
+            warnings.warn(f"skipping corrupt example ({msg}); {i} skipped so far", stacklevel=2)
 
     def __getitem__(self, idx):
         return self.ds[idx]
