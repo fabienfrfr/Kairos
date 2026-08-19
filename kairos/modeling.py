@@ -58,6 +58,9 @@ class KairosConfig(PretrainedConfig):
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
         self.codec_mode = kwargs.get("codec_mode", "conv")
+        # rank of the conv-mode codec's channel mixer bottleneck; None -> PyramidalCodec's
+        # own default (max(8, d_model // 4)). Only used when codec_mode == "conv".
+        self.codec_mixer_rank = kwargs.get("codec_mixer_rank", None)
         self.predict_octet_family = kwargs.get("predict_octet_family", True)
         self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
@@ -424,13 +427,18 @@ class CodecOutput:
 class PyramidalCodec(nn.Module):
     """Multi-scale encode/decode: mode='patch' (nn.Linear per scale) or 'conv' (cuDNN, faster)."""
 
-    def __init__(self, d_model, stride=5, num_scales=4, mode="patch", norm_eps=1e-6):
+    def __init__(self, d_model, stride=5, num_scales=4, mode="patch", norm_eps=1e-6, mixer_rank=None):
         super().__init__()
         assert mode in ("patch", "conv"), f"mode must be 'patch' or 'conv', got {mode!r}"
         self.stride = stride
         self.num_scales = num_scales
         self.mode = mode
         self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
+        # bottleneck rank for the conv-mode channel mixer: a dense d_model->d_model 1x1 conv
+        # costs O(d_model^2) per position; routing it through a narrow rank-r bottleneck
+        # (d_model->r->d_model) costs O(2*r*d_model) instead, while still mixing every channel
+        # against every other one (unlike a grouped conv, which only mixes within groups).
+        self.mixer_rank = mixer_rank if mixer_rank is not None else max(8, d_model // 4)
 
         if mode == "patch":
             self._init_patch(d_model)
@@ -449,8 +457,23 @@ class PyramidalCodec(nn.Module):
             nn.Parameter(torch.zeros(patch * d_model)) for patch in self.patch_sizes
         )
 
+    def _make_bottleneck_mixer(self, d_model):
+        """Rank-r channel mixer: Conv1d(d_model->r) -> Conv1d(r->d_model), both 1x1. Every
+        output channel can still depend on every input channel (full mixing, unlike grouped
+        conv), but the cost is O(2*r*d_model) instead of O(d_model^2). A nonlinearity between
+        the two convs keeps it from collapsing algebraically into a single rank-r-limited
+        linear map — it's a real 2-layer bottleneck, not a low-rank factorization of one."""
+        r = self.mixer_rank
+        return nn.Sequential(
+            nn.Conv1d(d_model, r, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv1d(r, d_model, kernel_size=1, bias=True),
+        )
+
     def _init_conv(self, d_model):
-        """Depthwise conv1d encoder + 1x1 mixer; decoder mirrors it (depthwise transpose + mixer)."""
+        """Depthwise conv1d encoder + bottleneck mixer; decoder mirrors it (depthwise transpose
+        + bottleneck mixer). See _make_bottleneck_mixer for why the mixer isn't a plain dense
+        1x1 conv."""
         self.encoders = nn.ModuleList()
         self.mixers = nn.ModuleList()
         self.decoders = nn.ModuleList()
@@ -459,13 +482,13 @@ class PyramidalCodec(nn.Module):
             self.encoders.append(
                 nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
             )
-            self.mixers.append(nn.Conv1d(d_model, d_model, kernel_size=1, bias=True))
+            self.mixers.append(self._make_bottleneck_mixer(d_model))
             # depthwise transpose conv: O(patch * d_model), not the O(patch * d_model^2) that
             # a dense Conv1d(d_model, d_model*patch, k=1) decoder would cost.
             self.decoders.append(
                 nn.ConvTranspose1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
             )
-            self.decode_mixers.append(nn.Conv1d(d_model, d_model, kernel_size=1, bias=True))
+            self.decode_mixers.append(self._make_bottleneck_mixer(d_model))
 
     @staticmethod
     def _pad_to_multiple(x, patch):
@@ -523,7 +546,7 @@ class PyramidalCodec(nn.Module):
         for scale, decoder, mixer, patch in zip(encoded.scales, self.decoders, self.decode_mixers, self.patch_sizes):
             h = scale.transpose(1, 2)   # (B,D,G)
             h = decoder(h)              # (B,D,G*patch) — depthwise, expands the length dim only
-            h = mixer(h)                # (B,D,L) — 1x1 conv mixes channels, O(d_model^2)
+            h = mixer(h)                # (B,D,L) — bottleneck mixer, O(2*r*d_model) not O(d_model^2)
             reconstructed.append(h.transpose(1, 2)[:, :length])  # (B,L,D)
         h = torch.cat(reconstructed, dim=-1)
         h = self.norm(h)
@@ -547,6 +570,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
             num_scales=config.num_scales,
             mode=config.codec_mode,
             norm_eps=config.rms_norm_eps,
+            mixer_rank=getattr(config, "codec_mixer_rank", None),
         )
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:

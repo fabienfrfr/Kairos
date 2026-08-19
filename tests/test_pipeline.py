@@ -510,6 +510,101 @@ def test_summary_before_build_raises():
         pipe.summary()
 
 
+# ------------------------------------------------------------- memory_report / summary fusion
+def test_memory_report_returns_detailed_measured_report(built_pipeline):
+    from kairos.utils import DetailedMemoryReport
+
+    report = built_pipeline.memory_report()
+
+    assert isinstance(report, DetailedMemoryReport)
+    assert report.unique_param_bytes > 0
+    assert report.grad_bytes > 0
+    assert report.optimizer_state_bytes > 0
+    assert report.rss_before_mb >= 0
+    assert report.rss_after_optimizer_step_mb >= 0
+
+
+def test_memory_report_restores_model_and_optimizer_state(built_pipeline):
+    before_model = {k: v.clone() for k, v in built_pipeline.model.state_dict().items()}
+    before_optim = copy.deepcopy(built_pipeline.optimizer.state_dict())
+
+    built_pipeline.memory_report()
+
+    after_model = built_pipeline.model.state_dict()
+    for key, val in before_model.items():
+        assert torch.equal(val, after_model[key]), f"param {key} changed after memory_report()"
+    after_optim = built_pipeline.optimizer.state_dict()
+    assert list(before_optim["state"].keys()) == list(after_optim["state"].keys())
+
+
+def test_memory_report_does_not_advance_global_step(built_pipeline):
+    step_before = built_pipeline.global_step
+    built_pipeline.memory_report()
+    assert built_pipeline.global_step == step_before
+
+
+def test_memory_report_before_build_raises():
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    pipe = KairosMultimodalPipeline(
+        model_config, DataConfig(text_examples=[{"modality": "text", "text": "hi"}]), TrainConfig(run_dir="unused")
+    )
+    with pytest.raises(RuntimeError):
+        pipe.memory_report()
+
+
+def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pipeline):
+    """summary(benchmark=True) should fold in the same kind of real measurement as
+    memory_report() (regression test for the old behaviour: two separate deepcopy'd runs
+    with estimate-only memory numbers in summary())."""
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+
+    assert summary.measured_memory is True
+    assert summary.param_memory_mb > 0
+    assert summary.optimizer_memory_mb > 0
+    # sanity: measured optimizer memory for AdamW should be roughly proportional to trainable
+    # params (not exactly 2x param bytes like the old formula estimate, since state is fp32
+    # regardless of model dtype and only allocated for params that actually got a grad).
+    assert summary.optimizer_memory_mb > 0.5 * summary.param_memory_mb
+
+
+def test_summary_str_shows_measured_label_when_benchmarked(built_pipeline):
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+    text = str(summary)
+    assert "Measured model memory:" in text
+    assert "Measured optimizer mem:" in text
+    assert "Measured total memory:" in text
+
+
+def test_summary_str_shows_est_label_without_benchmark(built_pipeline):
+    summary = built_pipeline.summary(benchmark=False)
+    text = str(summary)
+    assert "Est. model memory:" in text
+    assert summary.measured_memory is False
+
+
+def test_summary_n_bench_steps_one_still_produces_avg_step_time(built_pipeline):
+    """Regression test: the fused summary()/memory_report() used to consume the single
+    n_bench_steps=1 step for the memory measurement without timing it, leaving
+    avg_step_time_sec=None. The one measured step must count towards the timing budget."""
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+    assert summary.avg_step_time_sec is not None
+    assert summary.avg_step_time_sec > 0
+    assert summary.estimated_total_time_sec is not None
+
+
+def test_summary_benchmark_handles_exhausted_loader_gracefully(built_pipeline, monkeypatch):
+    """If the loader yields nothing at all (edge case: e.g. an empty split), summary(benchmark=
+    True) must not crash — it should fall back to no timing/no measured memory instead of
+    raising StopIteration."""
+    monkeypatch.setattr(built_pipeline, "loader", [])
+
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=2)
+
+    assert summary.avg_step_time_sec is None
+    assert summary.estimated_total_time_sec is None
+    assert summary.measured_memory is False
+
+
 # --------------------------------------------------------------------- hub
 def test_build_creates_hub_repo_when_configured(tmp_path, model_config, text_examples, monkeypatch):
     calls = []

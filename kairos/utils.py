@@ -344,17 +344,20 @@ class TrainingSummary:
     total_steps: int
     avg_step_time_sec: float | None = None
     estimated_total_time_sec: float | None = None
+    measured_memory: bool = False  # True when the memory fields below come from a real
+    # forward+backward+step (detailed_memory_report), not from the param-count formulas.
 
     def __str__(self) -> str:
+        mem_label = "Measured" if self.measured_memory else "Est."
         lines = [
             "Kairos training summary",
             "------------------------",
             f"Total params:        {self.total_params / 1e6:.2f}M",
             f"Active params/tok:   {self.active_params / 1e6:.2f}M",
             f"Trainable params:    {self.trainable_params / 1e6:.2f}M",
-            f"Est. model memory:   {self.param_memory_mb:.1f} MB",
-            f"Est. optimizer mem:  {self.optimizer_memory_mb:.1f} MB",
-            f"Est. total memory:   {self.total_memory_mb:.1f} MB",
+            f"{mem_label} model memory:".ljust(21) + f"{self.param_memory_mb:.1f} MB",
+            f"{mem_label} optimizer mem:".ljust(21) + f"{self.optimizer_memory_mb:.1f} MB",
+            f"{mem_label} total memory:".ljust(21) + f"{self.total_memory_mb:.1f} MB",
             f"Steps/epoch:         {self.steps_per_epoch}",
             f"Epochs:              {self.epochs}",
             f"Total steps:         {self.total_steps}",

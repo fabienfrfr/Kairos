@@ -7,6 +7,7 @@ import itertools
 import json
 import math
 import random
+import time
 import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -24,6 +25,7 @@ from .trainer import KairosDiffusionTrainer, compute_masked_diffusion_losses, ma
 from .utils import (
     DetailedMemoryReport,
     TrainingSummary,
+    benchmark_step_time,
     detailed_memory_report,
     locate_first_nonfinite_module,
     training_summary,
@@ -149,6 +151,16 @@ class KairosMultimodalPipeline:
     # ------------------------------------------------------------------ build
     def _build_dataset(self, data_config: DataConfig | None = None) -> KairosPretrainingDataset:
         dc = data_config or self.data_config
+        # A second build() reusing the same DataConfig (e.g. resuming training with a fresh
+        # KairosMultimodalPipeline instance, or a test that builds twice) used to hit the
+        # ValueError below, because the raw examples were freed after the first build. Cache
+        # the already-tokenized (arrow-backed, memory-mapped — cheap to hold) dataset on the
+        # config instead: a rebuild reuses it directly, which is both correct and faster
+        # (skips re-tokenizing) instead of just failing.
+        cached = getattr(dc, "_cached_dataset", None)
+        if cached is not None:
+            return cached
+
         text_ex = dc.text_examples or []
         multi_ex = dc.multimodal_examples or []
         # chain instead of list+list: avoids holding a second full-length copy of the
@@ -184,6 +196,7 @@ class KairosMultimodalPipeline:
         dc._multimodal_examples_count = len(multi_ex) or None
         dc.text_examples = None
         dc.multimodal_examples = None
+        dc._cached_dataset = ds
         del examples, text_ex, multi_ex
         return ds
 
@@ -243,11 +256,17 @@ class KairosMultimodalPipeline:
 
     # -------------------------------------------------------------- summary
     def summary(self, benchmark: bool = True, n_bench_steps: int = 5) -> TrainingSummary:
-        """Report params/memory/time; benchmark steps are timed then reverted."""
+        """Report params/memory/time. When benchmark=True, memory numbers come from one real
+        forward+backward+optimizer.step() (same measurement as memory_report()) instead of the
+        param-count formulas, and the remaining n_bench_steps-1 steps are timed for the step-time
+        estimate. Model/optimizer state and the loader are restored after a single snapshot —
+        this replaces the old pattern of summary() and memory_report() each doing their own
+        separate deepcopy (which doubled the transient RAM spike and made it worse each time
+        both were called back to back)."""
         self._require_built()
 
-        step_fn = None
-        model_state = optimizer_state = None
+        mem_report = None
+        avg_step_time = None
         if benchmark:
             model_state = copy.deepcopy(self.model.state_dict())
             optimizer_state = copy.deepcopy(self.optimizer.state_dict())
@@ -265,26 +284,64 @@ class KairosMultimodalPipeline:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
-        try:
-            return training_summary(
-                self.model,
-                self.loader,
-                epochs=self.train_config.epochs,
-                step_fn=step_fn,
-                n_bench_steps=n_bench_steps,
-                num_experts_per_tok=self.model_config.num_experts_per_tok if self.model_config.use_moe else None,
-                num_local_experts=self.model_config.num_local_experts if self.model_config.use_moe else None,
-            )
-        finally:
-            if benchmark:
+            try:
+                # one real step, fully measured (params/grads/optimizer/activations/RSS) —
+                # this *is* the memory_report() measurement, done once and reused here. Also
+                # timed, so it counts as the first of n_bench_steps rather than an extra step
+                # outside that budget (previously: n_bench_steps=1 left avg_step_time_sec=None,
+                # since "remaining" was 0 and this first step's own time was discarded).
+                batch = next(loader_iter)
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+
+                def loss_fn():
+                    return self.hf_trainer.compute_loss(self.model, batch)
+
+                t0 = time.perf_counter()
+                mem_report = detailed_memory_report(
+                    self.model, self.optimizer, loss_fn, self.device,
+                    autocast_ctx=self._autocast, scaler=self.scaler,
+                )
+                first_step_time = time.perf_counter() - t0
+
+                # remaining steps just for timing, continuing from the already-stepped model
+                remaining = max(0, n_bench_steps - 1)
+                rest_avg = benchmark_step_time(step_fn, n_steps=remaining, warmup=0) if remaining else None
+                if rest_avg is not None:
+                    avg_step_time = (first_step_time + rest_avg * remaining) / (1 + remaining)
+                else:
+                    avg_step_time = first_step_time
+            except StopIteration:
+                pass
+            finally:
                 self.model.load_state_dict(model_state)
                 self.optimizer.load_state_dict(optimizer_state)
+                del model_state, optimizer_state
+                self._release_transient_memory()
+
+        ts = training_summary(
+            self.model,
+            self.loader,
+            epochs=self.train_config.epochs,
+            step_fn=None,
+            n_bench_steps=n_bench_steps,
+            num_experts_per_tok=self.model_config.num_experts_per_tok if self.model_config.use_moe else None,
+            num_local_experts=self.model_config.num_local_experts if self.model_config.use_moe else None,
+        )
+        if avg_step_time is not None:
+            ts.avg_step_time_sec = avg_step_time
+            ts.estimated_total_time_sec = avg_step_time * ts.total_steps
+        if mem_report is not None:
+            ts.param_memory_mb = mem_report.unique_param_bytes / 1e6
+            ts.optimizer_memory_mb = mem_report.optimizer_state_bytes / 1e6
+            ts.total_memory_mb = mem_report.rss_after_optimizer_step_mb - mem_report.rss_before_mb
+            ts.measured_memory = True
+        return ts
 
     # ------------------------------------------------------------ memory report
     def memory_report(self) -> DetailedMemoryReport:
         """Real measured memory for one train step (params/grads/optimizer/activations/RSS),
-        as opposed to summary()'s estimates. Runs one real step then restores model/optimizer
-        state, same as summary(benchmark=True)."""
+        standalone version of the measurement summary(benchmark=True) now folds in directly.
+        Runs one real step then restores model/optimizer state."""
         self._require_built()
         model_state = copy.deepcopy(self.model.state_dict())
         optimizer_state = copy.deepcopy(self.optimizer.state_dict())
@@ -307,6 +364,25 @@ class KairosMultimodalPipeline:
         finally:
             self.model.load_state_dict(model_state)
             self.optimizer.load_state_dict(optimizer_state)
+            del model_state, optimizer_state
+            self._release_transient_memory()
+
+    @staticmethod
+    def _release_transient_memory() -> None:
+        """After a deepcopy'd state_dict snapshot is dropped, glibc's malloc doesn't always
+        return the freed pages to the OS — RSS stays high and creeps up further on repeated
+        calls (the "RAM explodes then plateaus, and grows again next run" symptom). gc.collect()
+        clears the Python-level references; malloc_trim(0) asks glibc to actually give the pages
+        back. Best-effort: silently no-ops on platforms without glibc (e.g. macOS)."""
+        import gc
+
+        gc.collect()
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except OSError:
+            pass
 
     # ---------------------------------------------------------------- eval
     def evaluate(self, step: int | None = None) -> dict | None:
