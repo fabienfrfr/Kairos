@@ -52,14 +52,20 @@ try:
         chunk_gated_delta_rule,
         fused_recurrent_gated_delta_rule,
     )
+
+    DELTA_RULE_BACKEND = "fla"
 except ImportError:
     chunk_gated_delta_rule = None
     fused_recurrent_gated_delta_rule = None
+    DELTA_RULE_BACKEND = "torch_fallback"
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+
+    CAUSAL_CONV1D_BACKEND = "causal_conv1d"
 except ImportError:
     causal_conv1d_fn = None
+    CAUSAL_CONV1D_BACKEND = "torch_fallback"
     try:
         from transformers.models.qwen3_next.modeling_qwen3_next import (
             torch_causal_conv1d_update as causal_conv1d_update,
@@ -68,6 +74,30 @@ except ImportError:
         from transformers.models.qwen3_next.modeling_qwen3_next import (
             causal_conv1d_update,
         )
+
+# DeltaNet runs on every layer alongside SWA (see KairosLiZAttention2); without fla/causal-conv1d
+# it silently falls back to slow pure-PyTorch kernels - warn loudly on CUDA
+def _warn_if_missing_fast_kernels(cuda_available: bool, delta_backend: str, conv_backend: str) -> None:
+    """Pure function (no CUDA/import side effects), directly unit-testable without reloading."""
+    if not cuda_available or (delta_backend == "fla" and conv_backend == "causal_conv1d"):
+        return
+    import warnings
+
+    missing = [
+        pkg
+        for pkg, ok in (("flash-linear-attention", delta_backend == "fla"), ("causal-conv1d", conv_backend == "causal_conv1d"))
+        if not ok
+    ]
+    warnings.warn(
+        f"CUDA is available but {', '.join(missing)} is not installed — KairosGatedDeltaNet is "
+        "running on the slow pure-PyTorch fallback (torch_chunk_gated_delta_rule / "
+        "torch_causal_conv1d_update) instead of the fused Triton kernel, on every layer, every "
+        "step. Install with: pip install 'kairos-fm[fast-attn]'",
+        stacklevel=2,
+    )
+
+
+_warn_if_missing_fast_kernels(torch.cuda.is_available(), DELTA_RULE_BACKEND, CAUSAL_CONV1D_BACKEND)
 
 
 def _supports_cu_seqlens(fn):
@@ -158,7 +188,7 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
     return out.contiguous()
 
 
-# Flex mask builder (bidir); flex block size - bucketing lengths up to it keeps the mask/kernel shape stable.
+# Flex mask builder (bidir); block size buckets lengths to keep mask/kernel shape stable.
 _FLEX_BLOCK_SIZE = 128
 
 

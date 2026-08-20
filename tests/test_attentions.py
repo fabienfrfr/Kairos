@@ -1,3 +1,4 @@
+import importlib
 import os
 import subprocess
 import sys
@@ -9,6 +10,8 @@ import torch
 
 from kairos.attentions import (
     ATTN_IMPL,
+    CAUSAL_CONV1D_BACKEND,
+    DELTA_RULE_BACKEND,
     KairosAttention,
     KairosGatedDeltaNet,
     KairosLiZAttention2,
@@ -728,3 +731,56 @@ class TestFlexAttentionBlockMask:
         eager = eager.reshape(2, 114, -1)
         out_eager = attn.out(eager)
         assert torch.allclose(out_flex, out_eager, atol=1e-3)
+
+
+# --------------------------------------------------------- kernel backend detection
+def test_delta_rule_backend_is_valid_value():
+    assert DELTA_RULE_BACKEND in ("fla", "torch_fallback")
+
+
+def test_causal_conv1d_backend_is_valid_value():
+    assert CAUSAL_CONV1D_BACKEND in ("causal_conv1d", "torch_fallback")
+
+
+def test_delta_rule_backend_matches_installed_fla():
+    fla_available = importlib.util.find_spec("fla") is not None
+    assert (DELTA_RULE_BACKEND == "fla") == fla_available
+
+
+def test_causal_conv1d_backend_matches_installed_package():
+    pkg_available = importlib.util.find_spec("causal_conv1d") is not None
+    assert (CAUSAL_CONV1D_BACKEND == "causal_conv1d") == pkg_available
+
+
+def test_warns_on_cuda_without_fast_kernels():
+    """On a CUDA machine without fla/causal-conv1d, importing kairos.attentions should warn
+    loudly instead of silently falling back — this used to be a silent ImportError->None swap."""
+    from kairos.attentions import _warn_if_missing_fast_kernels
+
+    with pytest.warns(UserWarning, match="fast-attn"):
+        _warn_if_missing_fast_kernels(cuda_available=True, delta_backend="torch_fallback", conv_backend="torch_fallback")
+
+
+def test_warns_lists_only_the_actually_missing_package():
+    from kairos.attentions import _warn_if_missing_fast_kernels
+
+    with pytest.warns(UserWarning) as record:
+        _warn_if_missing_fast_kernels(cuda_available=True, delta_backend="fla", conv_backend="torch_fallback")
+    msg = str(record[0].message)
+    assert "causal-conv1d" in msg
+    assert "flash-linear-attention" not in msg
+
+
+def test_no_warning_on_cpu_without_fast_kernels(recwarn):
+    """CPU-only machines can't install the CUDA-only fast kernels — no point warning there."""
+    from kairos.attentions import _warn_if_missing_fast_kernels
+
+    _warn_if_missing_fast_kernels(cuda_available=False, delta_backend="torch_fallback", conv_backend="torch_fallback")
+    assert len(recwarn.list) == 0
+
+
+def test_no_warning_on_cuda_with_both_fast_kernels_present(recwarn):
+    from kairos.attentions import _warn_if_missing_fast_kernels
+
+    _warn_if_missing_fast_kernels(cuda_available=True, delta_backend="fla", conv_backend="causal_conv1d")
+    assert len(recwarn.list) == 0

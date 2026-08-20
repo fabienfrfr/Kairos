@@ -30,43 +30,55 @@ class KairosConfig(PretrainedConfig):
         d_model=768,
         n_heads=12,
         n_layers=12,
-        vocab_size=259,
+        vocab_size=291,  # matches current KairosTokenizer; callers should pass len(tokenizer)
         intermediate_size=2048,
         window_size=128,
         stride=5,
         **kwargs,
     ):
+        # a reloaded config.json stores derived HF-style names; read them back first for round-trips
+        d_model = kwargs.pop("hidden_size", d_model)
+        n_heads = kwargs.pop("num_attention_heads", n_heads)
+        n_layers = kwargs.pop("num_hidden_layers", n_layers)
+        window_size = kwargs.pop("sliding_window_size", window_size)
+
         super().__init__(**kwargs)
 
-        self.hidden_size = d_model
-        self.num_attention_heads = n_heads
-        self.num_hidden_layers = n_layers
+        assert d_model % n_heads == 0, "hidden_size must be divisible by n_heads"
+
+        # canonical HF names (read by borrowed HF modules) + friendly aliases (model cards, logs)
+        self.hidden_size = self.d_model = d_model
+        self.num_attention_heads = self.n_heads = n_heads
+        self.num_hidden_layers = self.n_layers = n_layers
+        self.sliding_window_size = self.window_size = window_size
         self.vocab_size = vocab_size
 
         self.num_modalities = kwargs.get("num_modalities", 8)
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
+        self.codec_mode = kwargs.get("codec_mode", "conv")
+        # rank of the conv-mode codec's mixer bottleneck; None -> PyramidalCodec default
+        self.codec_mixer_rank = kwargs.get("codec_mixer_rank", None)
+        self.predict_octet_family = kwargs.get("predict_octet_family", True)
+        self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
-        default_scales = {0: [0, 1], 1: [1, 2], 2: [2, 3]}
+        # each default scale list is clipped to actually-existing scale indices (< num_scales)
+        def _clip(scales):
+            return [s for s in scales if s < self.num_scales] or [0]
+
+        default_scales = {0: _clip([0, 1]), 1: _clip([1, 2]), 2: _clip([2, 3])}
         for m in range(self.num_modalities):
             default_scales.setdefault(m, [0])
         self.modality_scales = kwargs.get("modality_scales", default_scales)
 
-        assert d_model % n_heads == 0, "hidden_size must be divisible by n_heads"
-
         self.stride = stride
 
-        self.sliding_window_size = window_size
         self.num_key_value_heads = n_heads
         self.head_dim = d_model // n_heads
         self.attention_dropout = 0.0
         self.rope_theta = 10000.0
         self.max_position_embeddings = 4096
 
-        self.linear_num_value_heads = kwargs.get("linear_num_value_heads", n_heads)
-        self.linear_num_key_heads = kwargs.get("linear_num_key_heads", n_heads)
-        self.linear_key_head_dim = kwargs.get("linear_key_head_dim", self.head_dim)
-        self.linear_value_head_dim = kwargs.get("linear_value_head_dim", self.head_dim)
         self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4)
         self.hidden_act = kwargs.get("hidden_act", "silu")
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
@@ -96,6 +108,7 @@ class KairosConfig(PretrainedConfig):
 
         # v3 Block-AttnRes: windows prior layer outputs
         self.attnres_block_size = kwargs.get("attnres_block_size", 1)
+        self.share_backbones = kwargs.get("share_backbones", False)
 
         # block-diffusion generation: one canvas of this many tokens per outer loop
         self.canvas_length = kwargs.get("canvas_length", 128)
@@ -250,8 +263,8 @@ class KairosMoE(DeepseekV3MoE):
 class DiffusionBlock(nn.Module):
     def __init__(self, config, layer_idx, use_moe=False):
         super().__init__()
-        self.norm1 = KairosNorm(config.hidden_size)
-        self.norm2 = KairosNorm(config.hidden_size)
+        self.norm1 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm2 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn = KairosLiZAttention2(config, layer_idx)
         self.ffn = KairosMoE(config) if use_moe else KairosFFN(config)
 
@@ -293,7 +306,7 @@ class KairosDiffusionBackbone(nn.Module):
     def __init__(self, config, use_moe=False):
         super().__init__()
         self.layers = nn.ModuleList([DiffusionBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
-        self.norm = KairosNorm(config.hidden_size)
+        self.norm = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.aggregator = nn.ModuleList([KairosAttnRes(config.hidden_size) for _ in range(config.num_hidden_layers)])
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
         self.deltanet_layer_indices = [i for i, lt in enumerate(config.layers_config) if "d" in lt]
@@ -328,32 +341,39 @@ class KairosDiffusionBackbone(nn.Module):
 
 
 class KairosEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, num_modalities: int, d_model: int):
+    def __init__(self, vocab_size: int, d_model: int, num_octet_families: int = 0):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.modality_embed = nn.Embedding(num_modalities, d_model)
-        self.fusion_proj = nn.Linear(d_model * 2, d_model)
+        self.family_embed = nn.Embedding(num_octet_families, d_model) if num_octet_families > 0 else None
+        n_parts = 1 + (1 if self.family_embed is not None else 0)
+        self.fusion_proj = nn.Linear(d_model * n_parts, d_model)
 
-    def forward(self, token_ids, modality_ids):
-        tok = self.token_embed(token_ids)
-        mod = self.modality_embed(modality_ids)
-        h = self.fusion_proj(torch.cat([tok, mod], dim=-1))
-        return h
+    def forward(self, token_ids, family_ids=None):
+        parts = [self.token_embed(token_ids)]
+        if self.family_embed is not None:
+            if family_ids is None:
+                family_ids = torch.zeros_like(token_ids)
+            parts.append(self.family_embed(family_ids))
+        if len(parts) == 1:
+            return parts[0]
+        return self.fusion_proj(torch.cat(parts, dim=-1))
 
 
 class OutputHead(nn.Module):
-    def __init__(self, embedding: KairosEmbedding):
+    """Predicts the token stream; optionally an auxiliary octet-family id too (see below)."""
+
+    def __init__(self, embedding: KairosEmbedding, num_octet_families: int = 0):
         super().__init__()
         d_model = embedding.token_embed.embedding_dim
         self.vocab_size = embedding.token_embed.num_embeddings
-        self.num_modalities = embedding.modality_embed.num_embeddings
         self.token_head = nn.Linear(d_model, self.vocab_size, bias=False)
-        self.modality_head = nn.Linear(d_model, self.num_modalities, bias=False)
         self.token_head.weight = embedding.token_embed.weight
-        self.modality_head.weight = embedding.modality_embed.weight
+        self.octet_head = nn.Linear(d_model, num_octet_families) if num_octet_families > 0 else None
 
     def forward(self, h):
-        return self.token_head(h), self.modality_head(h)
+        token_logits = self.token_head(h)
+        octet_logits = self.octet_head(h) if self.octet_head is not None else None
+        return token_logits, octet_logits
 
 
 class KairosScaleRouter(nn.Module):
@@ -402,58 +422,121 @@ class CodecOutput:
     length: int
 
 
-class PyramidalConvCodec(nn.Module):
-    """Parallel multi-scale convolutional codec with modality routing."""
+class PyramidalCodec(nn.Module):
+    """Multi-scale encode/decode: mode='patch' (nn.Linear per scale) or 'conv' (cuDNN, faster)."""
 
-    def __init__(self, d_model, stride=5, num_scales=4):
+    def __init__(self, d_model, stride=5, num_scales=4, mode="patch", norm_eps=1e-6, mixer_rank=None):
         super().__init__()
+        assert mode in ("patch", "conv"), f"mode must be 'patch' or 'conv', got {mode!r}"
         self.stride = stride
         self.num_scales = num_scales
-        self.encoders = nn.ModuleList()
-        self.decoders = nn.ModuleList()
-        for level in range(num_scales):
-            scale_stride = stride ** (level + 1)
-            kernel_size = scale_stride // 2
-            kernel_size += kernel_size % 2 == 0
-            padding = kernel_size // 2
-            self.encoders.append(
-                nn.Conv1d(
-                    d_model, d_model, kernel_size=kernel_size, stride=scale_stride, padding=padding, groups=d_model
-                )
-            )
-            self.decoders.append(
-                nn.ConvTranspose1d(
-                    d_model,
-                    d_model,
-                    kernel_size=kernel_size,
-                    stride=scale_stride,
-                    padding=padding,
-                    output_padding=max(scale_stride - 1, 0),
-                    groups=d_model,
-                )
-            )
-        self.norm = KairosNorm(d_model * num_scales)
+        self.mode = mode
+        self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
+        # bottleneck mixer: O(2*r*d) instead of a dense 1x1 conv's O(d^2), same full mixing
+        self.mixer_rank = mixer_rank if mixer_rank is not None else max(8, d_model // 4)
+
+        if mode == "patch":
+            self._init_patch(d_model)
+        else:
+            self._init_conv(d_model)
+
+        self.norm = KairosNorm(d_model * num_scales, eps=norm_eps)
         self.fusion = nn.Linear(d_model * num_scales, d_model)
 
+    def _init_patch(self, d_model):
+        """Linear(patch*d_model, d_model) per scale; decode reuses the same weight, transposed."""
+        self.encode_lin = nn.ModuleList(
+            nn.Linear(patch * d_model, d_model) for patch in self.patch_sizes
+        )
+        self.decode_b = nn.ParameterList(
+            nn.Parameter(torch.zeros(patch * d_model)) for patch in self.patch_sizes
+        )
+
+    def _make_bottleneck_mixer(self, d_model):
+        """Rank-r channel mixer: full mixing at O(2rd) not O(d^2); GELU keeps a real bottleneck."""
+        r = self.mixer_rank
+        return nn.Sequential(
+            nn.Conv1d(d_model, r, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv1d(r, d_model, kernel_size=1, bias=True),
+        )
+
+    def _init_conv(self, d_model):
+        """Depthwise conv encoder + bottleneck mixer; decoder mirrors this."""
+        self.encoders = nn.ModuleList()
+        self.mixers = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        self.decode_mixers = nn.ModuleList()
+        for patch in self.patch_sizes:
+            self.encoders.append(
+                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
+            )
+            self.mixers.append(self._make_bottleneck_mixer(d_model))
+            # depthwise transpose conv: O(patch*d_model), not O(patch*d_model^2) for a dense decoder
+            self.decoders.append(
+                nn.ConvTranspose1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
+            )
+            self.decode_mixers.append(self._make_bottleneck_mixer(d_model))
+
+    @staticmethod
+    def _pad_to_multiple(x, patch):
+        length = x.shape[1]
+        remainder = length % patch
+        return F.pad(x, (0, 0, 0, patch - remainder)) if remainder else x
+
     def encode(self, x):
-        h = x.transpose(1, 2)
-        scales = [encoder(h).transpose(1, 2) for encoder in self.encoders]
-        return CodecOutput(scales=scales, length=x.shape[1])
+        length = x.shape[1]
+        if self.mode == "patch":
+            return self._encode_patch(x, length)
+        return self._encode_conv(x, length)
+
+    def _encode_patch(self, x, length):
+        scales = []
+        for patch, lin in zip(self.patch_sizes, self.encode_lin):
+            padded = self._pad_to_multiple(x, patch)
+            batch, padded_len, d_model = padded.shape
+            grouped = padded.reshape(batch, padded_len // patch, patch * d_model)
+            scales.append(lin(grouped))
+        return CodecOutput(scales=scales, length=length)
+
+    def _encode_conv(self, x, length):
+        scales = []
+        for patch, encoder, mixer in zip(self.patch_sizes, self.encoders, self.mixers):
+            padded = self._pad_to_multiple(x, patch)
+            h = padded.transpose(1, 2)        # (B,D,L)
+            h = encoder(h)                     # (B,D,G)
+            h = mixer(h)                       # (B,D,G)
+            scales.append(h.transpose(1, 2))   # (B,G,D)
+        return CodecOutput(scales=scales, length=length)
 
     def decode(self, encoded):
-        scales = encoded.scales
         length = encoded.length
+        if self.mode == "patch":
+            return self._decode_patch(encoded, length)
+        return self._decode_conv(encoded, length)
+
+    def _decode_patch(self, encoded, length):
         reconstructed = []
-        for scale, decoder in zip(scales, self.decoders):
-            h = decoder(scale.transpose(1, 2))
-            reconstructed.append(h.transpose(1, 2))
-        padded = []
-        for r in reconstructed:
-            if r.shape[1] < length:
-                pad_amount = length - r.shape[1]
-                r = F.pad(r.transpose(1, 2), (0, pad_amount), mode="replicate").transpose(1, 2)
-            padded.append(r[:, :length])
-        h = torch.cat(padded, dim=-1)
+        for idx, (scale, patch) in enumerate(zip(encoded.scales, self.patch_sizes)):
+            lin, decode_b = self.encode_lin[idx], self.decode_b[idx]
+            # tied weights: same Linear, transposed (F.linear -> addmm).
+            expanded = F.linear(scale, lin.weight.t(), decode_b)
+            expanded = expanded.reshape(expanded.shape[0], -1, lin.in_features // patch)
+            if expanded.shape[1] < length:
+                expanded = F.pad(expanded, (0, 0, 0, length - expanded.shape[1]))
+            reconstructed.append(expanded[:, :length])
+        h = torch.cat(reconstructed, dim=-1)
+        h = self.norm(h)
+        return self.fusion(h)
+
+    def _decode_conv(self, encoded, length):
+        reconstructed = []
+        for scale, decoder, mixer, patch in zip(encoded.scales, self.decoders, self.decode_mixers, self.patch_sizes):
+            h = scale.transpose(1, 2)   # (B,D,G)
+            h = decoder(h)              # (B,D,G*patch) — depthwise, expands the length dim only
+            h = mixer(h)                # (B,D,L) — bottleneck mixer, O(2*r*d) not O(d^2)
+            reconstructed.append(h.transpose(1, 2)[:, :length])  # (B,L,D)
+        h = torch.cat(reconstructed, dim=-1)
         h = self.norm(h)
         return self.fusion(h)
 
@@ -461,24 +544,39 @@ class PyramidalConvCodec(nn.Module):
 @dataclass
 class KairosOutput(CausalLMOutputWithPast):
     encoder_last_hidden_state: torch.FloatTensor = None
-    modality_logits: torch.FloatTensor = None
+    octet_logits: torch.FloatTensor = None
 
 
 class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
-    def __init__(self, config, vocab_size=None, use_moe=None):
+    def __init__(self, config, vocab_size=None, num_octet_families=None, use_moe=None):
         super().__init__(config)
         if use_moe is None:
             use_moe = config.use_moe
-        self.codec = PyramidalConvCodec(d_model=config.hidden_size, stride=config.stride, num_scales=config.num_scales)
+        self.codec = PyramidalCodec(
+            d_model=config.hidden_size,
+            stride=config.stride,
+            num_scales=config.num_scales,
+            mode=config.codec_mode,
+            norm_eps=config.rms_norm_eps,
+            mixer_rank=getattr(config, "codec_mixer_rank", None),
+        )
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:
             vocab_size = config.vocab_size
+        if num_octet_families is None:
+            num_octet_families = config.num_octet_families
+        n_octet = num_octet_families if config.predict_octet_family else 0
         self.embedding = KairosEmbedding(
-            vocab_size=vocab_size, num_modalities=config.num_modalities, d_model=config.hidden_size
+            vocab_size=vocab_size, d_model=config.hidden_size, num_octet_families=n_octet
         )
-        self.backbones = nn.ModuleList(
-            [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
-        )
+        share = getattr(config, "share_backbones", False)
+        if share:
+            shared = KairosDiffusionBackbone(config=config, use_moe=use_moe)
+            self.backbones = nn.ModuleList([shared] * self.codec.num_scales)
+        else:
+            self.backbones = nn.ModuleList(
+                [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
+            )
         if getattr(config, "use_memory_gate", False):
             head_dim = config.hidden_size // config.num_attention_heads
             state_dim = config.num_attention_heads * head_dim * 2 * head_dim
@@ -486,8 +584,8 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         else:
             self.memory_gate = None
         self.rotary = KairosRotaryEmbedding(config, config.head_dim)
-        self.norm = KairosNorm(config.hidden_size)
-        self.lm_head = OutputHead(self.embedding)
+        self.norm = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = OutputHead(self.embedding, num_octet_families=n_octet)
         self.post_init()  # triggers _init_weights on every submodule/parameter
 
     def _init_weights(self, module):
@@ -505,9 +603,11 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         input_ids=None,
         decoder_input_ids=None,
         modality_ids=None,
+        family_ids=None,
         attention_mask=None,
         self_conditioning_logits=None,
         cache_params=None,
+        logits_mask=None,
         **kwargs,
     ):
         x = decoder_input_ids if decoder_input_ids is not None else input_ids
@@ -515,7 +615,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
             raise ValueError("either input_ids or decoder_input_ids must be provided")
         if modality_ids is None:
             modality_ids = torch.full_like(x, self.config.text_modality_id)
-        h = self.embedding(token_ids=x, modality_ids=modality_ids)
+        h = self.embedding(token_ids=x, family_ids=family_ids)
         if self_conditioning_logits is not None:
             probs = torch.softmax(self_conditioning_logits, dim=-1)
             h = h + (probs @ self.embedding.token_embed.weight).to(h.dtype)
@@ -545,5 +645,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         decoded = CodecOutput(scales=features, length=encoded.length)
         h = self.codec.decode(decoded)
         h = self.norm(h)
-        token_logits, modality_logits = self.lm_head(h)
-        return KairosOutput(logits=token_logits, modality_logits=modality_logits, past_key_values=cache_params)
+        # heads cost scales with vocab_size, so restrict to logits_mask positions when given
+        h = h[logits_mask] if logits_mask is not None else h
+        token_logits, octet_logits = self.lm_head(h)
+        return KairosOutput(logits=token_logits, octet_logits=octet_logits, past_key_values=cache_params)

@@ -1,17 +1,31 @@
+import array
 import io
 import json
 import random
+import uuid
 import warnings
 
 import numpy as np
 import torch
 from datasets import Dataset as HFDataset
-from datasets import concatenate_datasets, get_dataset_config_names, load_dataset
+from datasets import Features, Sequence, Value, concatenate_datasets, get_dataset_config_names, load_dataset
 from torch.utils.data import Dataset
 
-from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
+from .tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 MAX_LEN = 3 * 2048
+
+# explicit schema for _build_multimodal: lets from_generator build a (possibly empty)
+# dataset without inferring types from a first row, and gives a stable column order.
+_MULTIMODAL_FEATURES = Features(
+    {
+        "input_ids": Sequence(Value("int64")),
+        "modality_ids": Sequence(Value("int64")),
+        "octet_family_ids": Sequence(Value("int64")),
+        "mask": Sequence(Value("int64")),
+        "prompt_len": Value("int64"),
+    }
+)
 
 
 class NonFiniteDataError(ValueError):
@@ -75,32 +89,44 @@ class KairosPretrainingDataset(Dataset):
         self.ds = self.ds.map(self.preprocess, batched=True, remove_columns=self.ds.column_names)
         self.ds.set_format("torch")
 
-    def _chunk(self, token_ids, modality_ids):
-        """Fixed-length windowing shared by text and multimodal, padded to self.target_len."""
+    def _chunk(self, token_ids, modality_ids, family_ids):
+        """Fixed-length windowing shared by text and multimodal, padded to self.target_len.
+
+        token_ids/modality_ids/family_ids may be plain lists or array.array — always
+        materialize the final chunk as a plain list, since that's what pyarrow/torch
+        expect downstream and a single target_len-sized list is cheap either way.
+        """
         for i in range(0, len(token_ids), self.max_len):
-            ids_chunk = token_ids[i : i + self.max_len]
-            mod_chunk = modality_ids[i : i + self.max_len]
+            ids_chunk = list(token_ids[i : i + self.max_len])
+            mod_chunk = list(modality_ids[i : i + self.max_len])
+            fam_chunk = list(family_ids[i : i + self.max_len])
             pad_len = self.target_len - len(ids_chunk)
-            ids_chunk = ids_chunk + [self.tokenizer.pad_token_id] * pad_len
-            mod_chunk = mod_chunk + [int(Modality.TEXT)] * pad_len
+            ids_chunk += [self.tokenizer.pad_token_id] * pad_len
+            mod_chunk += [int(Modality.TEXT)] * pad_len
+            fam_chunk += [0] * pad_len
             mask = [1] * (len(ids_chunk) - pad_len) + [0] * pad_len
-            yield ids_chunk, mod_chunk, mask
+            yield ids_chunk, mod_chunk, fam_chunk, mask
 
     def _collect_chunks(self, chunk_sources):
-        """Run each (ids, modality_ids) pair through self._chunk and flatten into three lists;."""
-        all_input_ids, all_modality_ids, all_masks = [], [], []
+        """Run each (ids, modality_ids, family_ids) triple through self._chunk and flatten.
+
+        Yields one chunk at a time instead of building giant Python lists in RAM —
+        callers should feed this straight into Dataset.from_generator.
+        """
         if self.pack:
-            packed_ids, packed_mods = [], []
-            for ids, mods in chunk_sources:
-                packed_ids += ids
-                packed_mods += mods
-            chunk_sources = [(packed_ids, packed_mods)]
-        for ids, mods in chunk_sources:
-            for ids_chunk, mod_chunk, mask in self._chunk(ids, mods):
-                all_input_ids.append(ids_chunk)
-                all_modality_ids.append(mod_chunk)
-                all_masks.append(mask)
-        return all_input_ids, all_modality_ids, all_masks
+            # "H" (uint16, 2 bytes) covers vocab sizes up to 65536 — plenty for 291.
+            # "B" (uint8, 1 byte) covers modality/family ids. Both are ~14-28x cheaper
+            # than a Python int per element, which is what a plain list stores.
+            packed_ids = array.array("H")
+            packed_mods = array.array("B")
+            packed_fams = array.array("B")
+            for ids, mods, fams in chunk_sources:
+                packed_ids.extend(ids)
+                packed_mods.extend(mods)
+                packed_fams.extend(fams)
+            chunk_sources = [(packed_ids, packed_mods, packed_fams)]
+        for ids, mods, fams in chunk_sources:
+            yield from self._chunk(ids, mods, fams)
 
     def preprocess(self, examples):
         prompts = examples.get("prompt", [""] * len(examples["text"]))
@@ -115,12 +141,20 @@ class KairosPretrainingDataset(Dataset):
                 tokens = self.tokenizer.encode(merged, add_special_tokens=False)
                 if not tokens:
                     continue
-                yield tokens, [int(Modality.TEXT)] * len(tokens)
+                yield tokens, [int(Modality.TEXT)] * len(tokens), [0] * len(tokens)
 
-        all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
+        # still one batch's worth at a time (this runs inside ds.map(batched=True)),
+        # so materializing here is fine — arrow already chunks across batches.
+        all_input_ids, all_modality_ids, all_family_ids, all_masks = [], [], [], []
+        for ids_chunk, mod_chunk, fam_chunk, mask in self._collect_chunks(sources()):
+            all_input_ids.append(ids_chunk)
+            all_modality_ids.append(mod_chunk)
+            all_family_ids.append(fam_chunk)
+            all_masks.append(mask)
         return {
             "input_ids": all_input_ids,
             "modality_ids": all_modality_ids,
+            "octet_family_ids": all_family_ids,
             "mask": all_masks,
             "prompt_len": [0] * len(all_input_ids),
         }
@@ -173,14 +207,16 @@ class KairosPretrainingDataset(Dataset):
             return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"]))]
 
         if modality == "imu":
-            # flattened 1D signal, reuses the audio encoder
             flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
-            return [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_audio(flat))]
+            markers = KairosTokenizer.encode_signal(flat, family="STA")
+            return [MultimodalSegment(Modality.STATE, markers)]
 
         if modality == "control":
             sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
-            action_markers = KairosTokenizer.encode_audio(arrays["action"], tick_samples=sample_rate)
-            state_markers = KairosTokenizer.encode_audio(arrays["state"], tick_samples=sample_rate)
+            action = arrays["action"]
+            state = arrays["state"]
+            action_markers = KairosTokenizer.encode_signal(action, family="ACT", tick_samples=sample_rate)
+            state_markers = KairosTokenizer.encode_signal(state, family="STA", tick_samples=sample_rate)
             segments = []
             if caption:
                 segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
@@ -192,28 +228,74 @@ class KairosPretrainingDataset(Dataset):
         if self.tokenizer is None:
             self.tokenizer = KairosTokenizer()
 
+        skip_messages = []  # populated during iteration, warned about after (see below)
+
         def sources():
-            skipped = 0
             for ex in examples:
                 try:
                     segments = self._segments_for(ex)
                 except NonFiniteDataError as e:
-                    skipped += 1
-                    warnings.warn(f"skipping corrupt example ({e}); {skipped} skipped so far", stacklevel=2)
+                    skip_messages.append(str(e))
                     continue
                 encoded = self.tokenizer.encode_multimodal(segments)
-                yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist()
+                yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist(), encoded[
+                    "octet_family_ids"
+                ].tolist()
 
-        all_input_ids, all_modality_ids, all_masks = self._collect_chunks(sources())
-        self.ds = HFDataset.from_dict(
-            {
-                "input_ids": all_input_ids,
-                "modality_ids": all_modality_ids,
-                "mask": all_masks,
-                "prompt_len": [0] * len(all_input_ids),
-            }
-        )
+        def rows():
+            # one dict per row, streamed straight to the arrow writer — nothing
+            # accumulates for the full dataset in Python memory at any point.
+            for ids_chunk, mod_chunk, fam_chunk, mask in self._collect_chunks(sources()):
+                yield {
+                    "input_ids": ids_chunk,
+                    "modality_ids": mod_chunk,
+                    "octet_family_ids": fam_chunk,
+                    "mask": mask,
+                    "prompt_len": 0,
+                }
+
+        # writer_batch_size caps how many rows sit in the arrow write buffer at once
+        # (default is 1000, already reasonable, but explicit here since it's the knob
+        # to turn down further if RAM is still tight with very long/heavy sequences).
+        # An explicit schema (features=) lets this succeed even when every example is
+        # skipped (zero rows) — from_generator can't infer a schema from nothing.
+        try:
+            # from_generator caches its output to disk keyed by a fingerprint of the generator
+            # function, and a second call with a similarly-shaped generator can silently reuse
+            # that cache — skipping our generator entirely (so any skip-warnings never fire,
+            # and any dataset-construction-time errors never surface) while still returning a
+            # dataset that looks fine. A dataset is rebuilt from live Python examples every time
+            # this is called, so a stale cache hit is never correct here — force a fresh
+            # fingerprint each call. Do NOT set keep_in_memory=True to "solve" this: that forces
+            # the whole table into a real in-process buffer instead of the memory-mapped file
+            # backing from_generator uses by default, which defeats the entire point of
+            # streaming this through the writer in the first place on any real-sized dataset.
+            self.ds = HFDataset.from_generator(
+                rows, features=_MULTIMODAL_FEATURES, writer_batch_size=256, fingerprint=uuid.uuid4().hex
+            )
+        except ValueError as e:
+            # from_generator can still fail on a truly empty stream even with an explicit
+            # schema (no arrow shard gets written at all) — build the empty dataset directly.
+            if "corresponds to no data" in str(e):
+                self.ds = HFDataset.from_dict(
+                    {"input_ids": [], "modality_ids": [], "octet_family_ids": [], "mask": [], "prompt_len": []},
+                    features=_MULTIMODAL_FEATURES,
+                )
+            else:
+                raise
+        except Exception as e:
+            # datasets wraps generator errors in DatasetGenerationError — surface the
+            # original exception (e.g. the ValueError from an unknown modality) instead.
+            cause = e.__cause__ or e.__context__
+            if isinstance(cause, ValueError):
+                raise cause from None
+            raise
         self.ds.set_format("torch")
+
+        # warn here, not inside sources(): warnings emitted from within the generator
+        # that from_generator consumes don't reliably propagate to the caller.
+        for i, msg in enumerate(skip_messages, 1):
+            warnings.warn(f"skipping corrupt example ({msg}); {i} skipped so far", stacklevel=2)
 
     def __getitem__(self, idx):
         return self.ds[idx]

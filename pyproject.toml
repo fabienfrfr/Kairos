@@ -40,12 +40,17 @@ Homepage = "https://github.com/fabienfrfr/Kairos"
 Repository = "https://github.com/fabienfrfr/Kairos"
 
 [project.optional-dependencies]
-# `pip install -e ".[notebook]"` — everything notebook/kairos_multimodal_training.py needs on a bare Colab/Kaggle
+# `pip install -e ".[notebook]"` — everything the notebook needs on a bare Colab/Kaggle
 notebook = [
     "marimo>=0.23.9",
     "matplotlib>=3.10.0",
     "pandas>=2.0",
     "tqdm>=4.67.0",
+]
+# fused Triton/CUDA kernels for KairosGatedDeltaNet; without this, falls back to slow pure-PyTorch
+fast-attn = [
+    "flash-linear-attention[cuda]>=0.5.1",
+    "causal-conv1d>=1.4.0",
 ]
 
 
@@ -58,7 +63,7 @@ kairos = ["templates/*.md"]
 
 [tool.setuptools_scm]
 version_file = "kairos/_version.py"
-fallback_version = "0.1.1.dev0"  # editable/no-git-history installs (e.g. this sandbox's rebuilt checkout)
+fallback_version = "0.2.0.dev0"  # editable/no-git-history installs (this sandbox's checkout)
 local_scheme = "no-local-version"
 
 [tool.pytest.ini_options]

@@ -17,7 +17,7 @@ def make_config(canvas_length=32, use_memory_gate=False):
         n_heads=4,
         n_layers=4,
         stride=3,
-        vocab_size=291,
+        vocab_size=289,
         num_modalities=8,
         num_scales=4,
         modality_scales={m: [0] for m in range(8)},

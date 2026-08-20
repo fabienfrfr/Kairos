@@ -59,7 +59,7 @@ def all_kinds_examples(rng):
 def test_text_only_schema(tokenizer):
     ds = KairosPretrainingDataset(texts=["hello world"], tokenizer=tokenizer, max_len=64, stride=1)
     item = ds[0]
-    assert set(item.keys()) == {"input_ids", "modality_ids", "mask", "prompt_len"}
+    assert set(item.keys()) == {"input_ids", "modality_ids", "mask", "prompt_len", "octet_family_ids"}
     assert set(item["modality_ids"].tolist()) <= {int(Modality.TEXT)}
 
 
@@ -194,6 +194,49 @@ def test_all_nonfinite_multimodal_examples_yields_empty_dataset(tokenizer):
         ds = KairosPretrainingDataset(multimodal_examples=[bad], tokenizer=tokenizer, max_len=128, stride=1)
 
     assert len(ds) == 0
+
+
+def test_skip_warning_fires_on_every_call_not_just_the_first(tokenizer):
+    """Regression test: from_generator caches its output on disk keyed by a fingerprint of
+    the generator function. A stale cache hit would silently skip re-running our generator
+    on a second, similarly-shaped call — so the skip-warning (and any construction-time
+    error) would only ever fire once per process, not once per call, and the dataset build
+    itself could return silently-wrong content. This must hold across repeated calls."""
+    bad = make_example("lidar", points=np.full((32, 4), np.inf, dtype=np.float32))
+    good = make_example("lidar", points=np.random.uniform(-10, 10, (32, 4)).astype(np.float32))
+
+    for _ in range(3):
+        with pytest.warns(UserWarning, match="skipping corrupt example"):
+            ds = KairosPretrainingDataset(multimodal_examples=[bad, good], tokenizer=tokenizer, max_len=128, stride=1)
+        assert len(ds) > 0
+
+
+def test_large_multimodal_build_does_not_materialize_everything_in_process_memory(tokenizer):
+    """Regression test: _build_multimodal must stream rows into the arrow writer via a
+    memory-mapped file (the default for Dataset.from_generator), not load the whole table
+    into a real in-process buffer (keep_in_memory=True). RSS growth for a few thousand
+    multimodal examples should stay well under what fully materializing them would cost —
+    this is a coarse smoke check, not an exact bound, so it only needs to catch a gross
+    regression (e.g. keep_in_memory=True creeping back in), not tiny fluctuations."""
+    import resource
+
+    n_examples = 4000
+    examples = [
+        make_example("lidar", points=np.random.uniform(-10, 10, (64, 4)).astype(np.float32))
+        for _ in range(n_examples)
+    ]
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KB, peak-so-far
+    ds = KairosPretrainingDataset(multimodal_examples=examples, tokenizer=tokenizer, max_len=256, stride=1)
+    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    assert len(ds) > 0
+    # a fully in-memory (non-mmap) table for this many chunked+padded examples would grow
+    # RSS by tens to hundreds of MB; a properly streamed/mmap'd build should stay under ~50MB.
+    assert (rss_after - rss_before) / 1024 < 50, (
+        f"RSS grew {(rss_after - rss_before) / 1024:.1f} MB building {n_examples} examples — "
+        "looks like the dataset is being fully materialized in process memory instead of "
+        "streamed to a memory-mapped arrow file (check for a stray keep_in_memory=True)."
+    )
 
 
 def test_text_dataset_defaults_to_cosmopedia_when_no_texts_given(tokenizer, monkeypatch):

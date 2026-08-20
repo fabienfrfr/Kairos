@@ -4,8 +4,15 @@ import torch
 
 from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
 from kairos.modeling import KairosConfig, KairosDiffusionFM
+from kairos.pipeline import TrainConfig
 from kairos.tokenizer import KairosTokenizer
-from kairos.trainer import KairosDiffusionTrainer, compute_masked_diffusion_losses, make_diffusion_mask
+from kairos.trainer import (
+    KairosDiffusionTrainer,
+    anneal_mask_schedule,
+    compute_masked_diffusion_losses,
+    make_diffusion_mask,
+    stage_mask_schedule,
+)
 
 
 @pytest.fixture
@@ -80,6 +87,24 @@ def test_compute_loss_runs_end_to_end(dense_model, tokenizer):
     assert not torch.isnan(loss)
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in dense_model.parameters())
+
+
+def test_octet_family_loss_adds_to_total_when_configured(dense_model, tokenizer):
+    torch.manual_seed(0)
+    x0 = torch.randint(0, len(tokenizer), (2, 8))
+    batch = {
+        "input_ids": x0,
+        "modality_ids": torch.zeros_like(x0),
+        "mask": torch.ones_like(x0),
+        "prompt_len": torch.zeros(2, dtype=torch.long),
+    }
+    trainer = KairosDiffusionTrainer(model=dense_model)
+    torch.manual_seed(1)
+    loss_without = trainer.compute_loss(dense_model, batch)
+    batch["octet_family_ids"] = torch.zeros_like(x0)
+    torch.manual_seed(1)
+    loss_with = trainer.compute_loss(dense_model, batch)
+    assert not torch.allclose(loss_without, loss_with)
 
 
 def test_moe_plumbing_does_not_crash(model, tokenizer):
@@ -212,9 +237,9 @@ def test_compute_masked_diffusion_losses_reweight_true_divides_by_p(dense_model)
     p = torch.full_like(x0, fill_value=5, dtype=torch.float)  # p=5 everywhere (unrealistic but isolates the /p math)
 
     torch.manual_seed(0)  # same noise for both calls, otherwise /p math is masked by fresh noise draws
-    reweighted, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    reweighted, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
     torch.manual_seed(0)
-    plain, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+    plain, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
 
     assert torch.allclose(reweighted, plain / 5, atol=1e-5)
 
@@ -227,7 +252,7 @@ def test_compute_masked_diffusion_losses_reweight_false_is_plain_ce(dense_model)
     noise_mask[:, 2:5] = True
     p = torch.full_like(x0, fill_value=1e-3, dtype=torch.float)  # tiny p: /p would explode if reweight were on
 
-    plain, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+    plain, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
     assert torch.isfinite(plain).all()
     assert plain.max() < 50  # sane CE range for a small vocab, no 1/p blowup
 
@@ -239,8 +264,135 @@ def test_trainer_mask_p_max_and_reweight_default_to_full_diffusion(dense_model):
     assert trainer.mask_reweight is True
 
 
+# ----------------------------------------------------------- MAE/transition/diffusion curriculum
+def test_anneal_mask_schedule_zero_steps_returns_end_immediately():
+    """anneal_steps<=0 must reproduce the original hard-switch behaviour exactly."""
+    assert anneal_mask_schedule(step=0, anneal_steps=0, start=0.3, end=1.0) == 1.0
+    assert anneal_mask_schedule(step=999, anneal_steps=0, start=0.3, end=1.0) == 1.0
+
+
+def test_anneal_mask_schedule_linear_ramp_endpoints():
+    assert anneal_mask_schedule(step=0, anneal_steps=100, start=0.3, end=1.0) == pytest.approx(0.3)
+    assert anneal_mask_schedule(step=100, anneal_steps=100, start=0.3, end=1.0) == pytest.approx(1.0)
+    assert anneal_mask_schedule(step=50, anneal_steps=100, start=0.3, end=1.0) == pytest.approx(0.65)
+
+
+def test_anneal_mask_schedule_clamps_past_anneal_steps():
+    assert anneal_mask_schedule(step=500, anneal_steps=100, start=0.3, end=1.0) == pytest.approx(1.0)
+
+
+def test_anneal_mask_schedule_handles_decreasing_ramp():
+    """A ramp from a higher start to a lower end must also work, not just low->high."""
+    assert anneal_mask_schedule(step=50, anneal_steps=100, start=1.0, end=0.0) == pytest.approx(0.5)
+
+
+def test_stage_mask_schedule_flat_during_mae_phase():
+    p_max, reweight = stage_mask_schedule(
+        global_step=0, mae_steps=100, transition_steps=50, mae_p_max=0.3, mae_reweight=False,
+        target_p_max=1.0, target_reweight=True,
+    )
+    assert p_max == 0.3
+    assert reweight == 0.0
+    # still flat at the last MAE step (transition hasn't started yet)
+    p_max, reweight = stage_mask_schedule(99, 100, 50, 0.3, False, 1.0, True)
+    assert p_max == 0.3
+    assert reweight == 0.0
+
+
+def test_stage_mask_schedule_ramps_during_transition_phase():
+    # exactly at the MAE->transition boundary: ramp starts at the MAE value
+    p_max, reweight = stage_mask_schedule(100, 100, 50, 0.3, False, 1.0, True)
+    assert p_max == pytest.approx(0.3)
+    assert reweight == pytest.approx(0.0)
+    # halfway through the transition
+    p_max, reweight = stage_mask_schedule(125, 100, 50, 0.3, False, 1.0, True)
+    assert p_max == pytest.approx(0.65)
+    assert reweight == pytest.approx(0.5)
+
+
+def test_stage_mask_schedule_flat_at_target_during_diffusion_phase():
+    p_max, reweight = stage_mask_schedule(150, 100, 50, 0.3, False, 1.0, True)
+    assert p_max == pytest.approx(1.0)
+    assert reweight == pytest.approx(1.0)
+    # far beyond, still flat at target
+    p_max, reweight = stage_mask_schedule(10_000, 100, 50, 0.3, False, 1.0, True)
+    assert p_max == pytest.approx(1.0)
+    assert reweight == pytest.approx(1.0)
+
+
+def test_stage_mask_schedule_zero_transition_jumps_straight_to_target():
+    """transition_steps=0: no ramp — MAE phase, then immediately the diffusion target."""
+    p_max, reweight = stage_mask_schedule(99, 100, 0, 0.3, False, 1.0, True)
+    assert p_max == 0.3  # still MAE, one step before the boundary
+    p_max, reweight = stage_mask_schedule(100, 100, 0, 0.3, False, 1.0, True)
+    assert p_max == pytest.approx(1.0)  # jumped straight to target at the boundary
+    assert reweight == pytest.approx(1.0)
+
+
+def test_stage_mask_schedule_zero_mae_steps_starts_in_transition_immediately():
+    """mae_steps=0: no flat MAE phase — the ramp (or target, if transition_steps=0 too) starts
+    from step 0."""
+    p_max, reweight = stage_mask_schedule(0, 0, 100, 0.3, False, 1.0, True)
+    assert p_max == pytest.approx(0.3)
+    p_max, reweight = stage_mask_schedule(50, 0, 100, 0.3, False, 1.0, True)
+    assert p_max == pytest.approx(0.65)
+
+
+def test_compute_masked_diffusion_losses_reweight_accepts_float_alpha(dense_model):
+    """reweight is now a continuous blend in [0, 1], not just a bool — this is what lets the
+    MAE->diffusion transition ramp the loss weighting instead of switching it instantly."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=5, dtype=torch.float)
+
+    torch.manual_seed(0)
+    plain, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=0.0)
+    torch.manual_seed(0)
+    half, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=0.5)
+    torch.manual_seed(0)
+    full, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=1.0)
+
+    # alpha blend must exactly match reweight=False at 0, reweight=True at 1, halfway at 0.5
+    assert torch.allclose(plain, plain)  # sanity: same noise draw, same base CE
+    expected_half = plain * (1.0 + 0.5 * (1.0 / 5 - 1.0))
+    assert torch.allclose(half, expected_half, atol=1e-5)
+    assert torch.allclose(full, plain / 5, atol=1e-5)
+
+
+def test_trainconfig_default_is_one_mae_one_transition_one_diffusion_epoch():
+    tc = TrainConfig(run_dir="unused")
+    assert (tc.mae_epochs, tc.transition_epochs, tc.diffusion_epochs) == (1, 1, 1)
+    assert tc.epochs == 3  # derived total, unchanged from the old flat default of 3
+
+
+def test_trainconfig_explicit_epochs_is_diffusion_only_no_mae_no_transition():
+    """epochs=N is deprecated sugar for diffusion_epochs=N with no MAE/transition stage — this is
+    what keeps every pre-existing `TrainConfig(epochs=N, ...)` call site behaving exactly as
+    before (immediate full mask_p_max/mask_reweight from step 0, no curriculum)."""
+    tc = TrainConfig(epochs=5, run_dir="unused")
+    assert (tc.mae_epochs, tc.transition_epochs, tc.diffusion_epochs) == (0, 0, 5)
+    assert tc.epochs == 5
+
+
+def test_trainconfig_epochs_override_wins_over_explicit_stage_epochs():
+    tc = TrainConfig(epochs=2, mae_epochs=3, transition_epochs=3, diffusion_epochs=3, run_dir="unused")
+    assert (tc.mae_epochs, tc.transition_epochs, tc.diffusion_epochs) == (0, 0, 2)
+
+
+def test_trainconfig_rejects_negative_stage_epochs():
+    with pytest.raises(ValueError):
+        TrainConfig(mae_epochs=-1, run_dir="unused")
+
+
+def test_trainconfig_rejects_all_zero_stage_epochs():
+    with pytest.raises(ValueError):
+        TrainConfig(mae_epochs=0, transition_epochs=0, diffusion_epochs=0, run_dir="unused")
+
+
 def test_trainer_mae_mode_runs_end_to_end(dense_model, tokenizer):
-    """Stage-1 MAE config (capped p_max, no reweighting) must train like any other compute_loss call."""
+    """Stage-1 MAE config (capped p_max, no reweighting) trains like any other compute_loss call."""
     torch.manual_seed(0)
     batch = _padded_batch(tokenizer)
     trainer = KairosDiffusionTrainer(model=dense_model)

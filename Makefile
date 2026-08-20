@@ -10,6 +10,9 @@ coverage: ## prod-level > 95%
 test: ## Run the test suite
 	uv run pytest -q
 
+converge: ## Converge tests (-s for stdout : take print)
+	uv run pytest tests/test_pipeline.py -k "converg" -v -s
+
 lint: ## Check code style
 	uv run ruff check .
 

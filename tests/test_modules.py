@@ -13,10 +13,10 @@ from kairos.modeling import (
     KairosDiffusionFM,
     KairosEmbedding,
     KairosMultiCache,
-    PyramidalConvCodec,
+    PyramidalCodec,
 )
 from kairos.tokenizer import KairosTokenizer
-from kairos.trainer import KairosDiffusionTrainer
+from kairos.trainer import KairosDiffusionTrainer, make_diffusion_mask
 
 
 @pytest.fixture
@@ -88,6 +88,32 @@ def config():
 def test_kairos_config(config):
     assert config.hidden_size == 32
     assert config.num_attention_heads == 4
+
+
+def test_kairos_config_friendly_aliases_match_hf_names():
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, window_size=64)
+    assert cfg.d_model == cfg.hidden_size == 32
+    assert cfg.n_heads == cfg.num_attention_heads == 4
+    assert cfg.n_layers == cfg.num_hidden_layers == 2
+    assert cfg.window_size == cfg.sliding_window_size == 64
+
+
+def test_kairos_config_save_pretrained_round_trip(tmp_path):
+    # regression: d_model/n_heads/n_layers/window_size used to silently revert to defaults on reload
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, window_size=64)
+    cfg.save_pretrained(tmp_path)
+    reloaded = KairosConfig.from_pretrained(tmp_path)
+    assert reloaded.hidden_size == 32
+    assert reloaded.num_attention_heads == 4
+    assert reloaded.num_hidden_layers == 2
+    assert reloaded.sliding_window_size == 64
+
+
+def test_kairos_config_modality_scales_default_clips_to_num_scales():
+    # with num_scales=2, scale indices 2/3 must never appear in the default modality_scales
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=2, num_modalities=3)
+    for scales in cfg.modality_scales.values():
+        assert all(s < 2 for s in scales)
 
 
 def test_n_routed_experts_stays_synced_with_num_local_experts():
@@ -201,19 +227,141 @@ def test_backbone_block_size_uneven_layers_no_nan():
 
 
 def test_token_embedding():
-    emb = KairosEmbedding(vocab_size=100, num_modalities=7, d_model=32)
+    emb = KairosEmbedding(vocab_size=100, d_model=32)
     x = torch.randint(0, 100, (2, 16))
-    m = torch.zeros_like(x)
-    y = emb(token_ids=x, modality_ids=m)
+    y = emb(token_ids=x)
     assert y.shape[0] == 2
 
 
+def test_token_embedding_with_octet_family_fuses_a_third_stream():
+    emb = KairosEmbedding(vocab_size=100, d_model=32, num_octet_families=5)
+    assert emb.family_embed is not None
+    x = torch.randint(0, 100, (2, 16))
+    fam = torch.randint(0, 5, (2, 16))
+    y = emb(token_ids=x, family_ids=fam)
+    assert y.shape == (2, 16, 32)
+
+
+def test_token_embedding_family_ids_defaults_to_zero_when_omitted():
+    emb = KairosEmbedding(vocab_size=100, d_model=32, num_octet_families=5)
+    x = torch.randint(0, 100, (2, 16))
+    with_zero_family = emb(token_ids=x, family_ids=torch.zeros_like(x))
+    with_no_family_arg = emb(token_ids=x)
+    assert torch.allclose(with_zero_family, with_no_family_arg)
+
+
 def test_codec_roundtrip():
-    codec = PyramidalConvCodec(32, stride=3)
+    codec = PyramidalCodec(32, stride=3)
     x = torch.randn(2, 16, 32)
     encoded = codec.encode(x)
     decoded = codec.decode(encoded)
     assert decoded.shape == x.shape
+
+
+def test_codec_roundtrip_length_not_a_multiple_of_any_patch():
+    # 16 isn't a multiple of any of stride**1..4 = 3, 9, 27, 81: exercises the padding path
+    # on every scale at once.
+    codec = PyramidalCodec(32, stride=3, num_scales=4)
+    x = torch.randn(2, 16, 32)
+    decoded = codec.decode(codec.encode(x))
+    assert decoded.shape == x.shape
+
+
+def test_codec_decode_has_no_zeroed_positions():
+    # regression: the old strided-conv codec left 2 out of every `stride` positions as a hard
+    # zero after decode (kernel narrower than stride at the finest scale). The linear
+    # patchify/unpatchify codec must give every position a real, nonzero contribution.
+    codec = PyramidalCodec(32, stride=3, num_scales=4)
+    x = torch.randn(2, 30, 32)
+    decoded = codec.decode(codec.encode(x))
+    per_position_norm = decoded.norm(dim=-1)
+    assert (per_position_norm > 1e-6).all()
+
+
+def test_codec_every_input_position_affects_every_output_position_in_its_patch():
+    # a real linear layer over the whole patch means each of the `patch` reconstructed
+    # positions has nonzero gradient w.r.t. every input position in that patch - unlike the
+    # old kernel=1 conv, where only 1-in-`patch` positions carried any signal at all.
+    codec = PyramidalCodec(4, stride=3, num_scales=1)
+    x = torch.randn(1, 3, 4, requires_grad=True)
+    decoded = codec.decode(codec.encode(x))
+    decoded[0, 1].sum().backward()
+    assert (x.grad.abs().sum(dim=-1) > 0).all()
+
+
+def test_codec_cost_is_quadratic_in_d_model():
+    # dense patch*d_model -> d_model Linear: params are O(patch * d_model^2), so doubling
+    # d_model should roughly quadruple the codec's param count (excluding norm/fusion).
+    small = PyramidalCodec(32, stride=3, num_scales=4)
+    big = PyramidalCodec(64, stride=3, num_scales=4)
+    n_small = sum(p.numel() for n, p in small.named_parameters() if not n.startswith(("norm", "fusion")))
+    n_big = sum(p.numel() for n, p in big.named_parameters() if not n.startswith(("norm", "fusion")))
+    assert 3 * n_small < n_big < 5 * n_small
+
+
+def test_codec_patch_tied_roundtrip():
+    tied = PyramidalCodec(32, stride=3, num_scales=2)
+    x = torch.randn(2, 16, 32)
+    assert tied.decode(tied.encode(x)).shape == x.shape
+
+
+def test_codec_patch_uses_nn_linear():
+    codec = PyramidalCodec(32, stride=3, num_scales=2)
+    assert all(isinstance(lin, torch.nn.Linear) for lin in codec.encode_lin)
+
+
+def test_codec_patch_decode_reuses_encode_weight_transposed():
+    codec = PyramidalCodec(8, stride=3, num_scales=1)
+    lin = codec.encode_lin[0]
+    x = torch.randn(1, 3, 8)
+    scale = codec.encode(x).scales[0]
+    expected = torch.nn.functional.linear(scale, lin.weight.t(), codec.decode_b[0])
+    decoded = codec._decode_patch(codec.encode(x), length=3)
+    assert torch.allclose(decoded, codec.fusion(codec.norm(expected.reshape(1, 3, 8))))
+
+
+def test_codec_conv_roundtrip():
+    codec = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    x = torch.randn(2, 16, 32)
+    encoded = codec.encode(x)
+    decoded = codec.decode(encoded)
+    assert decoded.shape == x.shape
+
+
+def test_codec_conv_no_zeroed_positions():
+    codec = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    x = torch.randn(2, 30, 32)
+    decoded = codec.decode(codec.encode(x))
+    per_position_norm = decoded.norm(dim=-1)
+    assert (per_position_norm > 1e-6).all()
+
+
+def test_codec_conv_gradient_flow():
+    codec = PyramidalCodec(4, stride=3, num_scales=1, mode="conv")
+    x = torch.randn(1, 3, 4, requires_grad=True)
+    decoded = codec.decode(codec.encode(x))
+    decoded[0, 1].sum().backward()
+    assert (x.grad.abs().sum(dim=-1) > 0).all()
+
+
+def test_codec_conv_has_fewer_params_than_patch():
+    """conv mode is depthwise (O(patch*d_model)); patch mode is dense (O(patch*d_model^2)),
+    so conv is the cheaper mode, especially at larger patch sizes."""
+    patch = PyramidalCodec(32, stride=3, num_scales=2)
+    conv = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    n_patch = sum(p.numel() for p in patch.parameters())
+    n_conv = sum(p.numel() for p in conv.parameters())
+    assert n_conv < n_patch
+
+
+def test_codec_conv_decoder_is_depthwise_not_dense():
+    """Guards against the O(patch*d_model^2) 1x1-conv decoder regression: a depthwise
+    ConvTranspose1d's params scale with d_model, not d_model^2."""
+    small = PyramidalCodec(32, stride=5, num_scales=1, mode="conv")
+    big = PyramidalCodec(64, stride=5, num_scales=1, mode="conv")
+    n_small = sum(p.numel() for p in small.decoders.parameters())
+    n_big = sum(p.numel() for p in big.decoders.parameters())
+    assert n_big < n_small * 3  # well under the 4x a dense (patch*d_model^2) decoder would give
 
 
 def test_kairos_model_init(config):
@@ -269,6 +417,82 @@ def test_kairos_model_forward_with_self_conditioning(config):
     assert out.logits.shape == (2, 16, 259)
 
 
+def test_kairos_model_forward_logits_mask_restricts_lm_head_to_selected_positions():
+    # training only ever needs logits at the noised positions; logits_mask must skip lm_head's
+    # (vocab-sized, so expensive) projection everywhere else instead of computing and discarding it
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 100, (2, 16))
+    mask = torch.zeros(2, 16, dtype=torch.bool)
+    mask[0, :3] = True
+    mask[1, 5:8] = True
+    out = model(input_ids=x, logits_mask=mask)
+    assert out.logits.shape == (mask.sum().item(), 100)
+
+
+def test_kairos_model_forward_logits_mask_matches_full_forward_at_those_positions():
+    # restricting to logits_mask must be a pure optimization: same numbers as a full forward, just fewer of them
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    model.eval()
+    x = torch.randint(0, 100, (2, 16))
+    mask = torch.zeros(2, 16, dtype=torch.bool)
+    mask[0, :3] = True
+    mask[1, 5:8] = True
+    with torch.no_grad():
+        full = model(input_ids=x).logits
+        restricted = model(input_ids=x, logits_mask=mask).logits
+    assert torch.allclose(full[mask], restricted, atol=1e-5)
+
+
+def test_octet_family_head_off_by_default_config_flag():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, predict_octet_family=False)
+    model = KairosDiffusionFM(cfg)
+    assert model.lm_head.octet_head is None
+    x = torch.randint(0, 100, (2, 8))
+    assert model(input_ids=x).octet_logits is None
+
+
+def test_octet_family_head_on_produces_logits_of_right_shape():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=5)
+    model = KairosDiffusionFM(cfg)
+    assert model.lm_head.octet_head is not None
+    x = torch.randint(0, 100, (2, 8))
+    out = model(input_ids=x)
+    assert out.octet_logits.shape == (2, 8, 5)
+
+
+def test_octet_family_head_respects_logits_mask_too():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=5)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 100, (2, 8))
+    mask = torch.zeros(2, 8, dtype=torch.bool)
+    mask[0, :2] = True
+    out = model(input_ids=x, logits_mask=mask)
+    assert out.octet_logits.shape == (2, 5)
+
+
+def test_forward_accepts_family_ids_and_uses_them_in_the_embedding():
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=5)
+    model = KairosDiffusionFM(cfg)
+    model.eval()
+    x = torch.randint(0, 100, (2, 8))
+    fam_a = torch.zeros_like(x)
+    fam_b = torch.full_like(x, 3)
+    with torch.no_grad():
+        out_a = model(input_ids=x, family_ids=fam_a).logits
+        out_b = model(input_ids=x, family_ids=fam_b).logits
+    assert not torch.allclose(out_a, out_b)  # family_ids must actually influence the output
+
+
+def test_num_octet_families_constructor_override_mirrors_vocab_size():
+    # symmetry with the vocab_size=None override: callers must be able to pass the correct
+    # tokenizer-derived value directly, without relying on (possibly stale) config defaults
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2, num_octet_families=999)
+    model = KairosDiffusionFM(cfg, num_octet_families=7)
+    assert model.lm_head.octet_head.out_features == 7
+
+
 def test_kairos_cache_get_ssm_cache_roundtrip(config):
     model = KairosDiffusionFM(config)
     cache = KairosMultiCache(config)
@@ -321,6 +545,51 @@ def test_diffusion_trainer_backward(config):
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.requires_grad]
     assert any(g is not None for g in grads)
+
+
+def test_model_overfits_a_tiny_batch_without_collapsing_to_noise(config):
+    # Convergence sanity check: on a handful of fixed, repeated sequences the model must both
+    # (a) drive the MAE-style loss well below the "predicting uniformly at random" baseline
+    # ln(vocab_size), and (b) end up with token-level accuracy clearly above chance - not just a
+    # lower loss from confidently-wrong-but-less-uniform logits. Kept small (dense FFN, no MoE,
+    # short sequences, few steps) so it stays fast in CI while still exercising the codec + full
+    # backbone + lm_head path end to end.
+    torch.manual_seed(0)
+    vocab = 64
+    seq_len = 12
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=vocab, num_modalities=2, use_moe=False)
+    model = KairosDiffusionFM(cfg, vocab_size=vocab)
+    trainer = KairosDiffusionTrainer(model=model)
+    trainer.mask_p_max = 0.3
+    trainer.mask_reweight = False
+
+    x0 = torch.randint(0, vocab, (4, seq_len))
+    prompt_len = torch.zeros(4, dtype=torch.long)
+    inputs = {"input_ids": x0, "prompt_len": prompt_len}
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    random_baseline = torch.log(torch.tensor(float(vocab)))
+    first_loss = None
+    for _ in range(220):
+        optimizer.zero_grad()
+        loss = trainer.compute_loss(model, inputs)
+        if first_loss is None:
+            first_loss = loss.item()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+    assert first_loss > random_baseline.item() * 0.5  # sanity: started near/above the chance floor
+    assert loss.item() < first_loss * 0.5  # meaningfully below where it started
+    assert loss.item() < random_baseline.item() * 0.5  # and well below "uniform guessing"
+
+    model.eval()
+    with torch.no_grad():
+        noise_mask, p = make_diffusion_mask(x0, prompt_len, eps=trainer.mask_eps, p_max=trainer.mask_p_max)
+        logits = model(decoder_input_ids=x0, modality_ids=torch.zeros_like(x0)).logits
+        preds = logits[noise_mask].argmax(dim=-1)
+        accuracy = (preds == x0[noise_mask]).float().mean().item()
+    assert accuracy > 3.0 / vocab  # clearly better than chance (1/vocab), not just lower CE
 
 
 def test_diffusion_trainer_applies_noise(config):
@@ -577,3 +846,57 @@ def test_model_diffusion_stability_with_cache(config):
     outs = [model(input_ids=x_m, cache_params=cache.clone()).logits for _ in range(5)]
     for o in outs[1:]:
         assert torch.allclose(outs[0], o, atol=1e-5)
+
+
+def test_share_backbones_reduces_param_count():
+    cfg_sep = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=False,
+    )
+    cfg_share = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=True,
+    )
+    model_sep = KairosDiffusionFM(cfg_sep, vocab_size=100)
+    model_share = KairosDiffusionFM(cfg_share, vocab_size=100)
+    n_sep = sum(p.numel() for p in model_sep.parameters())
+    n_share = sum(p.numel() for p in model_share.parameters())
+    assert n_share < n_sep
+    # shared must have exactly num_scales× fewer backbone params
+    n_backbone = sum(p.numel() for p in model_sep.backbones[0].parameters())
+    assert n_sep - n_share == n_backbone * (cfg_sep.num_scales - 1)
+
+
+def test_share_backbones_forward_output_shape():
+    cfg = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=True,
+    )
+    model = KairosDiffusionFM(cfg, vocab_size=100)
+    x = torch.randint(0, 100, (2, 16))
+    out = model(input_ids=x)
+    assert out.logits.shape == (2, 16, 100)
+    assert not torch.isnan(out.logits).any()
+
+
+def test_share_backbones_backward():
+    cfg = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        share_backbones=True,
+    )
+    model = KairosDiffusionFM(cfg, vocab_size=100)
+    x = torch.randint(0, 100, (2, 8))
+    out = model(input_ids=x)
+    out.logits.mean().backward()
+    grads = [p.grad for p in model.parameters() if p.requires_grad]
+    assert any(g is not None for g in grads)
+
+
+def test_share_backbones_all_scales_use_same_module():
+    cfg = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=4, num_modalities=2,
+        share_backbones=True,
+    )
+    model = KairosDiffusionFM(cfg, vocab_size=100)
+    for i in range(1, len(model.backbones)):
+        assert model.backbones[i] is model.backbones[0]

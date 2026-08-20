@@ -39,7 +39,7 @@ def sample_lidar():
 
 # ========================= Vocab / backward compatibility =========================
 def test_vocab_size_is_291(tokenizer):
-    """Regression: KairosTokenizer forces extra_ids=0 and adds exactly 32 special tokens to the."""
+    """Regression: 259 base bytes/specials + 30 modality/channel/structural tags == 289 (+SEP+MASK=291)."""
     assert len(tokenizer) == 291
 
 
@@ -50,6 +50,61 @@ def test_no_native_bos(tokenizer):
 def test_byte_offset_contiguous(tokenizer):
     assert tokenizer.convert_tokens_to_ids(chr(0)) == tokenizer._byte_offset
     assert tokenizer.convert_tokens_to_ids(chr(255)) == tokenizer._byte_offset + 255
+
+
+def test_byte_value_ids_are_shared_across_modalities(tokenizer):
+    # by design: the *value* vocab is small and shared: a byte value 200 gets the same id whether
+    # it's a text byte, an image R byte, or an audio hi byte - only octet_family_ids disambiguates
+    ids = tokenizer._bytes_to_ids(bytes(range(256)))
+    assert len(set(ids)) == 256
+
+
+def test_place_value_bytes_use_distinct_families_not_a_duplicated_one(tokenizer):
+    # the hi and lo byte of a 16-bit sample must get distinct family ids (e.g. "LLRR" -> distinct
+    # L1/L2/R1/R2 families, not the same "L"/"R" family repeated)
+    markers = KairosTokenizer.encode_audio(np.zeros(4, dtype=np.float32), tick_samples=4)
+    _, families = tokenizer._resolve_markers(markers)
+    byte_families = [f for f in families if f != 0]
+    assert byte_families[0] != byte_families[1]  # hi byte family != lo byte family
+
+
+def test_rgb_channels_use_distinct_families(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image[:1])  # single row: R,G,B,R,G,B,...
+    _, families = tokenizer._resolve_markers(markers)
+    row_families = families[: sample_image.shape[1] * 3]
+    assert row_families[0:3] == list(dict.fromkeys(row_families[0:3]))  # R,G,B all distinct
+    assert len(set(row_families[0:3])) == 3
+
+
+def test_action_and_state_use_disjoint_families(tokenizer):
+    # action and state are semantically different control channels, must not share a family either
+    act_markers = KairosTokenizer.encode_signal(np.zeros(2, dtype=np.float32), family="ACT")
+    sta_markers = KairosTokenizer.encode_signal(np.zeros(2, dtype=np.float32), family="STA")
+    _, act_families = tokenizer._resolve_markers(act_markers)
+    _, sta_families = tokenizer._resolve_markers(sta_markers)
+    act_family_set = {f for f in act_families if f}
+    sta_family_set = {f for f in sta_families if f}
+    assert act_family_set.isdisjoint(sta_family_set)
+
+
+def test_signal_roundtrip_precision_beats_8bit(tokenizer):
+    # 16-bit place-value quantization must resolve a step far finer than the old 8-bit scheme
+    rng = np.random.default_rng(0)
+    values = rng.uniform(-1, 1, 200).astype(np.float32)
+    markers = KairosTokenizer.encode_signal(values, family="ACT")
+    ids, _ = tokenizer._resolve_markers(markers)
+    recon = tokenizer.decode_signal(ids)
+    assert np.max(np.abs(recon - values)) < (2 / 255)  # much tighter than the old 8-bit step
+
+
+def test_signal_and_audio_share_the_small_value_vocab_but_not_family(tokenizer):
+    # values are shared (that's the point - small vocab); family is what disambiguates them
+    values = np.zeros(4, dtype=np.float32)
+    signal_ids, signal_families = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values, family="ACT"))
+    audio_ids, audio_families = tokenizer._resolve_markers(KairosTokenizer.encode_audio(values))
+    byte_signal_families = [f for f in signal_families if f != 0]
+    byte_audio_families = [f for f in audio_families if f != 0]
+    assert set(byte_signal_families).isdisjoint(byte_audio_families)
 
 
 def test_plain_text_encode_decode_unchanged(tokenizer):
@@ -89,7 +144,7 @@ def test_image_roundtrip(tokenizer, sample_image):
 def test_image_endline_every_row(tokenizer, sample_image):
     """The whole point of the design: <ENDLINE> recurs locally, every W*C tokens,."""
     markers = KairosTokenizer.encode_image(sample_image)
-    ids = tokenizer._resolve_markers(markers)
+    ids, _ = tokenizer._resolve_markers(markers)
     endline_positions = [i for i, tid in enumerate(ids) if tid == tokenizer._endline_id]
     h, w, c = sample_image.shape
     assert len(endline_positions) == h
@@ -126,7 +181,7 @@ def test_video_roundtrip_with_stride(tokenizer, sample_video):
 
 def test_video_endframe_count_matches_num_frames(tokenizer, sample_video):
     markers = KairosTokenizer.encode_video(sample_video)
-    ids = tokenizer._resolve_markers(markers)
+    ids, _ = tokenizer._resolve_markers(markers)
     num_endframes = sum(1 for tid in ids if tid == tokenizer._endframe_id)
     assert num_endframes == sample_video.shape[0]
 
@@ -155,12 +210,13 @@ def test_audio_roundtrip_and_duration(tokenizer, sample_audio):
     recon, duration = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
     assert len(recon) == len(sample_audio)
     assert duration == pytest.approx(len(sample_audio) / KairosTokenizer.AUDIO_SAMPLE_RATE)
-    assert np.max(np.abs(recon - sample_audio)) < 1 / 127.5 + 1e-6
+    max_step = 2 / (256**2 - 1)  # 16-bit place-value quantization over [-1, 1]
+    assert np.max(np.abs(recon - sample_audio)) < max_step + 1e-6
 
 
 def test_audio_tick_count(tokenizer, sample_audio):
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
-    ids = tokenizer._resolve_markers(markers)
+    ids, _ = tokenizer._resolve_markers(markers)
     num_ticks = sum(1 for tid in ids if tid == tokenizer._tick_id)
     assert num_ticks == -(-len(sample_audio) // 16_000)  # ceil division
 
@@ -174,7 +230,7 @@ def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     assert recon.shape == sample_lidar.shape
     # quantization step over the fixed xyz range
     xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
-    max_step = (xyz_hi - xyz_lo) / 255
+    max_step = (xyz_hi - xyz_lo) / (256**2 - 1)  # 16-bit place-value quantization
     assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
 
 
@@ -231,7 +287,7 @@ def test_image_decode_rejects_stream_with_no_endline(tokenizer):
 
 def test_image_decode_rejects_width_not_divisible_by_channels(tokenizer, sample_image):
     markers = KairosTokenizer.encode_image(sample_image)
-    ids = tokenizer._resolve_markers(markers)
+    ids, _ = tokenizer._resolve_markers(markers)
     with pytest.raises(ValueError, match="not divisible by channels"):
         tokenizer.decode_image(ids, channels=5)
 
@@ -249,7 +305,7 @@ def test_video_decode_rejects_stream_with_no_endframe(tokenizer):
 
 def test_video_decode_keeps_trailing_frame_without_final_endframe_marker(tokenizer, sample_video):
     markers = KairosTokenizer.encode_video(sample_video)
-    ids = tokenizer._resolve_markers(markers)
+    ids, _ = tokenizer._resolve_markers(markers)
     ids_no_trailing_marker = ids[:-1]  # drop the last <ENDFRAME>
     frames, _ = tokenizer.decode_video(ids_no_trailing_marker)
     assert frames.shape[0] == sample_video.shape[0]
@@ -263,15 +319,15 @@ def test_encode_audio_rejects_bad_dtype():
 
 def test_audio_decode_keeps_trailing_samples_without_final_tick_marker(tokenizer, sample_audio):
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=4000)
-    ids = tokenizer._resolve_markers(markers)
+    ids, _ = tokenizer._resolve_markers(markers)
     ids_no_trailing_marker = ids[:-1]  # drop the last <TICK>
     waveform, _ = tokenizer.decode_audio(ids_no_trailing_marker)
     assert waveform.shape[0] == sample_audio.shape[0]
 
 
-def test_decode_lidar_rejects_payload_not_multiple_of_four(tokenizer):
-    ids = tokenizer._bytes_to_ids(b"\x00\x01\x02")  # 3 bytes, not a multiple
-    with pytest.raises(ValueError, match="not a multiple of 4"):
+def test_decode_lidar_rejects_payload_not_multiple_of_eight(tokenizer):
+    ids = tokenizer._bytes_to_ids(b"\x00\x01\x02")  # 3 bytes, not a multiple of 4 channels x 2 bytes
+    with pytest.raises(ValueError, match="not a multiple of 8"):
         tokenizer.decode_lidar(ids)
 
 
@@ -294,3 +350,32 @@ def test_decode_multimodal_skips_unrecognized_leading_tokens(tokenizer):
     assert len(segments) == 1
     assert segments[0].modality is Modality.TEXT
     assert segments[0].data == b"hi"
+
+
+def test_octet_family_id_range(tokenizer):
+    markers = KairosTokenizer.encode_image(np.zeros((1, 1, 3), dtype=np.uint8))
+    _, families = tokenizer._resolve_markers(markers)
+    assert max(families) < KairosTokenizer.NUM_OCTET_FAMILIES
+    assert min(families) >= 0
+
+
+def test_octet_family_ids_distinguish_rgb_and_place_value(tokenizer):
+    img_markers = KairosTokenizer.encode_image(np.zeros((1, 1, 3), dtype=np.uint8))
+    _, img_families = tokenizer._resolve_markers(img_markers)
+    aud_markers = KairosTokenizer.encode_audio(np.zeros(2, dtype=np.float32), tick_samples=2)
+    _, aud_families = tokenizer._resolve_markers(aud_markers)
+    r, g, b = img_families[0], img_families[1], img_families[2]
+    aud_hi, aud_lo = [f for f in aud_families if f][0], [f for f in aud_families if f][1]
+    assert len({r, g, b, aud_hi, aud_lo}) == 5
+
+
+def test_octet_family_ids_text_bytes_are_family_zero(tokenizer):
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.TEXT, b"hi")])
+    assert torch.all(out["octet_family_ids"] == 0)
+
+
+def test_encode_multimodal_returns_octet_family_ids_same_shape_as_input_ids(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    assert out["octet_family_ids"].shape == out["input_ids"].shape
+    assert out["octet_family_ids"].max().item() > 0  # image bytes got a real (nonzero) family

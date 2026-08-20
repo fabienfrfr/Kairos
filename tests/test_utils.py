@@ -5,10 +5,12 @@ import torch
 from torch import nn
 
 from kairos.utils import (
+    DetailedMemoryReport,
     TrainingSummary,
     benchmark_step_time,
     count_active_parameters,
     count_parameters,
+    detailed_memory_report,
     estimate_optimizer_memory_mb,
     estimate_param_memory_mb,
     format_duration,
@@ -149,6 +151,44 @@ def test_training_summary_str_contains_key_fields():
     assert "n/a" in text  # no benchmark run
 
 
+def test_training_summary_with_benchmark_shows_measured_step_time_in_str():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(10))
+
+    def step_fn():
+        time.sleep(0.001)
+
+    summary = training_summary(model, loader, epochs=2, step_fn=step_fn, n_bench_steps=3)
+    text = str(summary)
+    assert "Avg step time:" in text
+    assert "ms" in text
+    assert "Est. total time:" in text
+    assert "n/a" not in text
+
+
+def test_training_summary_str_uses_measured_label_when_flag_set():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(4))
+    summary = training_summary(model, loader, epochs=1, step_fn=None)
+    summary.measured_memory = True
+    text = str(summary)
+    assert "Measured model memory:" in text
+    assert "Measured optimizer mem:" in text
+    assert "Measured total memory:" in text
+    assert "Est. model memory:" not in text
+
+
+def test_training_summary_str_uses_est_label_by_default():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(4))
+    summary = training_summary(model, loader, epochs=1, step_fn=None)
+    assert summary.measured_memory is False
+    text = str(summary)
+    assert "Est. model memory:" in text
+    assert "Est. optimizer mem:" in text
+    assert "Est. total memory:" in text
+
+
 # ------------------------------------------------------------- count_active_parameters
 class _MoEModule(nn.Module):
     def __init__(self, n_experts=4, dim=4):
@@ -230,3 +270,74 @@ def test_make_progress_callback_closes_bar_at_last_step(monkeypatch):
     callback(3, 3, 0.1)
 
     assert created[0].closed
+
+
+# ------------------------------------------------------------- detailed_memory_report
+def _tiny_model_and_optimizer():
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 4))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    return model, optimizer
+
+
+def test_detailed_memory_report_without_scaler_runs_one_real_step():
+    model, optimizer = _tiny_model_and_optimizer()
+    x = torch.randn(2, 8)
+    target = torch.randn(2, 4)
+
+    def loss_fn():
+        return torch.nn.functional.mse_loss(model(x), target)
+
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    report = detailed_memory_report(model, optimizer, loss_fn, device=torch.device("cpu"))
+
+    assert isinstance(report, DetailedMemoryReport)
+    assert report.unique_param_bytes > 0
+    assert report.grad_bytes > 0
+    assert report.optimizer_state_bytes > 0  # AdamW m/v buffers, present after optimizer.step()
+    assert report.device == "cpu"
+    # a real step ran (no scaler path): weights actually moved
+    after = model.state_dict()
+    assert any(not torch.equal(before[k], after[k]) for k in before)
+
+
+def test_detailed_memory_report_with_scaler_runs_one_real_step():
+    model, optimizer = _tiny_model_and_optimizer()
+    scaler = torch.amp.GradScaler(device="cpu", enabled=False)  # CPU: scaler must be disabled
+    x = torch.randn(2, 8)
+    target = torch.randn(2, 4)
+
+    def loss_fn():
+        return torch.nn.functional.mse_loss(model(x), target)
+
+    report = detailed_memory_report(model, optimizer, loss_fn, device=torch.device("cpu"), scaler=scaler)
+
+    assert report.optimizer_state_bytes > 0
+    assert report.grad_bytes > 0
+
+
+def test_detailed_memory_report_module_breakdown_covers_leaf_modules():
+    model, optimizer = _tiny_model_and_optimizer()
+    x = torch.randn(2, 8)
+    target = torch.randn(2, 4)
+
+    def loss_fn():
+        return torch.nn.functional.mse_loss(model(x), target)
+
+    report = detailed_memory_report(model, optimizer, loss_fn, device=torch.device("cpu"))
+    names = {row["name"] for row in report.module_breakdown}
+    assert any("0" in n for n in names)  # first Linear
+    assert any("2" in n for n in names)  # second Linear
+
+
+def test_detailed_memory_report_str_contains_key_fields():
+    model, optimizer = _tiny_model_and_optimizer()
+    x = torch.randn(2, 8)
+    target = torch.randn(2, 4)
+
+    def loss_fn():
+        return torch.nn.functional.mse_loss(model(x), target)
+
+    report = detailed_memory_report(model, optimizer, loss_fn, device=torch.device("cpu"))
+    text = str(report)
+    assert "RSS" in text
+    assert "Unaccounted" in text

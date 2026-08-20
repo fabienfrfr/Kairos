@@ -52,6 +52,37 @@ ALL_SPECIAL_TOKENS = (
     + ["<SEP>", "<MASK>"]
 )
 
+# Octet-family ids: WHICH byte-plane/channel a position's *value* belongs to, carried as a small
+# parallel stream (octet_family_ids) instead of inflating the main token vocab. Byte values 0-255
+# are shared by every modality (a value id never encodes "which family" by itself); the family
+# tells the model whether that value is e.g. an image R channel byte, an audio hi byte, etc.
+# Family 0 is the catch-all for text and structural/marker tokens.
+_FAMILY_NAMES = (
+    [f"IMG{c}" for c in range(3)]  # R, G, B (shared by video)
+    + [f"AUD{p}" for p in range(2)]  # hi, lo byte of a 16-bit audio sample
+    + [f"LID{i}" for i in range(8)]  # 4 point channels x hi/lo byte
+    + [f"ACT{p}" for p in range(2)]  # hi, lo byte of a 16-bit action sample
+    + [f"STA{p}" for p in range(2)]  # hi, lo byte of a 16-bit state sample
+)
+_FAMILY_ID = {name: idx + 1 for idx, name in enumerate(_FAMILY_NAMES)}  # 0 reserved for text/other
+NUM_OCTET_FAMILIES = len(_FAMILY_NAMES) + 1
+
+
+def _quantize_planes(x: np.ndarray, lo, hi, n_bytes: int) -> np.ndarray:
+    """Float in [lo, hi] -> n_bytes big-endian byte planes (place-value digits, like RGB channels), no single-byte rounding."""
+    levels = 256**n_bytes - 1
+    q = np.clip((np.asarray(x) - lo) / (hi - lo) * levels, 0, levels).astype(np.int64)
+    shifts = [(n_bytes - 1 - k) * 8 for k in range(n_bytes)]
+    return np.stack([(q >> s) & 0xFF for s in shifts], axis=-1).astype(np.uint8)
+
+
+def _dequantize_planes(planes: np.ndarray, lo, hi, n_bytes: int) -> np.ndarray:
+    """Inverse of `_quantize_planes`."""
+    levels = 256**n_bytes - 1
+    shifts = [(n_bytes - 1 - k) * 8 for k in range(n_bytes)]
+    q = sum(planes[..., k].astype(np.int64) << s for k, s in enumerate(shifts))
+    return q / levels * (hi - lo) + lo
+
 
 @dataclass
 class MultimodalSegment:
@@ -73,13 +104,15 @@ class KairosTokenizer(ByT5Tokenizer):
     LIDAR_POINTS_PER_GROUP = 32  # one <PTSEP> every N points
     LIDAR_XYZ_RANGE = (-100.0, 100.0)
     LIDAR_INTENSITY_RANGE = (0.0, 1.0)
+    SIGNAL_VALUE_RANGE = (-1.0, 1.0)  # state/action/imu channels are expected pre-clipped to this
+    NUM_OCTET_FAMILIES = NUM_OCTET_FAMILIES
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("extra_ids", 0)
         super().__init__(*args, **kwargs)
         self.add_special_tokens({"additional_special_tokens": ALL_SPECIAL_TOKENS})
 
-        # byte -> id offset, calibrated empirically
+        # byte -> id offset, calibrated empirically; shared by every modality (value only, no family)
         self._byte_offset = self.convert_tokens_to_ids(chr(0))
         assert self.convert_tokens_to_ids(chr(255)) == self._byte_offset + 255, (
             "byte->id mapping is not contiguous — review _byte_offset calibration"
@@ -95,6 +128,14 @@ class KairosTokenizer(ByT5Tokenizer):
     def _ids_to_bytes(self, ids: list[int]) -> bytes:
         return bytes([max(0, i - self._byte_offset) & 0xFF for i in ids])
 
+    @staticmethod
+    def _family_ids_for(n: int, family_cycle: tuple | None) -> list[int]:
+        """n values -> parallel octet-family ids, cycling family_cycle (or all-0 if None)."""
+        if not family_cycle:
+            return [0] * n
+        cycle = [_FAMILY_ID[name] for name in family_cycle]
+        return [cycle[i % len(cycle)] for i in range(n)]
+
     # ---------------- IMAGE: row-delimited, no header ----------------
     @classmethod
     def encode_image(cls, image: np.ndarray) -> list:
@@ -105,20 +146,28 @@ class KairosTokenizer(ByT5Tokenizer):
 
     @staticmethod
     def _encode_frame_rows(frame: np.ndarray) -> list:
+        channels = frame.shape[-1]
+        family_cycle = tuple(f"IMG{c}" for c in range(channels))  # R, G, B, ...
         out = []
         for row in frame:
-            out.append(("bytes", row.tobytes()))
+            out.append(("bytes", row.tobytes(), family_cycle))
             out.append(("marker", "<ENDLINE>"))
         return out
 
-    def _resolve_markers(self, marker_seq: list) -> list[int]:
+    def _resolve_markers(self, marker_seq: list) -> tuple[list[int], list[int]]:
+        """Returns (ids, octet_family_ids), both the same length."""
         ids: list[int] = []
-        for kind, payload in marker_seq:
+        families: list[int] = []
+        for entry in marker_seq:
+            kind, payload = entry[0], entry[1]
             if kind == "bytes":
+                family_cycle = entry[2] if len(entry) > 2 else None
                 ids.extend(self._bytes_to_ids(payload))
+                families.extend(self._family_ids_for(len(payload), family_cycle))
             else:
                 ids.append(self.convert_tokens_to_ids(payload))
-        return ids
+                families.append(0)  # structural markers are family 0 (text/other)
+        return ids, families
 
     def decode_image(self, ids: list[int], channels: int | None = None) -> np.ndarray:
         """Dimensions recovered by counting <ENDLINE> markers; raises on bad row lengths."""
@@ -177,21 +226,17 @@ class KairosTokenizer(ByT5Tokenizer):
         duration = stacked.shape[0] / fps if fps > 0 else float("nan")
         return stacked, duration
 
-    # ---------------- AUDIO: flat PCM + periodic
+    # ---------------- shared PCM codec: N-byte place-value quantization for 1D signals ----------------
     @classmethod
-    def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None) -> list:
-        if waveform.dtype != np.float32:
-            raise ValueError("encode_audio expects a float32 waveform in [-1, 1]")
-        tick_samples = tick_samples or cls.AUDIO_TICK_SAMPLES
-        pcm = np.clip(waveform * 127.5 + 127.5, 0, 255).astype(np.uint8)
+    def _encode_pcm(cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, family_cycle: tuple, n_bytes: int) -> list:
+        planes = _quantize_planes(values, lo, hi, n_bytes)  # (N, n_bytes), one family id per byte-plane
         out = []
-        for start in range(0, len(pcm), tick_samples):
-            out.append(("bytes", pcm[start : start + tick_samples].tobytes()))
+        for start in range(0, len(planes), tick_samples):
+            out.append(("bytes", planes[start : start + tick_samples].tobytes(), family_cycle))
             out.append(("marker", "<TICK>"))
         return out
 
-    def decode_audio(self, ids: list[int], tick_samples: int | None = None):
-        """Returns (waveform, duration_seconds); duration = len(waveform)/AUDIO_SAMPLE_RATE."""
+    def _decode_pcm(self, ids: list[int], lo: float, hi: float, n_bytes: int) -> np.ndarray:
         samples, current = [], []
         for i in ids:
             if i == self._tick_id:
@@ -201,13 +246,40 @@ class KairosTokenizer(ByT5Tokenizer):
                 current.append(i)
         if current:
             samples.extend(current)
-        pcm = np.frombuffer(self._ids_to_bytes(samples), dtype=np.uint8)
-        waveform = (pcm.astype(np.float32) - 127.5) / 127.5
+        raw = self._ids_to_bytes(samples)
+        if len(raw) % n_bytes != 0:
+            raise ValueError(f"payload ({len(raw)} bytes) not a multiple of n_bytes={n_bytes}")
+        planes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, n_bytes)
+        return _dequantize_planes(planes, lo, hi, n_bytes).astype(np.float32)
+
+    # ---------------- AUDIO: flat PCM + periodic <TICK>, n_bytes=2 (16-bit) by default ----------------
+    @classmethod
+    def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None, n_bytes: int = 2) -> list:
+        if waveform.dtype != np.float32:
+            raise ValueError("encode_audio expects a float32 waveform in [-1, 1]")
+        family_cycle = tuple(f"AUD{p}" for p in range(n_bytes))  # hi, lo, ...
+        return cls._encode_pcm(waveform, -1.0, 1.0, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes)
+
+    def decode_audio(self, ids: list[int], tick_samples: int | None = None, n_bytes: int = 2):
+        """Returns (waveform, duration_seconds); duration = len(waveform)/AUDIO_SAMPLE_RATE."""
+        waveform = self._decode_pcm(ids, -1.0, 1.0, n_bytes)
         return waveform, len(waveform) / self.AUDIO_SAMPLE_RATE
 
-    # ---------------- LIDAR: point groups + fixed
+    # ------------- SIGNAL: generic control channel (state/action/imu), family picks its own id family -------------
     @classmethod
-    def encode_lidar(cls, points: np.ndarray, points_per_group: int | None = None) -> list:
+    def encode_signal(cls, values: np.ndarray, family: str, tick_samples: int | None = None, n_bytes: int = 2) -> list:
+        """Same place-value PCM scheme as audio, tagged with its own family (e.g. "ACT" vs "STA")."""
+        if values.dtype != np.float32:
+            raise ValueError("encode_signal expects a float32 array in [-1, 1]")
+        family_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
+        return cls._encode_pcm(values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes)
+
+    def decode_signal(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
+        return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, n_bytes)
+
+    # ---------------- LIDAR: point groups + fixed quantization bounds, n_bytes=2 per channel ----------------
+    @classmethod
+    def encode_lidar(cls, points: np.ndarray, points_per_group: int | None = None, n_bytes: int = 2) -> list:
         if points.dtype != np.float32 or points.ndim != 2 or points.shape[-1] != 4:
             raise ValueError("encode_lidar expects a (N, 4) float32 array [x,y,z,intensity]")
         points_per_group = points_per_group or cls.LIDAR_POINTS_PER_GROUP
@@ -215,14 +287,15 @@ class KairosTokenizer(ByT5Tokenizer):
         int_lo, int_hi = cls.LIDAR_INTENSITY_RANGE
         lo = np.array([xyz_lo, xyz_lo, xyz_lo, int_lo], dtype=np.float32)
         hi = np.array([xyz_hi, xyz_hi, xyz_hi, int_hi], dtype=np.float32)
-        q = ((np.clip(points, lo, hi) - lo) / (hi - lo) * 255).astype(np.uint8)
+        planes = _quantize_planes(points, lo, hi, n_bytes)  # (N, 4, n_bytes)
+        family_cycle = tuple(f"LID{c * n_bytes + p}" for c in range(4) for p in range(n_bytes))
         out = []
-        for start in range(0, len(q), points_per_group):
-            out.append(("bytes", q[start : start + points_per_group].tobytes()))
+        for start in range(0, len(planes), points_per_group):
+            out.append(("bytes", planes[start : start + points_per_group].tobytes(), family_cycle))
             out.append(("marker", "<PTSEP>"))
         return out
 
-    def decode_lidar(self, ids: list[int]) -> np.ndarray:
+    def decode_lidar(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
         """Dequantized via fixed LIDAR_XYZ_RANGE/LIDAR_INTENSITY_RANGE (lossy but header-free)."""
         point_bytes, current = [], []
         for i in ids:
@@ -234,20 +307,22 @@ class KairosTokenizer(ByT5Tokenizer):
         if current:
             point_bytes.extend(current)
         raw = self._ids_to_bytes(point_bytes)
-        if len(raw) % 4 != 0:
-            raise ValueError(f"lidar payload ({len(raw)} bytes) not a multiple of 4")
-        q = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4).astype(np.float32)
+        stride = 4 * n_bytes
+        if len(raw) % stride != 0:
+            raise ValueError(f"lidar payload ({len(raw)} bytes) not a multiple of {stride}")
+        planes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4, n_bytes)
         xyz_lo, xyz_hi = self.LIDAR_XYZ_RANGE
         int_lo, int_hi = self.LIDAR_INTENSITY_RANGE
         lo = np.array([xyz_lo, xyz_lo, xyz_lo, int_lo], dtype=np.float32)
         hi = np.array([xyz_hi, xyz_hi, xyz_hi, int_hi], dtype=np.float32)
-        return q / 255.0 * (hi - lo) + lo
+        return _dequantize_planes(planes, lo, hi, n_bytes)
 
     # ---------------- multimodal sequence assembly ----------------
     def encode_multimodal(self, segments: list[MultimodalSegment], max_len: int | None = None) -> dict:
-        """Returns aligned {"input_ids", "modality_ids"} tensors; padding uses Modality.TEXT."""
+        """Returns aligned {input_ids, modality_ids, octet_family_ids}; padding uses Modality.TEXT / family 0."""
         all_ids: list[int] = []
         all_modality: list[int] = []
+        all_family: list[int] = []
 
         for seg in segments:
             open_tag, close_tag = _MODALITY_TAGS[seg.modality]
@@ -256,28 +331,35 @@ class KairosTokenizer(ByT5Tokenizer):
 
             if seg.modality is Modality.TEXT:
                 body_ids = self.encode(seg.data.decode("utf-8"), add_special_tokens=False)
+                body_families = [0] * len(body_ids)
             else:
-                body_ids = self._resolve_markers(seg.data)
+                body_ids, body_families = self._resolve_markers(seg.data)
 
             if seg.channel is not None:
                 c_open, c_close = _CHANNEL_TAGS[seg.channel]
                 body_ids = [self.convert_tokens_to_ids(c_open)] + body_ids + [self.convert_tokens_to_ids(c_close)]
+                body_families = [0] + body_families + [0]
 
             seg_ids = [open_id] + body_ids + [close_id]
+            seg_families = [0] + body_families + [0]
             all_ids.extend(seg_ids)
             all_modality.extend([int(seg.modality)] * len(seg_ids))
+            all_family.extend(seg_families)
 
         if max_len is not None:
             all_ids = all_ids[:max_len]
             all_modality = all_modality[:max_len]
+            all_family = all_family[:max_len]
             pad_len = max_len - len(all_ids)
             if pad_len > 0:
                 all_ids += [self.pad_token_id] * pad_len
                 all_modality += [int(Modality.TEXT)] * pad_len
+                all_family += [0] * pad_len
 
         return {
             "input_ids": torch.tensor(all_ids, dtype=torch.long),
             "modality_ids": torch.tensor(all_modality, dtype=torch.long),
+            "octet_family_ids": torch.tensor(all_family, dtype=torch.long),
         }
 
     def decode_multimodal(self, input_ids: torch.Tensor) -> list[MultimodalSegment]:
@@ -309,4 +391,6 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
 
-# len(KairosTokenizer()) == 291 (259 base bytes + pad/eos/unk + locals)
+# len(KairosTokenizer()) == 259 base bytes/specials + 30 modality/channel/structural tags == 289.
+# The (up to) 17 "which byte/channel" families live in a separate small octet_family_ids stream
+# (see NUM_OCTET_FAMILIES), not in the main vocab - that's what keeps this vocab small.
