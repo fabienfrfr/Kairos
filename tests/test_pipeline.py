@@ -76,7 +76,7 @@ def built_pipeline(tmp_path, model_config, text_examples, multimodal_examples):
 
 
 def test_build_wires_mask_curriculum_config_to_trainer(tmp_path, model_config, text_examples):
-    """TrainConfig.mask_p_max / mask_reweight (MAE curriculum stage) must reach the underlying trainer."""
+    """TrainConfig.mask_p_max / mask_reweight (MAE stage) must reach the underlying trainer."""
     data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
     train_config = TrainConfig(
         epochs=1, save_every=3, run_dir=str(tmp_path / "run"), mask_p_max=0.3, mask_reweight=False
@@ -365,6 +365,140 @@ def test_train_no_nan_losses(built_pipeline):
     assert all(not math.isnan(row["loss"]) for row in logs)
 
 
+def test_train_epochs_shortcut_uses_target_mask_values_from_step_zero(
+    tmp_path, model_config, text_examples, multimodal_examples
+):
+    """The deprecated `epochs=N` shortcut (diffusion_epochs=N, mae_epochs=transition_epochs=0)
+    must keep the pre-curriculum behaviour exactly: mask_p_max/mask_reweight already at their
+    target values on the very first step, no MAE/transition stage at all."""
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=multimodal_examples, max_len=256, batch_size=2
+    )
+    train_config = TrainConfig(
+        epochs=1, save_every=3, run_dir=str(tmp_path / "run"), mask_p_max=0.7, mask_reweight=True
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    pipe.train()
+    assert pipe.hf_trainer.mask_p_max == 0.7
+    assert pipe.hf_trainer.mask_reweight == 1.0  # continuous blend factor now, not a bool identity
+
+
+def test_train_single_pipeline_moves_through_mae_transition_diffusion_stages(
+    tmp_path, model_config, text_examples, multimodal_examples
+):
+    """One pipeline, one optimizer, one train() call covering all three stages — this replaces
+    the old two-pipeline setup (build+train pipe_mae, del it, build a second pipe that resumes
+    from its checkpoint)."""
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=multimodal_examples, max_len=256, batch_size=2
+    )
+    train_config = TrainConfig(
+        mae_epochs=1,
+        transition_epochs=1,
+        diffusion_epochs=1,
+        save_every=1000,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_mae_reweight=False,
+        mask_p_max=1.0,
+        mask_reweight=True,
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    assert pipe.train_config.epochs == 3  # derived total across the three stages
+
+    steps_per_epoch = len(pipe.loader)
+    seen_p_max, seen_reweight = [], []
+
+    def _record(step, total, loss_val):
+        seen_p_max.append(pipe.hf_trainer.mask_p_max)
+        seen_reweight.append(pipe.hf_trainer.mask_reweight)
+
+    pipe.train(progress_callback=_record)
+
+    assert len(seen_p_max) == 3 * steps_per_epoch
+    mae_vals = seen_p_max[:steps_per_epoch]
+    transition_vals = seen_p_max[steps_per_epoch : 2 * steps_per_epoch]
+    diffusion_vals = seen_p_max[2 * steps_per_epoch :]
+
+    # MAE epoch: flat at the MAE ceiling, plain CE
+    assert all(v == pytest.approx(0.3) for v in mae_vals)
+    assert all(r == pytest.approx(0.0) for r in seen_reweight[:steps_per_epoch])
+    # transition epoch: monotonically ramping towards the diffusion target
+    assert transition_vals == sorted(transition_vals)
+    assert transition_vals[-1] <= 1.0
+    # diffusion epoch: flat at the target, full reweighting
+    assert all(v == pytest.approx(1.0) for v in diffusion_vals)
+    assert all(r == pytest.approx(1.0) for r in seen_reweight[2 * steps_per_epoch :])
+
+
+def test_train_zero_transition_epochs_jumps_straight_from_mae_to_diffusion(
+    tmp_path, model_config, text_examples, multimodal_examples
+):
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=multimodal_examples, max_len=256, batch_size=2
+    )
+    train_config = TrainConfig(
+        mae_epochs=1,
+        transition_epochs=0,
+        diffusion_epochs=1,
+        save_every=1000,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_p_max=1.0,
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    steps_per_epoch = len(pipe.loader)
+    seen_p_max = []
+    pipe.train(progress_callback=lambda step, total, loss: seen_p_max.append(pipe.hf_trainer.mask_p_max))
+
+    assert all(v == pytest.approx(0.3) for v in seen_p_max[:steps_per_epoch])
+    assert all(v == pytest.approx(1.0) for v in seen_p_max[steps_per_epoch:])
+
+
+def test_train_resume_mid_curriculum_recovers_correct_stage(
+    tmp_path, model_config, text_examples, multimodal_examples
+):
+    """Resuming from a checkpoint taken mid-curriculum must land in the right stage automatically
+    — the stage is a pure function of the persisted global_step, not of which pipeline/stage
+    object originally ran it (no separate pipe_mae/pipe objects or manual hand-off anymore)."""
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=multimodal_examples, max_len=256, batch_size=2
+    )
+    train_config = TrainConfig(
+        mae_epochs=1,
+        transition_epochs=1,
+        diffusion_epochs=1,
+        save_every=1000,
+        last_ckpt_every=1,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_p_max=1.0,
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    pipe.train()  # runs all 3 stages, checkpointing along the way
+    finished_step = pipe.global_step
+
+    fresh_config = TrainConfig(
+        mae_epochs=1,
+        transition_epochs=1,
+        diffusion_epochs=1,
+        save_every=1000,
+        last_ckpt_every=1,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_p_max=1.0,
+    )
+    fresh_pipe = KairosMultimodalPipeline(model_config, data_config, fresh_config)
+    fresh_pipe.build()
+    fresh_pipe.train(resume=True)  # nothing left to do, but must not crash / must land at target
+    assert fresh_pipe.global_step >= finished_step
+    assert fresh_pipe.hf_trainer.mask_p_max == pytest.approx(1.0)
+
+
 def test_train_produces_checkpoints(built_pipeline):
     built_pipeline.train()
     ckpts = os.listdir(built_pipeline.ckpt_dir)
@@ -561,9 +695,7 @@ def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pip
     assert summary.measured_memory is True
     assert summary.param_memory_mb > 0
     assert summary.optimizer_memory_mb > 0
-    # sanity: measured optimizer memory for AdamW should be roughly proportional to trainable
-    # params (not exactly 2x param bytes like the old formula estimate, since state is fp32
-    # regardless of model dtype and only allocated for params that actually got a grad).
+    # sanity: measured optimizer memory scales with trainable params (state is fp32 regardless of dtype)
     assert summary.optimizer_memory_mb > 0.5 * summary.param_memory_mb
 
 
@@ -986,8 +1118,62 @@ def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config
     assert pipe.loader is loader_before
 
 
+def test_overfit_test_default_walks_all_three_active_stages(tmp_path, model_config):
+    """No mask_p_max/mask_reweight override: overfit_test() alone should walk the same
+    MAE -> transition -> diffusion curriculum as train(), proportionally compressed into `steps`."""
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        mae_epochs=1, transition_epochs=1, diffusion_epochs=1, run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3, mask_mae_reweight=False, mask_p_max=1.0, mask_reweight=True,
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    captured_p_max = []
+    real_compute_loss = pipe.hf_trainer.compute_loss
+
+    def spy(model, batch, **kw):
+        captured_p_max.append(pipe.hf_trainer.mask_p_max)
+        return real_compute_loss(model, batch, **kw)
+
+    pipe.hf_trainer.compute_loss = spy
+    pipe.overfit_test(n_examples=16, steps=9)  # 1:1:1 epochs -> 3/3/3 steps
+
+    assert captured_p_max[0] == pytest.approx(0.3)  # starts in the MAE regime
+    assert captured_p_max == sorted(captured_p_max)  # monotonically rising throughout
+    assert captured_p_max[-1] == pytest.approx(1.0)  # ends at the diffusion target
+
+
+def test_overfit_test_default_skips_stages_with_zero_epochs(tmp_path, model_config):
+    """diffusion_epochs=0: overfit_test() should stay in the MAE regime the whole call, one line,
+    no notebook-side loop needed to pick which stage(s) to exercise."""
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        mae_epochs=1, transition_epochs=0, diffusion_epochs=0, run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3, mask_mae_reweight=False,
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    captured_p_max, captured_reweight = [], []
+    real_compute_loss = pipe.hf_trainer.compute_loss
+
+    def spy(model, batch, **kw):
+        captured_p_max.append(pipe.hf_trainer.mask_p_max)
+        captured_reweight.append(pipe.hf_trainer.mask_reweight)
+        return real_compute_loss(model, batch, **kw)
+
+    pipe.hf_trainer.compute_loss = spy
+    pipe.overfit_test(n_examples=16, steps=5)
+
+    assert all(v == pytest.approx(0.3) for v in captured_p_max)
+    assert all(v == pytest.approx(0.0) for v in captured_reweight)
+
+
 def test_overfit_test_mask_override_is_applied_and_restored(tmp_path, model_config):
-    """mask_p_max/mask_reweight overrides (MAE vs. diffusion mode) must be used during the call, then reverted."""
+    """mask_p_max/mask_reweight overrides (MAE vs diffusion) apply during the call, then revert."""
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
     train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"), mask_p_max=1.0, mask_reweight=True)
@@ -1007,7 +1193,7 @@ def test_overfit_test_mask_override_is_applied_and_restored(tmp_path, model_conf
     pipe.overfit_test(n_examples=16, steps=3, mask_p_max=0.3, mask_reweight=False)
 
     assert all(v == 0.3 for v in captured_p_max)
-    assert all(v is False for v in captured_reweight)
+    assert all(v == 0.0 for v in captured_reweight)  # continuous blend factor now, not a bool identity
     # restored to the pipe's original (Stage 2 / diffusion) settings after the call
     assert pipe.hf_trainer.mask_p_max == 1.0
     assert pipe.hf_trainer.mask_reweight is True

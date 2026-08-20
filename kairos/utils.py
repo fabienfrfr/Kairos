@@ -47,9 +47,7 @@ def locate_first_nonfinite_module(model, forward_fn) -> dict | None:
 
 
 def real_module_breakdown(model) -> list[dict]:
-    """Per top-level submodule param bytes, deduped by storage identity (not double-counting
-    shared modules like a tied/shared backbone). Each entry also reports how many attribute
-    slots reference that same physical module, so sharing is visible instead of hidden."""
+    """Per top-level submodule param bytes, deduped by storage identity; reports sharing counts."""
     seen_storage: dict[int, str] = {}  # storage id -> first module name that claimed it
     breakdown = []
     for name, module in model.named_children():
@@ -65,8 +63,7 @@ def real_module_breakdown(model) -> list[dict]:
             else:
                 seen_storage[sid] = name
                 unique_bytes += nbytes
-        # detect internal repetition (e.g. self.backbones = ModuleList([shared] * 4)):
-        # count how many distinct child slots inside `module` point at the same storage.
+        # detect internal repetition (e.g. shared backbone): count slots sharing the same storage
         n_slots = sum(1 for _ in module.modules())
         n_unique_instances = len({id(m) for m in module.modules()})
         breakdown.append(
@@ -83,8 +80,7 @@ def real_module_breakdown(model) -> list[dict]:
 
 
 def _process_rss_mb() -> float:
-    """Current process resident memory in MB (Linux/Mac; ru_maxrss is peak, not current, so we
-    read /proc/self/status when available for a live number, falling back to peak RSS)."""
+    """Current process resident memory in MB; live via /proc/self/status, else peak ru_maxrss."""
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -164,12 +160,7 @@ class DetailedMemoryReport:
 
 
 def detailed_memory_report(model, optimizer, loss_fn, device, autocast_ctx=None, scaler=None) -> DetailedMemoryReport:
-    """Runs exactly one real forward+backward+optimizer-step and measures actual memory at
-    each stage — no estimation. loss_fn() must run the forward pass and return the loss
-    tensor (e.g. lambda: hf_trainer.compute_loss(model, batch)). Leaves the model/optimizer
-    mutated — caller should snapshot and restore state_dict() around this call if it needs
-    to keep training from a clean state.
-    """
+    """Runs one real forward+backward+optimizer-step, measures actual memory; model left mutated"""
     import gc
 
     autocast_ctx = autocast_ctx or contextlib.nullcontext
@@ -192,7 +183,7 @@ def detailed_memory_report(model, optimizer, loss_fn, device, autocast_ctx=None,
         return _hook
 
     for name, module in model.named_modules():
-        if name and sum(1 for _ in module.children()) == 0:  # leaf modules only, avoid double counting
+        if name and sum(1 for _ in module.children()) == 0:  # leaf modules only
             handles.append(module.register_forward_hook(_make_hook(name)))
 
     gc.collect()

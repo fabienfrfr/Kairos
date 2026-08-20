@@ -75,15 +75,10 @@ except ImportError:
             causal_conv1d_update,
         )
 
-# Every KairosLiZAttention2 layer runs the DeltaNet path unconditionally alongside SWA (see
-# that class below) — it is not an occasional fallback, it's on the hot path of every forward.
-# Without `fla`/`causal-conv1d` (`pip install kairos-fm[fast-attn]`, needs a CUDA GPU), both
-# fall back to slower pure-PyTorch reference implementations. On a CPU-only machine this is
-# unavoidable and not worth warning about; on a CUDA machine it's usually the single biggest
-# available training-speed lever, so surface it loudly instead of failing silently.
+# DeltaNet runs on every layer alongside SWA (see KairosLiZAttention2); without fla/causal-conv1d
+# it silently falls back to slow pure-PyTorch kernels - warn loudly on CUDA
 def _warn_if_missing_fast_kernels(cuda_available: bool, delta_backend: str, conv_backend: str) -> None:
-    """Pure function (no CUDA/import side effects) so it's directly unit-testable without
-    reloading this module or mocking torch.cuda internals."""
+    """Pure function (no CUDA/import side effects), directly unit-testable without reloading."""
     if not cuda_available or (delta_backend == "fla" and conv_backend == "causal_conv1d"):
         return
     import warnings
@@ -193,7 +188,7 @@ def eager_attention(q, k, v, window, key_padding_mask=None):
     return out.contiguous()
 
 
-# Flex mask builder (bidir); flex block size - bucketing lengths up to it keeps the mask/kernel shape stable.
+# Flex mask builder (bidir); block size buckets lengths to keep mask/kernel shape stable.
 _FLEX_BLOCK_SIZE = 128
 
 

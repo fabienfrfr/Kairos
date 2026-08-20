@@ -34,7 +34,7 @@ def _():
 
 @app.cell
 def _():
-    # --force-reinstall is required: pip skips reinstalling if the version is unchanged.
+    # --force-reinstall required since pip skips reinstalling an unchanged version
     # !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
     return
 
@@ -129,7 +129,7 @@ def _(TEXT_PCT, TEXT_SOURCE):
 
             _ds = load_dataset("ffurfaro/keep-it-simple", split=f"train[:{TEXT_PCT}%]")
             text_examples = [{"modality": "text", "text": f"{row['prompt']} {row['text']}".strip()} for row in _ds]
-        except Exception as e:  # noqa: BLE001 — network/dataset-availability failure, fall back to a tiny inline sample
+        except Exception as e:  # noqa: BLE001 - network/dataset failure, fall back to a sample
             print(f"[fallback] keep-it-simple unavailable ({e}) - using inline sample")
             text_examples = [
                 {"modality": "text", "text": "Paris is the capital of France."},
@@ -237,17 +237,14 @@ def _(EVAL_PCT, multimodal_examples, random, text_examples):
 @app.cell
 def _():
     # ---- model settings ----
-    # modality_scales routes each modality to a
-    # the v3 Block-AttnRes window (1 =
     CFG_D_MODEL = 64  # head_dim = 64/4 = 16, power of 2 for flex_attention
     CFG_N_HEADS = 4
     CFG_N_LAYERS = 4
     CFG_STRIDE = 3
     CFG_NUM_SCALES = 4
     CFG_ATTNRES_BLOCK = 4
-    CFG_EXPERTS = 7  # 0 = dense FFN. Top-1 routing (see CFG_EXPERTS_PER_TOK) is slow to converge on tiny
-    # overfit-test runs since gradient only reaches the chosen expert per token; set to 0 to isolate whether
-    # the backbone itself can memorize before blaming routing.
+    CFG_EXPERTS = 7  # 0 = dense FFN; top-1 routing is slow to converge on tiny overfit-test runs
+    # set to 0 to isolate whether the backbone itself can memorize before blaming routing
     CFG_EXPERTS_PER_TOK = 1
     CFG_SHARED_EXPERTS = 1
     CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
@@ -341,23 +338,24 @@ def _():
     TRAIN_MAX_LEN = 1024
     TRAIN_STRIDE = 3
     TRAIN_SAVE_EVERY = 200
-    TRAIN_MASK_EPS = 1e-3  # floor of masked-diffusion rate p (CE/p); lower -> more variance, harder to overfit fast
+    TRAIN_MASK_EPS = 1e-3  # floor of masked-diffusion rate p; lower -> harder to overfit fast
 
-    # ---- two-stage curriculum: Stage 1 (MAE, fixed-rate bidirectional denoising, cheap/stable) bootstraps
-    # the backbone, then Stage 2 (full diffusion, p up to 1.0, CE/p-weighted) resumes from Stage 1's weights
-    # and fine-tunes on the real generative objective. Set *_EPOCHS = 0 to skip a stage entirely.
-    TRAIN_MAE_EPOCHS = 5  # was 1, too few steps to leave the near-random-init loss (fixed codec bottleneck; see PyramidalCodec)
-    TRAIN_MAE_P_MAX = 0.3  # MAE stage ceiling on p: fixed-ish low corruption, easy/stable to optimize
+    # ---- single-pipeline MAE -> transition -> diffusion curriculum: one train() call runs all
+    # three stages; set an *_EPOCHS to 0 to skip. TrainConfig defaults to (1, 1, 1) if unset.
+    TRAIN_MAE_EPOCHS = 5  # was 1, too few steps past random-init loss (codec bottleneck fixed)
+    TRAIN_MAE_P_MAX = 0.3  # MAE stage ceiling on p: fixed-ish low corruption, stable to optimize
     TRAIN_MAE_REWEIGHT = False  # plain CE in MAE stage: no 1/p variance blowup
 
+    TRAIN_TRANSITION_EPOCHS = 2  # ramps masking rate + reweighting from MAE to diffusion values
+
     TRAIN_DIFFUSION_EPOCHS = 5  # was 3, same reasoning as TRAIN_MAE_EPOCHS
-    TRAIN_MASK_P_MAX = 1.0  # Stage 2 ceiling on p: full diffusion, rows can be up to 100% noised
-    TRAIN_MASK_REWEIGHT = True  # Stage 2: divide CE by p (standard masked-diffusion ELBO weighting)
+    TRAIN_MASK_P_MAX = 1.0  # diffusion stage ceiling on p: full diffusion, up to 100% noised
+    TRAIN_MASK_REWEIGHT = True  # diffusion stage: divide CE by p (standard ELBO weighting)
 
     TRAIN_EVAL_EVERY = 100  # eval on held-out set every N steps (0 = off)
     TRAIN_EVAL_BATCHES = 2  # batches per eval; small keeps it cheap
-    TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts to
-    # also bridge Stage 1 -> Stage 2: both stages write/read checkpoints/last.pt in this same directory.
+    TRAIN_RUN_DIR = "checkpoints/kairos-multimodal/run_01"  # keep unchanged across restarts -
+    # resuming mid-curriculum (any stage) reads/writes checkpoints/last.pt in this same directory.
 
     # ---- packing: concatenate samples before chunking
     TRAIN_PACK = True
@@ -388,6 +386,7 @@ def _():
         TRAIN_RUN_DIR,
         TRAIN_SAVE_EVERY,
         TRAIN_STRIDE,
+        TRAIN_TRANSITION_EPOCHS,
     )
 
 
@@ -414,6 +413,7 @@ def _(
     TRAIN_RUN_DIR,
     TRAIN_SAVE_EVERY,
     TRAIN_STRIDE,
+    TRAIN_TRANSITION_EPOCHS,
     TrainConfig,
     eval_examples,
     train_examples,
@@ -435,27 +435,17 @@ def _(
         shuffle=False,
         drop_last=False,
     )
-    train_config_mae = TrainConfig(
-        lr=TRAIN_LR,
-        mask_eps=TRAIN_MASK_EPS,
-        mask_p_max=TRAIN_MAE_P_MAX,
-        mask_reweight=TRAIN_MAE_REWEIGHT,
-        epochs=TRAIN_MAE_EPOCHS,
-        save_every=TRAIN_SAVE_EVERY,
-        eval_every=TRAIN_EVAL_EVERY,
-        eval_batches=TRAIN_EVAL_BATCHES,
-        run_dir=TRAIN_RUN_DIR,
-        hub_repo_id=HUB_REPO_ID,
-        hub_push_every_ckpt=HUB_PUSH_EVERY_CKPT,
-        hub_private=HUB_PRIVATE,
-        hub_subfolder=HUB_SUBFOLDER,
-    )
+    # single TrainConfig for the whole MAE -> transition -> diffusion curriculum (one pipeline)
     train_config = TrainConfig(
         lr=TRAIN_LR,
         mask_eps=TRAIN_MASK_EPS,
+        mae_epochs=TRAIN_MAE_EPOCHS,
+        mask_mae_p_max=TRAIN_MAE_P_MAX,
+        mask_mae_reweight=TRAIN_MAE_REWEIGHT,
+        transition_epochs=TRAIN_TRANSITION_EPOCHS,
+        diffusion_epochs=TRAIN_DIFFUSION_EPOCHS,
         mask_p_max=TRAIN_MASK_P_MAX,
         mask_reweight=TRAIN_MASK_REWEIGHT,
-        epochs=TRAIN_DIFFUSION_EPOCHS,
         save_every=TRAIN_SAVE_EVERY,
         eval_every=TRAIN_EVAL_EVERY,
         eval_batches=TRAIN_EVAL_BATCHES,
@@ -465,7 +455,7 @@ def _(
         hub_private=HUB_PRIVATE,
         hub_subfolder=HUB_SUBFOLDER,
     )
-    return data_config, eval_data_config, train_config, train_config_mae
+    return data_config, eval_data_config, train_config
 
 
 @app.cell
@@ -497,8 +487,7 @@ def _(
 
 @app.cell
 def _():
-    # compute-cost summary: params/memory instantly, plus an
-    # few real timed steps (state is
+    # compute-cost summary: params/memory measured via a few real timed steps
     RUN_BENCHMARK = True
     N_BENCH_STEPS = 5
     return N_BENCH_STEPS, RUN_BENCHMARK
@@ -513,8 +502,7 @@ def _(N_BENCH_STEPS, RUN_BENCHMARK, pipe):
 
 @app.cell
 def _(RUN_BENCHMARK, pipe):
-    # one-off diagnostic, same spirit as pipe.summary(): runs a single real step then
-    # restores model/optimizer state. Do NOT call this inside the training loop.
+    # one-off diagnostic: runs a single real step; don't call inside the training loop
     if RUN_BENCHMARK:
         print(pipe.memory_report())
     return
@@ -522,10 +510,7 @@ def _(RUN_BENCHMARK, pipe):
 
 @app.cell
 def _(pd, pipe):
-    # visualize the tokenized input exactly as
-    # post-collation) - use this to rule
-    # note: a single row can (and
-    # audio/... segments get concatenated into one
+    # visualize the tokenized input as fed to the model, post-collation
     _reports = pipe.inspect_batch(n=1)
     _table = pd.DataFrame(
         [
@@ -565,140 +550,31 @@ def _():
 
 
 @app.cell
-def _(
-    OVERFIT_EXAMPLES,
-    OVERFIT_RUN,
-    OVERFIT_STEPS,
-    TRAIN_MAE_P_MAX,
-    TRAIN_MAE_REWEIGHT,
-    make_progress_callback,
-    mo,
-    pipe,
-):
-    # MAE-mode overfit test: fixed-rate low corruption, plain CE (matches Stage 1's objective).
-    # non-destructive: model/optimizer/loader state, and pipe.hf_trainer's mask settings, are restored afterwards.
-    _oflogs_mae = []
+def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, pipe):
+    # walks whichever of the MAE / transition / diffusion stages are configured, proportionally
     if OVERFIT_RUN:
         if mo.running_in_notebook():
-            with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test (MAE)") as _bar:
-                _state = {"last_step": 0}
-
-                def _on_step(step, total, loss_val):
-                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                    _state["last_step"] = step
-
-                _oflogs_mae = pipe.overfit_test(
+            with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
+                overfit_logs = pipe.overfit_test(
                     n_examples=OVERFIT_EXAMPLES,
                     steps=OVERFIT_STEPS,
-                    progress_callback=_on_step,
-                    mask_p_max=TRAIN_MAE_P_MAX,
-                    mask_reweight=TRAIN_MAE_REWEIGHT,
+                    progress_callback=lambda step, total, loss_val: _bar.update(increment=1, subtitle=f"loss={loss_val:.4f}"),
                 )
         else:
-            _oflogs_mae = pipe.overfit_test(
-                n_examples=OVERFIT_EXAMPLES,
-                steps=OVERFIT_STEPS,
-                progress_callback=make_progress_callback(desc="overfit_test (MAE)"),
-                mask_p_max=TRAIN_MAE_P_MAX,
-                mask_reweight=TRAIN_MAE_REWEIGHT,
+            overfit_logs = pipe.overfit_test(
+                n_examples=OVERFIT_EXAMPLES, steps=OVERFIT_STEPS, progress_callback=make_progress_callback(desc="overfit_test")
             )
     else:
-        print("OVERFIT_RUN is False - skipping MAE overfit test")
-    return
-
-
-@app.cell
-def _(
-    OVERFIT_EXAMPLES,
-    OVERFIT_RUN,
-    OVERFIT_STEPS,
-    TRAIN_MASK_P_MAX,
-    TRAIN_MASK_REWEIGHT,
-    make_progress_callback,
-    mo,
-    pipe,
-):
-    # Diffusion-mode overfit test: full p in [eps, 1], CE/p-weighted (matches Stage 2's real objective).
-    # non-destructive: model/optimizer/loader state, and pipe.hf_trainer's mask settings, are restored afterwards.
-    _oflogs_diffusion = []
-    if OVERFIT_RUN:
-        if mo.running_in_notebook():
-            with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test (diffusion)") as _bar:
-                _state = {"last_step": 0}
-
-                def _on_step(step, total, loss_val):
-                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                    _state["last_step"] = step
-
-                _oflogs_diffusion = pipe.overfit_test(
-                    n_examples=OVERFIT_EXAMPLES,
-                    steps=OVERFIT_STEPS,
-                    progress_callback=_on_step,
-                    mask_p_max=TRAIN_MASK_P_MAX,
-                    mask_reweight=TRAIN_MASK_REWEIGHT,
-                )
-        else:
-            _oflogs_diffusion = pipe.overfit_test(
-                n_examples=OVERFIT_EXAMPLES,
-                steps=OVERFIT_STEPS,
-                progress_callback=make_progress_callback(desc="overfit_test (diffusion)"),
-                mask_p_max=TRAIN_MASK_P_MAX,
-                mask_reweight=TRAIN_MASK_REWEIGHT,
-            )
-    else:
-        print("OVERFIT_RUN is False - skipping diffusion overfit test")
-    return
-
-
-@app.cell
-def _(
-    KairosMultimodalPipeline,
-    data_config,
-    make_progress_callback,
-    mo,
-    model_config,
-    tokenizer,
-    train_config_mae,
-):
-    # Stage 1 (MAE): fixed-rate bidirectional denoising, no CE/p reweighting. Cheap sanity check that the
-    # backbone can learn/memorize at all, and a stable bootstrap before the harder full-diffusion objective.
-    # Writes checkpoints/last.pt in train_config_mae.run_dir, picked up by Stage 2 below via resume=True.
-    if train_config_mae.epochs > 0:
-        pipe_mae = KairosMultimodalPipeline(model_config, data_config, train_config_mae, tokenizer=tokenizer)
-        pipe_mae.build()
-
-        _total_steps = train_config_mae.epochs * len(pipe_mae.loader)
-        if mo.running_in_notebook():
-            with mo.status.progress_bar(total=_total_steps, title="mae_pretrain") as _bar:
-                _state = {"last_step": 0}
-
-                def _on_mae_step(step, total, loss_val):
-                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                    _state["last_step"] = step
-
-                mae_logs = pipe_mae.train(progress_callback=_on_mae_step, resume=True)
-        else:
-            mae_logs = pipe_mae.train(progress_callback=make_progress_callback(desc="mae_pretrain"), resume=True)
-
-        print(f"MAE stage complete - steps: {len(mae_logs)}  best avg-epoch loss: {pipe_mae.best_loss:.4f}")
-        del pipe_mae
-        import gc
-        gc.collect()
-        try:
-            import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except OSError:
-            pass
-    else:
-        print("TRAIN_MAE_EPOCHS is 0 - skipping the MAE bootstrap stage")
-    return
+        print("OVERFIT_RUN is False - skipping overfit test")
+        overfit_logs = []
+    return (overfit_logs,)
 
 
 @app.cell
 def _():
-    FORCE_RESTART = True  # Stage 2 must resume=True (FORCE_RESTART=False) to pick up Stage 1's MAE weights;
-    # setting this True skips that bridge and (re)trains Stage 2 from a freshly random-initialized model.
+    FORCE_RESTART = True  # True = restart from scratch, False = resume, landing in the right stage
     return (FORCE_RESTART,)
+
 
 
 @app.cell
@@ -799,8 +675,7 @@ def _(
     text_examples,
     tokenizer,
 ):
-    # diffusion generation via KairosDiffusionGenerationMixin (reuses the HF
-    # DiffusionGemma EntropyBoundSampler + temperature schedule + adaptive stopping)
+    # diffusion generation via KairosDiffusionGenerationMixin (HF EntropyBoundSampler + adaptive)
     _rows = [
         ex
         for ex in eval_examples
@@ -875,8 +750,7 @@ def _(pipe):
 
 @app.cell
 def _():
-    # not needed for a simple crash-recovery
-    # use this only to load a
+    # not needed for simple crash-recovery; use this to load a specific saved checkpoint by path
     RESUME_CKPT_PATH = ""
     return (RESUME_CKPT_PATH,)
 
