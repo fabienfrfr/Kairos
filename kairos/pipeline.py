@@ -274,7 +274,7 @@ class KairosMultimodalPipeline:
 
             def step_fn():
                 batch = next(loader_iter)
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 self.optimizer.zero_grad()
                 with self._autocast():
                     loss = self.hf_trainer.compute_loss(self.model, batch)
@@ -291,7 +291,7 @@ class KairosMultimodalPipeline:
                 # outside that budget (previously: n_bench_steps=1 left avg_step_time_sec=None,
                 # since "remaining" was 0 and this first step's own time was discarded).
                 batch = next(loader_iter)
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
                 def loss_fn():
                     return self.hf_trainer.compute_loss(self.model, batch)
@@ -347,7 +347,7 @@ class KairosMultimodalPipeline:
         optimizer_state = copy.deepcopy(self.optimizer.state_dict())
         loader_iter = iter(self.loader)
         batch = next(loader_iter)
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
         def loss_fn():
             return self.hf_trainer.compute_loss(self.model, batch)
@@ -397,7 +397,7 @@ class KairosMultimodalPipeline:
         try:
             with torch.no_grad():
                 for batch in self.eval_loader:
-                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with self._autocast():
                         losses.append(self.hf_trainer.compute_loss(self.model, batch).item())
                     seen += 1
@@ -485,7 +485,7 @@ class KairosMultimodalPipeline:
                 except StopIteration:
                     it = iter(loader)
                     batch = next(it)
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
                 opt.zero_grad()
                 with self._autocast():
@@ -556,7 +556,7 @@ class KairosMultimodalPipeline:
             for epoch in range(start_epoch, tc.epochs + 1):
                 epoch_loss = 0.0
                 for batch in self.loader:
-                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
                     cache_params = None
                     if use_memory_gate:
@@ -904,7 +904,7 @@ class KairosMultimodalPipeline:
         seen = 0
         with torch.no_grad():
             for batch in self.loader:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 for name, loss_val in self._per_modality_loss_for_batch(batch).items():
                     losses_by_modality[name].append(loss_val)
                 seen += 1
