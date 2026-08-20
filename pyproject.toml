@@ -47,6 +47,16 @@ notebook = [
     "pandas>=2.0",
     "tqdm>=4.67.0",
 ]
+# `pip install -e ".[fast-attn]"` — fused Triton/CUDA kernels for KairosGatedDeltaNet
+# (chunk_gated_delta_rule, causal_conv1d). Without this, attentions.py silently falls back to
+# torch_chunk_gated_delta_rule / torch_causal_conv1d_update (pure PyTorch, no fusion) — every
+# layer runs this path since SWA+DeltaNet are always both computed (see KairosLiZAttention2),
+# so this is usually the single biggest training-speed lever available. Requires a CUDA GPU;
+# not installable on CPU-only machines, hence optional rather than a hard dependency.
+fast-attn = [
+    "flash-linear-attention[cuda]>=0.5.1",
+    "causal-conv1d>=1.4.0",
+]
 
 
 
