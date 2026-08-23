@@ -39,7 +39,7 @@ def sample_lidar():
 
 # ========================= Vocab / backward compatibility =========================
 def test_vocab_size_is_291(tokenizer):
-    """Regression: 259 base bytes/specials + 30 modality/channel/structural tags == 289 (+SEP+MASK=291)."""
+    """Regression: 259 base + 30 modality/channel tags == 289 (+SEP+MASK=291)."""
     assert len(tokenizer) == 291
 
 

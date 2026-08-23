@@ -62,9 +62,7 @@ class KairosConfig(PretrainedConfig):
         self.predict_octet_family = kwargs.get("predict_octet_family", True)
         self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
-        # every modality gets [i, i+1] clipped to existing scales: id 0 (text) stays finest,
-        # higher modality ids default to progressively coarser (more compressed) scales, so a
-        # forgotten modality never silently lands on the finest, most expensive scale 0 alone.
+        # id 0 (text) stays finest; higher ids default to coarser scales, never scale 0 alone
         def _clip(scales):
             return sorted({s for s in scales if 0 <= s < self.num_scales}) or [self.num_scales - 1]
 
@@ -462,8 +460,7 @@ class PyramidalCodec(nn.Module):
         )
 
     def _init_conv(self, d_model):
-        """Depthwise conv encoder/decoder. One shared pre-mixer (full length L, run once) feeds
-        cross-channel context to every scale; per-scale post-mixers stay cheap (run at length G)."""
+        """Depthwise conv encoder/decoder; one shared pre-mixer feeds context to every scale."""
         self.pre_mixer = self._make_bottleneck_mixer(d_model)
         self.encoders = nn.ModuleList()
         self.mixers = nn.ModuleList()

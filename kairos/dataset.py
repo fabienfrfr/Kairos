@@ -4,6 +4,7 @@ import json
 import random
 import uuid
 import warnings
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -45,6 +46,76 @@ def unpack_multimodal_data(data: bytes) -> dict:
         return {k: npz[k] for k in npz.files}
 
 
+_KNOWN_MULTIMODAL_MODALITIES = frozenset({"image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"})
+
+
+def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[MultimodalSegment]:
+    """Dispatch by `modality` (see build_keep_it_simple_multimodal.py)."""
+    modality_scale_factors = modality_scale_factors or {}
+    modality = ex["modality"]
+
+    if modality == "text":
+        return [MultimodalSegment(Modality.TEXT, ex["text"].encode("utf-8"))]
+
+    if modality not in _KNOWN_MULTIMODAL_MODALITIES:
+        raise ValueError(f"unknown example modality: {modality!r}")
+
+    arrays = unpack_multimodal_data(ex["data"])
+    for name, arr in arrays.items():
+        if np.issubdtype(arr.dtype, np.floating) and not np.isfinite(arr).all():
+            raise NonFiniteDataError(f"non-finite values in {modality!r} field {name!r}")
+    meta = json.loads(ex["meta"]) if ex.get("meta") else {}
+    caption = ex.get("caption") or ""
+
+    if modality == "image_caption":
+        sf = modality_scale_factors.get("image_caption")
+        img_markers = KairosTokenizer.encode_image(arrays["image"], scale_factor=sf)
+        return [
+            MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
+            MultimodalSegment(Modality.IMAGE, img_markers),
+        ]
+
+    if modality == "audio_caption":
+        sr = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
+        sf = modality_scale_factors.get("audio_caption")
+        audio_markers = KairosTokenizer.encode_audio(arrays["audio"], tick_samples=sr, scale_factor=sf)
+        return [
+            MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
+            MultimodalSegment(Modality.AUDIO, audio_markers),
+        ]
+
+    if modality == "video_caption":
+        sf = modality_scale_factors.get("video_caption")
+        video_markers = KairosTokenizer.encode_video(arrays["video"], scale_factor=sf)
+        return [
+            MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
+            MultimodalSegment(Modality.VIDEO, video_markers),
+        ]
+
+    if modality == "lidar":
+        sf = modality_scale_factors.get("lidar")
+        return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"], scale_factor=sf))]
+
+    if modality == "imu":
+        sf = modality_scale_factors.get("imu")
+        flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
+        markers = KairosTokenizer.encode_signal(flat, family="STA", scale_factor=sf)
+        return [MultimodalSegment(Modality.STATE, markers)]
+
+    if modality == "control":
+        sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
+        sf = modality_scale_factors.get("control")
+        action_markers = KairosTokenizer.encode_signal(arrays["action"], family="ACT", tick_samples=sample_rate, scale_factor=sf)
+        state_markers = KairosTokenizer.encode_signal(arrays["state"], family="STA", tick_samples=sample_rate, scale_factor=sf)
+        segments = []
+        if caption:
+            segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
+        segments.append(MultimodalSegment(Modality.ACTION, action_markers))
+        segments.append(MultimodalSegment(Modality.STATE, state_markers))
+        return segments
+    return None
+
+
 def _pad_and_gen_mask(ids, prompt_len, max_len, pad_token_id):
     """Pad `ids` to max_len and build a gen_mask that's 0 on the."""
     pad_len = max_len - len(ids)
@@ -52,6 +123,159 @@ def _pad_and_gen_mask(ids, prompt_len, max_len, pad_token_id):
     ids = ids + [pad_token_id] * pad_len
     gen_mask = [0] * prompt_len + [1] * gen_len + [0] * pad_len
     return ids, gen_mask
+
+
+@dataclass
+class ModalityDataStats:
+    """Raw-count and tokenized-length stats for one modality key, sampled from a corpus."""
+
+    modality: str
+    total_examples: int
+    sampled: int
+    tokens_mean: float
+    tokens_min: int
+    tokens_max: int
+    chunks_mean: float
+    chunks_total_estimate: int
+
+
+@dataclass
+class DataDiagnosticReport:
+    """Per-modality raw-vs-tokenized breakdown; see diagnose_multimodal_examples."""
+
+    rows: list[ModalityDataStats]
+    max_len: int
+    total_examples: int
+
+    def __str__(self) -> str:
+        lines = [
+            "Kairos data diagnostic (raw examples -> tokenized chunk estimate)",
+            "----------------------------------------------------------------",
+            f"Total examples:  {self.total_examples}",
+            f"max_len (chunk): {self.max_len}",
+            "",
+            f"{'modality':<16} {'count':>8} {'sampled':>8} {'tok mean':>10} {'tok min':>8} {'tok max':>8} {'chunks/ex':>10} {'chunks (est)':>13}",
+        ]
+        for r in sorted(self.rows, key=lambda r: -r.chunks_total_estimate):
+            lines.append(
+                f"{r.modality:<16} {r.total_examples:>8} {r.sampled:>8} {r.tokens_mean:>10.0f} "
+                f"{r.tokens_min:>8} {r.tokens_max:>8} {r.chunks_mean:>10.2f} {r.chunks_total_estimate:>13}"
+            )
+        lines.append("")
+        lines.append(f"Total estimated chunks (all modalities): {sum(r.chunks_total_estimate for r in self.rows)}")
+        return "\n".join(lines)
+
+
+def diagnose_multimodal_examples(
+    examples, tokenizer=None, modality_scale_factors=None, max_len=1024, sample_size=200, seed=0
+) -> DataDiagnosticReport:
+    """Per-modality raw example count + tokenized-length stats, sampled for speed on big corpora."""
+    tokenizer = tokenizer or KairosTokenizer()
+    modality_scale_factors = modality_scale_factors or {}
+    rng = random.Random(seed)
+
+    by_modality: dict[str, list] = {}
+    for ex in examples:
+        by_modality.setdefault(ex["modality"], []).append(ex)
+
+    rows = []
+    for modality, exs in by_modality.items():
+        sample = exs if len(exs) <= sample_size else rng.sample(exs, sample_size)
+        lengths = []
+        for ex in sample:
+            segments = _segments_for(ex, modality_scale_factors)
+            encoded = tokenizer.encode_multimodal(segments)
+            lengths.append(len(encoded["input_ids"]))
+        mean_tokens = sum(lengths) / len(lengths) if lengths else 0.0
+        mean_chunks = mean_tokens / max_len if max_len else 0.0
+        rows.append(
+            ModalityDataStats(
+                modality=modality,
+                total_examples=len(exs),
+                sampled=len(sample),
+                tokens_mean=mean_tokens,
+                tokens_min=min(lengths) if lengths else 0,
+                tokens_max=max(lengths) if lengths else 0,
+                chunks_mean=mean_chunks,
+                chunks_total_estimate=round(mean_chunks * len(exs)),
+            )
+        )
+    return DataDiagnosticReport(rows=rows, max_len=max_len, total_examples=len(examples))
+
+
+def modality_counts(examples) -> dict[str, int]:
+    """Raw example count per modality, no tokenization — cheap, safe to run on a full corpus."""
+    counts: dict[str, int] = {}
+    for ex in examples:
+        counts[ex["modality"]] = counts.get(ex["modality"], 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def split_examples(examples, eval_pct: float = 10, seed: int = 0) -> tuple[list, list]:
+    """Shuffles then splits examples into (train, eval); eval_pct% goes to eval."""
+    shuffled = list(examples)
+    random.Random(seed).shuffle(shuffled)
+    n_eval = int(len(shuffled) * eval_pct / 100)
+    return shuffled[n_eval:], shuffled[:n_eval]
+
+
+def preview_multimodal_examples(examples, n: int = 3, seed: int = 0) -> None:
+    """Prints caption/meta and plots a small sample of each multimodal modality (matplotlib)."""
+    import matplotlib.pyplot as plt
+
+    rng = np.random.default_rng(seed)
+    by_modality: dict[str, list] = {}
+    for ex in examples:
+        if ex["modality"] != "text":
+            by_modality.setdefault(ex["modality"], []).append(ex)
+
+    for modality, rows in by_modality.items():
+        print(f"--- {modality} ({len(rows)} examples) ---")
+        sample_idx = rng.choice(len(rows), size=min(n, len(rows)), replace=False)
+        for i in sample_idx:
+            row = rows[i]
+            arrays = unpack_multimodal_data(row["data"])
+            caption = (row.get("caption") or "")[:80]
+            meta = json.loads(row["meta"]) if row.get("meta") else {}
+            print(f"  caption: {caption!r}  meta: {meta}")
+            _plot_multimodal_row(plt, modality, arrays)
+
+
+def _plot_multimodal_row(plt, modality: str, arrays: dict) -> None:
+    """One matplotlib panel for a single preview_multimodal_examples row."""
+    if modality == "image_caption":
+        plt.figure(figsize=(2, 2))
+        plt.imshow(arrays["image"])
+        plt.axis("off")
+        plt.show()
+    elif modality == "audio_caption":
+        plt.figure(figsize=(3, 1))
+        plt.plot(arrays["audio"], linewidth=0.5)
+        plt.axis("off")
+        plt.show()
+    elif modality == "video_caption":
+        video = arrays["video"]
+        n_frames = min(4, video.shape[0])
+        _fig, axes = plt.subplots(1, n_frames, figsize=(n_frames * 1.2, 1.2))
+        for j, ax in enumerate(axes if n_frames > 1 else [axes]):
+            ax.imshow(video[j])
+            ax.axis("off")
+        plt.show()
+    elif modality == "lidar":
+        points = np.asarray(arrays["points"], dtype=np.float32)
+        fig = plt.figure(figsize=(2.5, 2.5))
+        ax = fig.add_subplot(projection="3d") if points.shape[1] >= 3 else fig.add_subplot()
+        if points.shape[1] >= 3:
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1)
+        else:
+            ax.scatter(points[:, 0], points[:, 1], s=1)
+        plt.show()
+    elif modality == "control":
+        plt.figure(figsize=(3, 1.2))
+        plt.plot(arrays["state"], label="state")
+        plt.plot(arrays["action"], label="action")
+        plt.legend(fontsize=6)
+        plt.show()
 
 
 class KairosPretrainingDataset(Dataset):
@@ -73,8 +297,7 @@ class KairosPretrainingDataset(Dataset):
         self.target_len = max_len
         self.max_len = (max_len // stride) * stride
         self.pack = pack
-        # per-modality-key override for encode_*'s scale_factor (keys: image_caption/audio_caption/
-        # video_caption/lidar/imu/control); unset keys fall back to the tokenizer's own class defaults
+        # per-modality-key override for encode_*'s scale_factor; unset keys use tokenizer defaults
         self.modality_scale_factors = modality_scale_factors or {}
 
         if multimodal_examples is not None or multimodal_path is not None:
@@ -163,76 +386,8 @@ class KairosPretrainingDataset(Dataset):
             "prompt_len": [0] * len(all_input_ids),
         }
 
-    _KNOWN_MULTIMODAL_MODALITIES = frozenset(
-        {"image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"}
-    )
-
     def _segments_for(self, ex):
-        """Dispatch by `modality` (see build_keep_it_simple_multimodal.py)."""
-        modality = ex["modality"]
-
-        if modality == "text":
-            return [MultimodalSegment(Modality.TEXT, ex["text"].encode("utf-8"))]
-
-        if modality not in self._KNOWN_MULTIMODAL_MODALITIES:
-            raise ValueError(f"unknown example modality: {modality!r}")
-
-        arrays = unpack_multimodal_data(ex["data"])
-        for name, arr in arrays.items():
-            if np.issubdtype(arr.dtype, np.floating) and not np.isfinite(arr).all():
-                # NaN/Inf in a raw modality array
-                raise NonFiniteDataError(f"non-finite values in {modality!r} field {name!r}")
-        meta = json.loads(ex["meta"]) if ex.get("meta") else {}
-        caption = ex.get("caption") or ""
-
-        if modality == "image_caption":
-            sf = self.modality_scale_factors.get("image_caption")
-            img_markers = KairosTokenizer.encode_image(arrays["image"], scale_factor=sf)
-            return [
-                MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
-                MultimodalSegment(Modality.IMAGE, img_markers),
-            ]
-
-        if modality == "audio_caption":
-            sr = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
-            sf = self.modality_scale_factors.get("audio_caption")
-            audio_markers = KairosTokenizer.encode_audio(arrays["audio"], tick_samples=sr, scale_factor=sf)
-            return [
-                MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
-                MultimodalSegment(Modality.AUDIO, audio_markers),
-            ]
-
-        if modality == "video_caption":
-            sf = self.modality_scale_factors.get("video_caption")
-            video_markers = KairosTokenizer.encode_video(arrays["video"], scale_factor=sf)
-            return [
-                MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
-                MultimodalSegment(Modality.VIDEO, video_markers),
-            ]
-
-        if modality == "lidar":
-            sf = self.modality_scale_factors.get("lidar")
-            return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"], scale_factor=sf))]
-
-        if modality == "imu":
-            sf = self.modality_scale_factors.get("imu")
-            flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
-            markers = KairosTokenizer.encode_signal(flat, family="STA", scale_factor=sf)
-            return [MultimodalSegment(Modality.STATE, markers)]
-
-        if modality == "control":
-            sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
-            sf = self.modality_scale_factors.get("control")
-            action = arrays["action"]
-            state = arrays["state"]
-            action_markers = KairosTokenizer.encode_signal(action, family="ACT", tick_samples=sample_rate, scale_factor=sf)
-            state_markers = KairosTokenizer.encode_signal(state, family="STA", tick_samples=sample_rate, scale_factor=sf)
-            segments = []
-            if caption:
-                segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
-            segments.append(MultimodalSegment(Modality.ACTION, action_markers))
-            segments.append(MultimodalSegment(Modality.STATE, state_markers))
-            return segments
+        return _segments_for(ex, self.modality_scale_factors)
 
     def _build_multimodal(self, examples):
         if self.tokenizer is None:

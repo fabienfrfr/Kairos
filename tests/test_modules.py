@@ -438,7 +438,7 @@ def test_kairos_model_forward_logits_mask_restricts_lm_head_to_selected_position
 
 
 def test_kairos_model_forward_logits_mask_matches_full_forward_at_those_positions():
-    # restricting to logits_mask must be a pure optimization: same numbers as a full forward, just fewer of them
+    # restricting to logits_mask must be a pure optimization: same numbers, just fewer of them
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2)
     model = KairosDiffusionFM(cfg)
     model.eval()

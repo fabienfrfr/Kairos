@@ -273,6 +273,76 @@ def test_modality_scale_factors_defaults_to_tokenizer_class_defaults(tokenizer, 
     assert len(ds_omitted) == len(ds_explicit_none)
 
 
+def test_diagnose_multimodal_examples_reports_every_modality(tokenizer, rng):
+    from kairos.dataset import diagnose_multimodal_examples
+
+    examples = [
+        {"modality": "text", "text": "hello world"},
+        make_example("control", action=rng.uniform(-1, 1, 4000).astype(np.float32), state=rng.uniform(-1, 1, 4000).astype(np.float32), sample_rate=8000),
+    ]
+    report = diagnose_multimodal_examples(examples, tokenizer=tokenizer, max_len=1024)
+    modalities = {r.modality for r in report.rows}
+    assert modalities == {"text", "control"}
+    assert report.total_examples == 2
+
+
+def test_diagnose_multimodal_examples_scale_factor_shrinks_chunk_estimate(tokenizer, rng):
+    from kairos.dataset import diagnose_multimodal_examples
+
+    examples = [
+        make_example("control", action=rng.uniform(-1, 1, 4000).astype(np.float32), state=rng.uniform(-1, 1, 4000).astype(np.float32), sample_rate=8000)
+        for _ in range(3)
+    ]
+    default_report = diagnose_multimodal_examples(examples, tokenizer=tokenizer, max_len=1024)
+    scaled_report = diagnose_multimodal_examples(
+        examples, tokenizer=tokenizer, max_len=1024, modality_scale_factors={"control": 16}
+    )
+    default_chunks = next(r.chunks_total_estimate for r in default_report.rows if r.modality == "control")
+    scaled_chunks = next(r.chunks_total_estimate for r in scaled_report.rows if r.modality == "control")
+    assert scaled_chunks < default_chunks
+
+
+def test_pipeline_data_report_matches_diagnose_multimodal_examples(tokenizer, rng):
+    from kairos.dataset import diagnose_multimodal_examples
+    from kairos.modeling import KairosConfig
+    from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+
+    examples = [
+        {"modality": "text", "text": "hello world"},
+        make_example("control", action=rng.uniform(-1, 1, 4000).astype(np.float32), state=rng.uniform(-1, 1, 4000).astype(np.float32), sample_rate=8000),
+    ]
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    dc = DataConfig(multimodal_examples=examples, max_len=256)
+    pipe = KairosMultimodalPipeline(model_config, dc, TrainConfig(run_dir="unused"), tokenizer=tokenizer)
+
+    pipe_report = pipe.data_report(sample_size=200)
+    direct_report = diagnose_multimodal_examples(examples, tokenizer=tokenizer, max_len=256, sample_size=200)
+    assert {r.modality: r.chunks_total_estimate for r in pipe_report.rows} == {
+        r.modality: r.chunks_total_estimate for r in direct_report.rows
+    }
+
+
+def test_modality_counts_groups_and_sorts_descending():
+    from kairos.dataset import modality_counts
+
+    examples = [{"modality": "text"}] * 5 + [{"modality": "control"}] * 2 + [{"modality": "lidar"}] * 1
+    counts = modality_counts(examples)
+    assert counts == {"text": 5, "control": 2, "lidar": 1}
+    assert list(counts.keys()) == ["text", "control", "lidar"]  # sorted by count, descending
+
+
+def test_split_examples_respects_eval_pct_and_is_deterministic():
+    from kairos.dataset import split_examples
+
+    examples = [{"modality": "text", "text": str(i)} for i in range(100)]
+    train_a, eval_a = split_examples(examples, eval_pct=20, seed=0)
+    train_b, eval_b = split_examples(examples, eval_pct=20, seed=0)
+    assert len(eval_a) == 20
+    assert len(train_a) == 80
+    assert train_a == train_b and eval_a == eval_b  # same seed -> same split
+    assert {ex["text"] for ex in train_a}.isdisjoint(ex["text"] for ex in eval_a)
+
+
 def test_text_dataset_defaults_to_cosmopedia_when_no_texts_given(tokenizer, monkeypatch):
     def fake_config_names(name):
         return ["sample"]

@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
-from .dataset import KairosPretrainingDataset
+from .dataset import DataDiagnosticReport, KairosPretrainingDataset, diagnose_multimodal_examples
 from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import (
@@ -52,8 +52,7 @@ class DataConfig:
     pack: bool = False  # concatenate samples before chunking so
     num_workers: int | None = None  # None: 4 if batch_size > 1 else 0. Set explicitly to
     # override to e.g. 0 on a memory-constrained machine: each worker forks the parent process.
-    # per-modality-key encode_* scale_factor override (keys: image_caption/audio_caption/
-    # video_caption/lidar/imu/control); unset keys use the tokenizer's own class defaults
+    # per-modality-key encode_* scale_factor override; unset keys use tokenizer defaults
     modality_scale_factors: dict | None = None
 
 
@@ -248,7 +247,7 @@ class KairosMultimodalPipeline:
         self.model = KairosDiffusionFM(
             self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
         ).to(self.device)
-        # split each batch across all visible GPUs; state_dict/generate keep using the raw self.model
+        # split each batch across visible GPUs; state_dict/generate keep using self.model
         n_gpus = torch.cuda.device_count()
         self.model_forward = torch.nn.DataParallel(self.model) if n_gpus > 1 else self.model
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
@@ -380,7 +379,7 @@ class KairosMultimodalPipeline:
 
     # ------------------------------------------------------------ time profile
     def profile(self, n_steps: int = 3) -> ModuleTimeReport:
-        """Per-module wall-clock time (forward+backward), averaged over n_steps; state restored after."""
+        """Per-module wall-clock time (fwd+bwd), avg over n_steps; restores state after."""
         self._require_built()
         model_state = copy.deepcopy(self.model.state_dict())
         optimizer_state = copy.deepcopy(self.optimizer.state_dict())
@@ -405,6 +404,22 @@ class KairosMultimodalPipeline:
             self.optimizer.load_state_dict(optimizer_state)
             del model_state, optimizer_state
             self._release_transient_memory()
+
+    def data_report(self, sample_size: int = 200) -> DataDiagnosticReport:
+        """Per-modality raw-vs-tokenized stats for this pipeline's dataset (see diagnose_multimodal_examples)."""
+        dc = self.data_config
+        examples = dc.multimodal_examples
+        if examples is None and dc.multimodal_path:
+            examples = torch.load(dc.multimodal_path, weights_only=False)
+        if not examples:
+            raise RuntimeError("data_report needs data_config.multimodal_examples or multimodal_path")
+        return diagnose_multimodal_examples(
+            examples,
+            tokenizer=self.tokenizer,
+            modality_scale_factors=dc.modality_scale_factors,
+            max_len=dc.max_len,
+            sample_size=sample_size,
+        )
 
     @staticmethod
     def _release_transient_memory() -> None:

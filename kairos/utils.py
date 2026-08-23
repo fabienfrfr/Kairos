@@ -247,7 +247,7 @@ def detailed_memory_report(model, optimizer, loss_fn, device, autocast_ctx=None,
 
 @dataclass
 class ModuleTimeReport:
-    """Wall-clock time per module: forward + backward self-time (excludes children), avg over n_steps."""
+    """Wall-clock time per module: fwd+bwd self-time (excludes children), avg over n_steps."""
 
     rows: list[dict]  # {name, module_type, fwd_ms, bwd_ms, self_ms, calls}
     step_ms: float

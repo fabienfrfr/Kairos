@@ -42,7 +42,6 @@ def _():
 @app.cell
 def _():
     import os
-    import random
     from pathlib import Path
 
     # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
@@ -55,6 +54,7 @@ def _():
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
     from kairos.utils import make_progress_callback
+    from kairos.dataset import modality_counts, split_examples, preview_multimodal_examples
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
@@ -69,8 +69,10 @@ def _():
         Path,
         TrainConfig,
         make_progress_callback,
+        modality_counts,
         pd,
-        random,
+        preview_multimodal_examples,
+        split_examples,
         tokenizer,
         torch,
     )
@@ -146,10 +148,11 @@ def _(TEXT_PCT, TEXT_SOURCE):
 
 
 @app.cell
-def _(multimodal_examples, pd, text_examples):
+def _(modality_counts, multimodal_examples, text_examples):
     _all_ex = list(text_examples) + list(multimodal_examples)
     print(f"total examples: {len(_all_ex)}")
-    print(pd.Series([ex["modality"] for ex in _all_ex]).value_counts())
+    for _modality, _count in modality_counts(_all_ex).items():
+        print(f"  {_modality:<16} {_count}")
     return
 
 
@@ -160,76 +163,18 @@ def _():
 
 
 @app.cell
-def _(SHOW_PREVIEW, multimodal_examples):
+def _(SHOW_PREVIEW, multimodal_examples, preview_multimodal_examples):
     if SHOW_PREVIEW and multimodal_examples:
-        import json as _json
-
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        from kairos.dataset import unpack_multimodal_data
-
-        _by_modality: dict[str, list] = {}
-        for _ex in multimodal_examples:
-            _by_modality.setdefault(_ex["modality"], []).append(_ex)
-
-        for _mod, _rows in _by_modality.items():
-            print(f"--- {_mod} ({len(_rows)} examples) ---")
-            _sample = np.random.default_rng(0).choice(len(_rows), size=min(3, len(_rows)), replace=False)
-            for _i in _sample:
-                _row = _rows[_i]
-                _arrays = unpack_multimodal_data(_row["data"])
-                _caption = (_row.get("caption") or "")[:80]
-                _meta = _json.loads(_row["meta"]) if _row.get("meta") else {}
-                print(f"  caption: {_caption!r}  meta: {_meta}")
-
-                if _mod == "image_caption":
-                    plt.figure(figsize=(2, 2))
-                    plt.imshow(_arrays["image"])
-                    plt.axis("off")
-                    plt.show()
-                elif _mod == "audio_caption":
-                    plt.figure(figsize=(3, 1))
-                    plt.plot(_arrays["audio"], linewidth=0.5)
-                    plt.axis("off")
-                    plt.show()
-                elif _mod == "video_caption":
-                    _video = _arrays["video"]
-                    _n = min(4, _video.shape[0])
-                    _fig, _axes = plt.subplots(1, _n, figsize=(_n * 1.2, 1.2))
-                    for _j, _ax in enumerate(_axes if _n > 1 else [_axes]):
-                        _ax.imshow(_video[_j])
-                        _ax.axis("off")
-                    plt.show()
-                elif _mod == "lidar":
-                    _points = np.asarray(_arrays["points"], dtype=np.float32)
-                    _fig = plt.figure(figsize=(2.5, 2.5))
-                    _ax = _fig.add_subplot(projection="3d") if _points.shape[1] >= 3 else _fig.add_subplot()
-                    if _points.shape[1] >= 3:
-                        _ax.scatter(_points[:, 0], _points[:, 1], _points[:, 2], s=1)
-                    else:
-                        _ax.scatter(_points[:, 0], _points[:, 1], s=1)
-                    plt.show()
-                elif _mod == "control":
-                    plt.figure(figsize=(3, 1.2))
-                    plt.plot(_arrays["state"], label="state")
-                    plt.plot(_arrays["action"], label="action")
-                    plt.legend(fontsize=6)
-                    plt.show()
+        preview_multimodal_examples(multimodal_examples, n=3)
     else:
         print("preview skipped")
     return
 
 
 @app.cell
-def _(EVAL_PCT, multimodal_examples, random, text_examples):
+def _(EVAL_PCT, multimodal_examples, split_examples, text_examples):
     _all_ex = list(text_examples) + list(multimodal_examples)
-    _rng = random.Random(0)
-    _shuffled = _all_ex.copy()
-    _rng.shuffle(_shuffled)
-    _n_eval = int(len(_shuffled) * EVAL_PCT / 100)
-    eval_examples = _shuffled[:_n_eval]
-    train_examples = _shuffled[_n_eval:]
+    train_examples, eval_examples = split_examples(_all_ex, eval_pct=EVAL_PCT, seed=0)
     print(f"train: {len(train_examples)} ({100 - EVAL_PCT}%)  eval: {len(eval_examples)} ({EVAL_PCT}%)")
     return eval_examples, train_examples
 
@@ -286,9 +231,7 @@ def _(Modality):
 
 @app.cell
 def _():
-    # per-modality-key encode_* scale_factor: audio/control default block-mean x4 already
-    # bounds raw PCM to a comparable token budget as image/video/lidar (see KairosTokenizer
-    # PCM_SCALE_FACTOR); override here per dataset-building key if the mix changes.
+    # per-modality encode_* scale_factor override; None uses the tokenizer's class default
     modality_scale_factors = {
         "audio_caption": None,  # None -> KairosTokenizer.PCM_SCALE_FACTOR default (4)
         "control": None,
@@ -532,6 +475,14 @@ def _(RUN_BENCHMARK, pipe):
     # per-module wall-clock time (self-time, excludes children); shows where compute actually goes
     if RUN_BENCHMARK:
         print(pipe.profile(n_steps=3))
+    return
+
+
+@app.cell
+def _(RUN_BENCHMARK, pipe):
+    # per-modality raw-vs-tokenized breakdown: where dataset rows/steps actually come from
+    if RUN_BENCHMARK:
+        print(pipe.data_report())
     return
 
 

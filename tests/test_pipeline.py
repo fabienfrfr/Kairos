@@ -150,7 +150,7 @@ def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
 
 
 def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
-    # full-width (d_model=768, matching the real KairosConfig) but trimmed batch/epochs/seq-len to stay fast in CI
+    # full-width (d_model=768) but trimmed batch/epochs/seq-len to stay fast in CI
     model_config = KairosConfig(d_model=768, n_heads=12, n_layers=2)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog "}] * 4
     data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
@@ -734,7 +734,7 @@ def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pip
     assert summary.measured_memory is True
     assert summary.param_memory_mb > 0
     assert summary.optimizer_memory_mb > 0
-    # sanity: measured optimizer memory scales with trainable params (state is fp32 regardless of dtype)
+    # sanity: optimizer memory scales with trainable params (state is fp32 regardless of dtype)
     assert summary.optimizer_memory_mb > 0.5 * summary.param_memory_mb
 
 
