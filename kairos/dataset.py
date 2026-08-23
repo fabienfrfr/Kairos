@@ -66,12 +66,16 @@ class KairosPretrainingDataset(Dataset):
         multimodal_examples=None,
         multimodal_path=None,
         pack=False,
+        modality_scale_factors=None,
     ):
         self.tokenizer = tokenizer
         self.stride = stride
         self.target_len = max_len
         self.max_len = (max_len // stride) * stride
         self.pack = pack
+        # per-modality-key override for encode_*'s scale_factor (keys: image_caption/audio_caption/
+        # video_caption/lidar/imu/control); unset keys fall back to the tokenizer's own class defaults
+        self.modality_scale_factors = modality_scale_factors or {}
 
         if multimodal_examples is not None or multimodal_path is not None:
             if multimodal_examples is None:
@@ -182,7 +186,8 @@ class KairosPretrainingDataset(Dataset):
         caption = ex.get("caption") or ""
 
         if modality == "image_caption":
-            img_markers = KairosTokenizer.encode_image(arrays["image"])
+            sf = self.modality_scale_factors.get("image_caption")
+            img_markers = KairosTokenizer.encode_image(arrays["image"], scale_factor=sf)
             return [
                 MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
                 MultimodalSegment(Modality.IMAGE, img_markers),
@@ -190,33 +195,38 @@ class KairosPretrainingDataset(Dataset):
 
         if modality == "audio_caption":
             sr = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
-            audio_markers = KairosTokenizer.encode_audio(arrays["audio"], tick_samples=sr)
+            sf = self.modality_scale_factors.get("audio_caption")
+            audio_markers = KairosTokenizer.encode_audio(arrays["audio"], tick_samples=sr, scale_factor=sf)
             return [
                 MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
                 MultimodalSegment(Modality.AUDIO, audio_markers),
             ]
 
         if modality == "video_caption":
-            video_markers = KairosTokenizer.encode_video(arrays["video"])
+            sf = self.modality_scale_factors.get("video_caption")
+            video_markers = KairosTokenizer.encode_video(arrays["video"], scale_factor=sf)
             return [
                 MultimodalSegment(Modality.TEXT, caption.encode("utf-8")),
                 MultimodalSegment(Modality.VIDEO, video_markers),
             ]
 
         if modality == "lidar":
-            return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"]))]
+            sf = self.modality_scale_factors.get("lidar")
+            return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"], scale_factor=sf))]
 
         if modality == "imu":
+            sf = self.modality_scale_factors.get("imu")
             flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
-            markers = KairosTokenizer.encode_signal(flat, family="STA")
+            markers = KairosTokenizer.encode_signal(flat, family="STA", scale_factor=sf)
             return [MultimodalSegment(Modality.STATE, markers)]
 
         if modality == "control":
             sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
+            sf = self.modality_scale_factors.get("control")
             action = arrays["action"]
             state = arrays["state"]
-            action_markers = KairosTokenizer.encode_signal(action, family="ACT", tick_samples=sample_rate)
-            state_markers = KairosTokenizer.encode_signal(state, family="STA", tick_samples=sample_rate)
+            action_markers = KairosTokenizer.encode_signal(action, family="ACT", tick_samples=sample_rate, scale_factor=sf)
+            state_markers = KairosTokenizer.encode_signal(state, family="STA", tick_samples=sample_rate, scale_factor=sf)
             segments = []
             if caption:
                 segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))

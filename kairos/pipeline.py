@@ -29,10 +29,12 @@ from .trainer import (
 )
 from .utils import (
     DetailedMemoryReport,
+    ModuleTimeReport,
     TrainingSummary,
     benchmark_step_time,
     detailed_memory_report,
     locate_first_nonfinite_module,
+    profile_module_time,
     training_summary,
 )
 
@@ -50,6 +52,9 @@ class DataConfig:
     pack: bool = False  # concatenate samples before chunking so
     num_workers: int | None = None  # None: 4 if batch_size > 1 else 0. Set explicitly to
     # override to e.g. 0 on a memory-constrained machine: each worker forks the parent process.
+    # per-modality-key encode_* scale_factor override (keys: image_caption/audio_caption/
+    # video_caption/lidar/imu/control); unset keys use the tokenizer's own class defaults
+    modality_scale_factors: dict | None = None
 
 
 @dataclass
@@ -192,6 +197,7 @@ class KairosMultimodalPipeline:
                 max_len=dc.max_len,
                 stride=dc.stride,
                 pack=dc.pack,
+                modality_scale_factors=dc.modality_scale_factors,
             )
         elif dc.multimodal_path:
             ds = KairosPretrainingDataset(
@@ -200,6 +206,7 @@ class KairosMultimodalPipeline:
                 max_len=dc.max_len,
                 stride=dc.stride,
                 pack=dc.pack,
+                modality_scale_factors=dc.modality_scale_factors,
             )
         else:
             raise ValueError("DataConfig needs multimodal_examples, text_examples, and/or multimodal_path")
@@ -241,6 +248,9 @@ class KairosMultimodalPipeline:
         self.model = KairosDiffusionFM(
             self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
         ).to(self.device)
+        # split each batch across all visible GPUs; state_dict/generate keep using the raw self.model
+        n_gpus = torch.cuda.device_count()
+        self.model_forward = torch.nn.DataParallel(self.model) if n_gpus > 1 else self.model
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
@@ -284,7 +294,7 @@ class KairosMultimodalPipeline:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 self.optimizer.zero_grad()
                 with self._autocast():
-                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                    loss = self.hf_trainer.compute_loss(self.model_forward, batch)
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
@@ -297,7 +307,7 @@ class KairosMultimodalPipeline:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
                 def loss_fn():
-                    return self.hf_trainer.compute_loss(self.model, batch)
+                    return self.hf_trainer.compute_loss(self.model_forward, batch)
 
                 t0 = time.perf_counter()
                 mem_report = detailed_memory_report(
@@ -351,7 +361,7 @@ class KairosMultimodalPipeline:
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
         def loss_fn():
-            return self.hf_trainer.compute_loss(self.model, batch)
+            return self.hf_trainer.compute_loss(self.model_forward, batch)
 
         try:
             return detailed_memory_report(
@@ -362,6 +372,34 @@ class KairosMultimodalPipeline:
                 autocast_ctx=self._autocast,
                 scaler=self.scaler,
             )
+        finally:
+            self.model.load_state_dict(model_state)
+            self.optimizer.load_state_dict(optimizer_state)
+            del model_state, optimizer_state
+            self._release_transient_memory()
+
+    # ------------------------------------------------------------ time profile
+    def profile(self, n_steps: int = 3) -> ModuleTimeReport:
+        """Per-module wall-clock time (forward+backward), averaged over n_steps; state restored after."""
+        self._require_built()
+        model_state = copy.deepcopy(self.model.state_dict())
+        optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+        loader_iter = iter(self.loader)
+        batch = next(loader_iter)
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+
+        def step_fn():
+            self.optimizer.zero_grad()
+            with self._autocast():
+                loss = self.hf_trainer.compute_loss(self.model_forward, batch)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+        try:
+            return profile_module_time(self.model, step_fn, self.device, n_steps=n_steps)
         finally:
             self.model.load_state_dict(model_state)
             self.optimizer.load_state_dict(optimizer_state)
@@ -396,7 +434,7 @@ class KairosMultimodalPipeline:
                 for batch in self.eval_loader:
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with self._autocast():
-                        losses.append(self.hf_trainer.compute_loss(self.model, batch).item())
+                        losses.append(self.hf_trainer.compute_loss(self.model_forward, batch).item())
                     seen += 1
                     if tc.eval_batches and seen >= tc.eval_batches:
                         break
@@ -498,7 +536,7 @@ class KairosMultimodalPipeline:
                 opt.zero_grad()
                 self.hf_trainer.mask_p_max, self.hf_trainer.mask_reweight = stage_at(step)
                 with self._autocast():
-                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                    loss = self.hf_trainer.compute_loss(self.model_forward, batch)
                 loss_val = loss.item()
                 if not math.isfinite(loss_val):
                     warnings.warn(

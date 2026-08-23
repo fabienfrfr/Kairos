@@ -105,6 +105,9 @@ class KairosTokenizer(ByT5Tokenizer):
     LIDAR_XYZ_RANGE = (-100.0, 100.0)
     LIDAR_INTENSITY_RANGE = (0.0, 1.0)
     SIGNAL_VALUE_RANGE = (-1.0, 1.0)  # state/action/imu channels are expected pre-clipped to this
+    IMAGE_SCALE_FACTOR = 1  # default spatial block-mean factor for encode_image/encode_video
+    LIDAR_SCALE_FACTOR = 1  # default point-stride factor for encode_lidar
+    PCM_SCALE_FACTOR = 4  # default block-mean factor for encode_audio/encode_signal
     NUM_OCTET_FAMILIES = NUM_OCTET_FAMILIES
 
     def __init__(self, *args, **kwargs):
@@ -137,11 +140,25 @@ class KairosTokenizer(ByT5Tokenizer):
         return [cycle[i % len(cycle)] for i in range(n)]
 
     # ---------------- IMAGE: row-delimited, no header ----------------
+    @staticmethod
+    def _scale_hw(frame: np.ndarray, scale_factor: int) -> np.ndarray:
+        """Block-mean downsamples the H,W dims of a (H,W,C) uint8 array by an integer factor."""
+        if scale_factor <= 1:
+            return frame
+        h, w, c = frame.shape
+        pad_h, pad_w = (-h) % scale_factor, (-w) % scale_factor
+        if pad_h or pad_w:
+            frame = np.pad(frame, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+        h2, w2 = frame.shape[0] // scale_factor, frame.shape[1] // scale_factor
+        blocks = frame.reshape(h2, scale_factor, w2, scale_factor, c)
+        return blocks.mean(axis=(1, 3)).round().astype(np.uint8)
+
     @classmethod
-    def encode_image(cls, image: np.ndarray) -> list:
-        """(H, W, C) uint8 -> marker-list, one <ENDLINE> per row."""
+    def encode_image(cls, image: np.ndarray, scale_factor: int | None = None) -> list:
+        """(H, W, C) uint8 -> marker-list, one <ENDLINE> per row. scale_factor block-means H,W down."""
         if image.dtype != np.uint8 or image.ndim != 3:
             raise ValueError("encode_image expects a (H, W, C) uint8 array")
+        image = cls._scale_hw(image, scale_factor if scale_factor is not None else cls.IMAGE_SCALE_FACTOR)
         return cls._encode_frame_rows(image)
 
     @staticmethod
@@ -195,12 +212,14 @@ class KairosTokenizer(ByT5Tokenizer):
 
     # ---------------- VIDEO: rows + <ENDFRAME> ----------------
     @classmethod
-    def encode_video(cls, frames: np.ndarray, stride: int = 1) -> list:
+    def encode_video(cls, frames: np.ndarray, stride: int = 1, scale_factor: int | None = None) -> list:
+        """stride subsamples frames (temporal); scale_factor block-means each frame's H,W (spatial)."""
         if frames.dtype != np.uint8 or frames.ndim != 4:
             raise ValueError("encode_video expects a (T, H, W, C) uint8 array")
+        factor = scale_factor if scale_factor is not None else cls.IMAGE_SCALE_FACTOR
         out = []
         for frame in frames[::stride]:
-            out.extend(cls._encode_frame_rows(frame))
+            out.extend(cls._encode_frame_rows(cls._scale_hw(frame, factor)))
             out.append(("marker", "<ENDFRAME>"))
         return out
 
@@ -227,8 +246,22 @@ class KairosTokenizer(ByT5Tokenizer):
         return stacked, duration
 
     # ---------------- shared PCM codec: N-byte place-value quantization for 1D signals ----------------
+    @staticmethod
+    def _decimate_1d(values: np.ndarray, scale_factor: int) -> np.ndarray:
+        """Block-means every scale_factor consecutive raw samples into 1 (no-op if factor <= 1)."""
+        if scale_factor <= 1:
+            return values
+        n = len(values)
+        pad = (-n) % scale_factor
+        if pad:
+            values = np.concatenate([values, np.full(pad, values[-1], dtype=values.dtype)])
+        return values.reshape(-1, scale_factor).mean(axis=1).astype(values.dtype)
+
     @classmethod
-    def _encode_pcm(cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, family_cycle: tuple, n_bytes: int) -> list:
+    def _encode_pcm(
+        cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, family_cycle: tuple, n_bytes: int, scale_factor: int
+    ) -> list:
+        values = cls._decimate_1d(values, scale_factor)
         planes = _quantize_planes(values, lo, hi, n_bytes)  # (N, n_bytes), one family id per byte-plane
         out = []
         for start in range(0, len(planes), tick_samples):
@@ -254,11 +287,15 @@ class KairosTokenizer(ByT5Tokenizer):
 
     # ---------------- AUDIO: flat PCM + periodic <TICK>, n_bytes=2 (16-bit) by default ----------------
     @classmethod
-    def encode_audio(cls, waveform: np.ndarray, tick_samples: int | None = None, n_bytes: int = 2) -> list:
+    def encode_audio(
+        cls, waveform: np.ndarray, tick_samples: int | None = None, n_bytes: int = 2, scale_factor: int | None = None
+    ) -> list:
+        """scale_factor block-means every N raw samples into 1 before quantizing (default PCM_SCALE_FACTOR)."""
         if waveform.dtype != np.float32:
             raise ValueError("encode_audio expects a float32 waveform in [-1, 1]")
         family_cycle = tuple(f"AUD{p}" for p in range(n_bytes))  # hi, lo, ...
-        return cls._encode_pcm(waveform, -1.0, 1.0, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes)
+        factor = scale_factor if scale_factor is not None else cls.PCM_SCALE_FACTOR
+        return cls._encode_pcm(waveform, -1.0, 1.0, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes, factor)
 
     def decode_audio(self, ids: list[int], tick_samples: int | None = None, n_bytes: int = 2):
         """Returns (waveform, duration_seconds); duration = len(waveform)/AUDIO_SAMPLE_RATE."""
@@ -267,21 +304,32 @@ class KairosTokenizer(ByT5Tokenizer):
 
     # ------------- SIGNAL: generic control channel (state/action/imu), family picks its own id family -------------
     @classmethod
-    def encode_signal(cls, values: np.ndarray, family: str, tick_samples: int | None = None, n_bytes: int = 2) -> list:
+    def encode_signal(
+        cls, values: np.ndarray, family: str, tick_samples: int | None = None, n_bytes: int = 2, scale_factor: int | None = None
+    ) -> list:
         """Same place-value PCM scheme as audio, tagged with its own family (e.g. "ACT" vs "STA")."""
         if values.dtype != np.float32:
             raise ValueError("encode_signal expects a float32 array in [-1, 1]")
         family_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
-        return cls._encode_pcm(values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes)
+        factor = scale_factor if scale_factor is not None else cls.PCM_SCALE_FACTOR
+        return cls._encode_pcm(
+            values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes, factor
+        )
 
     def decode_signal(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
         return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, n_bytes)
 
     # ---------------- LIDAR: point groups + fixed quantization bounds, n_bytes=2 per channel ----------------
     @classmethod
-    def encode_lidar(cls, points: np.ndarray, points_per_group: int | None = None, n_bytes: int = 2) -> list:
+    def encode_lidar(
+        cls, points: np.ndarray, points_per_group: int | None = None, n_bytes: int = 2, scale_factor: int | None = None
+    ) -> list:
+        """scale_factor keeps every Nth point (uniform stride subsample) before quantizing."""
         if points.dtype != np.float32 or points.ndim != 2 or points.shape[-1] != 4:
             raise ValueError("encode_lidar expects a (N, 4) float32 array [x,y,z,intensity]")
+        factor = scale_factor if scale_factor is not None else cls.LIDAR_SCALE_FACTOR
+        if factor > 1:
+            points = points[::factor]
         points_per_group = points_per_group or cls.LIDAR_POINTS_PER_GROUP
         xyz_lo, xyz_hi = cls.LIDAR_XYZ_RANGE
         int_lo, int_hi = cls.LIDAR_INTENSITY_RANGE

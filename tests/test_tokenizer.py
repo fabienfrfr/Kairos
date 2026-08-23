@@ -91,7 +91,7 @@ def test_signal_roundtrip_precision_beats_8bit(tokenizer):
     # 16-bit place-value quantization must resolve a step far finer than the old 8-bit scheme
     rng = np.random.default_rng(0)
     values = rng.uniform(-1, 1, 200).astype(np.float32)
-    markers = KairosTokenizer.encode_signal(values, family="ACT")
+    markers = KairosTokenizer.encode_signal(values, family="ACT", scale_factor=1)
     ids, _ = tokenizer._resolve_markers(markers)
     recon = tokenizer.decode_signal(ids)
     assert np.max(np.abs(recon - values)) < (2 / 255)  # much tighter than the old 8-bit step
@@ -139,6 +139,16 @@ def test_image_roundtrip(tokenizer, sample_image):
     decoded = tokenizer.decode_multimodal(out["input_ids"])
     recon = tokenizer.decode_image(decoded[0].data)
     assert np.array_equal(recon, sample_image)
+
+
+def test_image_scale_factor_downsamples_hw(tokenizer, sample_image):
+    """scale_factor=2 block-means H,W down (with edge padding for odd dims), C untouched."""
+    markers = KairosTokenizer.encode_image(sample_image, scale_factor=2)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon = tokenizer.decode_image(decoded[0].data)
+    h, w, c = sample_image.shape
+    assert recon.shape == (-(-h // 2), -(-w // 2), c)
 
 
 def test_image_endline_every_row(tokenizer, sample_image):
@@ -203,22 +213,39 @@ def test_video_rejects_inconsistent_frame_shapes(tokenizer):
 
 
 # ========================= AUDIO: periodic <TICK>, duration from tick =========================
-def test_audio_roundtrip_and_duration(tokenizer, sample_audio):
+def test_audio_decimated_by_pcm_scale_factor(tokenizer, sample_audio):
+    """encode_audio block-means every PCM_SCALE_FACTOR raw samples into 1 by default."""
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
     decoded = tokenizer.decode_multimodal(out["input_ids"])
-    recon, duration = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
-    assert len(recon) == len(sample_audio)
-    assert duration == pytest.approx(len(sample_audio) / KairosTokenizer.AUDIO_SAMPLE_RATE)
+    recon, _ = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
+    factor = KairosTokenizer.PCM_SCALE_FACTOR
+    expected = sample_audio.reshape(-1, factor).mean(axis=1).astype(np.float32)
+    assert len(recon) == len(expected) == len(sample_audio) // factor
     max_step = 2 / (256**2 - 1)  # 16-bit place-value quantization over [-1, 1]
-    assert np.max(np.abs(recon - sample_audio)) < max_step + 1e-6
+    assert np.max(np.abs(recon - expected)) < max_step + 1e-6
+
+
+def test_audio_scale_factor_one_disables_decimation(tokenizer):
+    """scale_factor=1 is a no-op: bit-exact roundtrip, same as before decimation was added."""
+    rng = np.random.default_rng(1)
+    short_audio = rng.uniform(-1, 1, 512).astype(np.float32)
+    markers = KairosTokenizer.encode_audio(short_audio, tick_samples=16_000, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon, duration = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
+    assert len(recon) == len(short_audio)
+    assert duration == pytest.approx(len(short_audio) / KairosTokenizer.AUDIO_SAMPLE_RATE)
+    max_step = 2 / (256**2 - 1)
+    assert np.max(np.abs(recon - short_audio)) < max_step + 1e-6
 
 
 def test_audio_tick_count(tokenizer, sample_audio):
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
     ids, _ = tokenizer._resolve_markers(markers)
     num_ticks = sum(1 for tid in ids if tid == tokenizer._tick_id)
-    assert num_ticks == -(-len(sample_audio) // 16_000)  # ceil division
+    decimated_len = len(sample_audio) // KairosTokenizer.PCM_SCALE_FACTOR
+    assert num_ticks == -(-decimated_len // 16_000)  # ceil division
 
 
 # ======================= LIDAR: <PTSEP>, fixed quantization bounds ========================
@@ -232,6 +259,14 @@ def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
     max_step = (xyz_hi - xyz_lo) / (256**2 - 1)  # 16-bit place-value quantization
     assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
+
+
+def test_lidar_scale_factor_keeps_every_nth_point(tokenizer, sample_lidar):
+    markers = KairosTokenizer.encode_lidar(sample_lidar, scale_factor=3)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.LIDAR, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon = tokenizer.decode_lidar(decoded[0].data)
+    assert recon.shape[0] == len(sample_lidar[::3])
 
 
 def test_lidar_rejects_wrong_shape():
@@ -322,7 +357,7 @@ def test_audio_decode_keeps_trailing_samples_without_final_tick_marker(tokenizer
     ids, _ = tokenizer._resolve_markers(markers)
     ids_no_trailing_marker = ids[:-1]  # drop the last <TICK>
     waveform, _ = tokenizer.decode_audio(ids_no_trailing_marker)
-    assert waveform.shape[0] == sample_audio.shape[0]
+    assert waveform.shape[0] == len(sample_audio) // KairosTokenizer.PCM_SCALE_FACTOR
 
 
 def test_decode_lidar_rejects_payload_not_multiple_of_eight(tokenizer):

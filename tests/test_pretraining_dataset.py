@@ -239,6 +239,40 @@ def test_large_multimodal_build_does_not_materialize_everything_in_process_memor
     )
 
 
+def test_modality_scale_factors_override_reduces_row_count(tokenizer, rng):
+    """A larger explicit scale_factor for 'control' shrinks its token count -> fewer chunks."""
+    ex = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 4000).astype(np.float32),
+            state=rng.uniform(-1, 1, 4000).astype(np.float32),
+            sample_rate=8000,
+        )
+    ]
+    ds_default = KairosPretrainingDataset(multimodal_examples=ex, tokenizer=tokenizer, max_len=256, stride=1)
+    ds_scaled = KairosPretrainingDataset(
+        multimodal_examples=ex,
+        tokenizer=tokenizer,
+        max_len=256,
+        stride=1,
+        modality_scale_factors={"control": 16},
+    )
+    assert len(ds_scaled) < len(ds_default)
+
+
+def test_modality_scale_factors_defaults_to_tokenizer_class_defaults(tokenizer, all_kinds_examples):
+    """Omitting modality_scale_factors entirely must match passing an all-None dict explicitly."""
+    ds_omitted = KairosPretrainingDataset(multimodal_examples=all_kinds_examples, tokenizer=tokenizer, max_len=128, stride=1)
+    ds_explicit_none = KairosPretrainingDataset(
+        multimodal_examples=all_kinds_examples,
+        tokenizer=tokenizer,
+        max_len=128,
+        stride=1,
+        modality_scale_factors={k: None for k in ["image_caption", "audio_caption", "video_caption", "lidar", "imu", "control"]},
+    )
+    assert len(ds_omitted) == len(ds_explicit_none)
+
+
 def test_text_dataset_defaults_to_cosmopedia_when_no_texts_given(tokenizer, monkeypatch):
     def fake_config_names(name):
         return ["sample"]

@@ -116,6 +116,13 @@ def test_kairos_config_modality_scales_default_clips_to_num_scales():
         assert all(s < 2 for s in scales)
 
 
+def test_kairos_config_default_modality_scales_never_finest_only_beyond_id_1():
+    # a forgotten/unconfigured heavy modality (id >= 3) must not silently land on scale 0 alone
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=4, num_modalities=8)
+    for m in range(3, 8):
+        assert cfg.modality_scales[m] != [0]
+
+
 def test_n_routed_experts_stays_synced_with_num_local_experts():
     via_old_name = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, n_routed_experts=16)
     assert via_old_name.num_local_experts == 16

@@ -686,6 +686,45 @@ def test_memory_report_before_build_raises():
         pipe.memory_report()
 
 
+def test_profile_returns_module_time_report(built_pipeline):
+    from kairos.utils import ModuleTimeReport
+
+    report = built_pipeline.profile(n_steps=2)
+
+    assert isinstance(report, ModuleTimeReport)
+    assert report.step_ms > 0
+    assert len(report.rows) > 0
+    assert all(r["self_ms"] >= 0 and r["calls"] >= 1 for r in report.rows)
+
+
+def test_profile_restores_model_and_optimizer_state(built_pipeline):
+    before_model = {k: v.clone() for k, v in built_pipeline.model.state_dict().items()}
+    before_optim = copy.deepcopy(built_pipeline.optimizer.state_dict())
+
+    built_pipeline.profile(n_steps=2)
+
+    after_model = built_pipeline.model.state_dict()
+    for key, val in before_model.items():
+        assert torch.equal(val, after_model[key]), f"param {key} changed after profile()"
+    after_optim = built_pipeline.optimizer.state_dict()
+    assert list(before_optim["state"].keys()) == list(after_optim["state"].keys())
+
+
+def test_profile_does_not_advance_global_step(built_pipeline):
+    step_before = built_pipeline.global_step
+    built_pipeline.profile(n_steps=2)
+    assert built_pipeline.global_step == step_before
+
+
+def test_profile_before_build_raises():
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    pipe = KairosMultimodalPipeline(
+        model_config, DataConfig(text_examples=[{"modality": "text", "text": "hi"}]), TrainConfig(run_dir="unused")
+    )
+    with pytest.raises(RuntimeError):
+        pipe.profile()
+
+
 def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pipeline):
     """summary(benchmark=True) should fold in the same kind of real measurement as
     memory_report() (regression test for the old behaviour: two separate deepcopy'd runs

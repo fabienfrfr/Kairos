@@ -285,6 +285,22 @@ def _(Modality):
 
 
 @app.cell
+def _():
+    # per-modality-key encode_* scale_factor: audio/control default block-mean x4 already
+    # bounds raw PCM to a comparable token budget as image/video/lidar (see KairosTokenizer
+    # PCM_SCALE_FACTOR); override here per dataset-building key if the mix changes.
+    modality_scale_factors = {
+        "audio_caption": None,  # None -> KairosTokenizer.PCM_SCALE_FACTOR default (4)
+        "control": None,
+        "imu": None,
+        "image_caption": None,  # None -> KairosTokenizer.IMAGE_SCALE_FACTOR default (1, no-op)
+        "video_caption": None,
+        "lidar": None,  # None -> KairosTokenizer.LIDAR_SCALE_FACTOR default (1, no-op)
+    }
+    return (modality_scale_factors,)
+
+
+@app.cell
 def _(
     CFG_ATTNRES_BLOCK,
     CFG_CODEC_MODE,
@@ -342,13 +358,13 @@ def _():
 
     # ---- single-pipeline MAE -> transition -> diffusion curriculum: one train() call runs all
     # three stages; set an *_EPOCHS to 0 to skip. TrainConfig defaults to (1, 1, 1) if unset.
-    TRAIN_MAE_EPOCHS = 5  # was 1, too few steps past random-init loss (codec bottleneck fixed)
+    TRAIN_MAE_EPOCHS = 1
     TRAIN_MAE_P_MAX = 0.3  # MAE stage ceiling on p: fixed-ish low corruption, stable to optimize
     TRAIN_MAE_REWEIGHT = False  # plain CE in MAE stage: no 1/p variance blowup
 
-    TRAIN_TRANSITION_EPOCHS = 2  # ramps masking rate + reweighting from MAE to diffusion values
+    TRAIN_TRANSITION_EPOCHS = 1  # ramps masking rate + reweighting from MAE to diffusion values
 
-    TRAIN_DIFFUSION_EPOCHS = 5  # was 3, same reasoning as TRAIN_MAE_EPOCHS
+    TRAIN_DIFFUSION_EPOCHS = 1
     TRAIN_MASK_P_MAX = 1.0  # diffusion stage ceiling on p: full diffusion, up to 100% noised
     TRAIN_MASK_REWEIGHT = True  # diffusion stage: divide CE by p (standard ELBO weighting)
 
@@ -416,6 +432,7 @@ def _(
     TRAIN_TRANSITION_EPOCHS,
     TrainConfig,
     eval_examples,
+    modality_scale_factors,
     train_examples,
 ):
     data_config = DataConfig(
@@ -425,6 +442,7 @@ def _(
         stride=TRAIN_STRIDE,
         batch_size=TRAIN_BATCH,
         pack=TRAIN_PACK,
+        modality_scale_factors=modality_scale_factors,
     )
     eval_data_config = DataConfig(
         text_examples=[],
@@ -434,6 +452,7 @@ def _(
         batch_size=TRAIN_BATCH,
         shuffle=False,
         drop_last=False,
+        modality_scale_factors=modality_scale_factors,
     )
     # single TrainConfig for the whole MAE -> transition -> diffusion curriculum (one pipeline)
     train_config = TrainConfig(
@@ -505,6 +524,14 @@ def _(RUN_BENCHMARK, pipe):
     # one-off diagnostic: runs a single real step; don't call inside the training loop
     if RUN_BENCHMARK:
         print(pipe.memory_report())
+    return
+
+
+@app.cell
+def _(RUN_BENCHMARK, pipe):
+    # per-module wall-clock time (self-time, excludes children); shows where compute actually goes
+    if RUN_BENCHMARK:
+        print(pipe.profile(n_steps=3))
     return
 
 
