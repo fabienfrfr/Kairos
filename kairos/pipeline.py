@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
-from .dataset import DataDiagnosticReport, KairosPretrainingDataset, diagnose_multimodal_examples
+from .dataset import KairosPretrainingDataset, diagnose_built_dataset, diagnose_multimodal_examples
 from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import (
@@ -405,21 +405,32 @@ class KairosMultimodalPipeline:
             del model_state, optimizer_state
             self._release_transient_memory()
 
-    def data_report(self, sample_size: int = 200) -> DataDiagnosticReport:
-        """Per-modality raw-vs-tokenized stats for this pipeline's dataset (see diagnose_multimodal_examples)."""
-        dc = self.data_config
+    def data_report(self, sample_size: int = 200, split: str = "train"):
+        """Raw-vs-tokenized per-modality stats; falls back to the built dataset if freed."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        dc = self.data_config if split == "train" else self.eval_data_config
+        loader = self.loader if split == "train" else self.eval_loader
+        if dc is None:
+            raise RuntimeError(f"data_report(split={split!r}) needs an eval_data_config on this pipeline")
+
         examples = dc.multimodal_examples
         if examples is None and dc.multimodal_path:
             examples = torch.load(dc.multimodal_path, weights_only=False)
-        if not examples:
-            raise RuntimeError("data_report needs data_config.multimodal_examples or multimodal_path")
-        return diagnose_multimodal_examples(
-            examples,
-            tokenizer=self.tokenizer,
-            modality_scale_factors=dc.modality_scale_factors,
-            max_len=dc.max_len,
-            sample_size=sample_size,
-        )
+        try:
+            if examples:
+                return diagnose_multimodal_examples(
+                    examples,
+                    tokenizer=self.tokenizer,
+                    modality_scale_factors=dc.modality_scale_factors,
+                    max_len=dc.max_len,
+                    sample_size=sample_size,
+                )
+            if loader is not None and getattr(loader.dataset, "ds", None) is not None:
+                return diagnose_built_dataset(loader.dataset.ds, sample_size=sample_size)
+            raise RuntimeError(f"data_report(split={split!r}) needs multimodal_examples/multimodal_path, or a built pipeline")
+        finally:
+            self._release_transient_memory()
 
     @staticmethod
     def _release_transient_memory() -> None:

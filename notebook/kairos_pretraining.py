@@ -482,7 +482,10 @@ def _(RUN_BENCHMARK, pipe):
 def _(RUN_BENCHMARK, pipe):
     # per-modality raw-vs-tokenized breakdown: where dataset rows/steps actually come from
     if RUN_BENCHMARK:
-        print(pipe.data_report())
+        print(pipe.data_report(split="train"))
+        if pipe.eval_data_config is not None:
+            print()
+            print(pipe.data_report(split="eval"))
     return
 
 

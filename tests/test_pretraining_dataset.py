@@ -322,6 +322,86 @@ def test_pipeline_data_report_matches_diagnose_multimodal_examples(tokenizer, rn
     }
 
 
+def test_pipeline_data_report_falls_back_to_built_dataset_after_build(tokenizer, rng):
+    from kairos.dataset import BuiltDatasetReport
+    from kairos.modeling import KairosConfig
+    from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+
+    examples = [{"modality": "text", "text": "hello world foo bar"} for _ in range(5)]
+    examples.append(
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 4000).astype(np.float32),
+            state=rng.uniform(-1, 1, 4000).astype(np.float32),
+            sample_rate=8000,
+        )
+    )
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    dc = DataConfig(multimodal_examples=examples, max_len=256, batch_size=2, num_workers=0)
+    pipe = KairosMultimodalPipeline(model_config, dc, TrainConfig(run_dir="unused"), tokenizer=tokenizer)
+    pipe.build()
+
+    assert dc.multimodal_examples is None  # build() frees the raw examples to save RAM
+    report = pipe.data_report()
+    assert isinstance(report, BuiltDatasetReport)
+    assert report.total_rows > 0
+    assert sum(report.modality_tokens.values()) > 0
+
+
+def test_pipeline_data_report_raises_when_nothing_available():
+    from kairos.modeling import KairosConfig
+    from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    dc = DataConfig(text_examples=[])
+    pipe = KairosMultimodalPipeline(model_config, dc, TrainConfig(run_dir="unused"))
+    with pytest.raises(RuntimeError):
+        pipe.data_report()
+
+
+def test_pipeline_data_report_supports_eval_split(tokenizer, rng):
+    from kairos.dataset import BuiltDatasetReport
+    from kairos.modeling import KairosConfig
+    from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+
+    train_ex = [{"modality": "text", "text": "hello world foo bar"} for _ in range(5)]
+    eval_ex = [{"modality": "text", "text": "eval example only"} for _ in range(2)]
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    dc = DataConfig(multimodal_examples=train_ex, max_len=64, batch_size=2, num_workers=0)
+    edc = DataConfig(multimodal_examples=eval_ex, max_len=64, batch_size=2, num_workers=0, shuffle=False, drop_last=False)
+    pipe = KairosMultimodalPipeline(model_config, dc, TrainConfig(run_dir="unused"), eval_data_config=edc, tokenizer=tokenizer)
+    pipe.build()
+
+    train_report = pipe.data_report(split="train")
+    eval_report = pipe.data_report(split="eval")
+    assert isinstance(train_report, BuiltDatasetReport)
+    assert isinstance(eval_report, BuiltDatasetReport)
+    assert train_report.total_rows != eval_report.total_rows  # different splits, different sizes
+
+
+def test_pipeline_data_report_eval_split_without_eval_config_raises():
+    from kairos.modeling import KairosConfig
+    from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    dc = DataConfig(multimodal_examples=[{"modality": "text", "text": "hi"}])
+    pipe = KairosMultimodalPipeline(model_config, dc, TrainConfig(run_dir="unused"))
+    with pytest.raises(RuntimeError):
+        pipe.data_report(split="eval")
+
+
+def test_pipeline_data_report_invalid_split_raises():
+    from kairos.modeling import KairosConfig
+    from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    dc = DataConfig(multimodal_examples=[{"modality": "text", "text": "hi"}])
+    pipe = KairosMultimodalPipeline(model_config, dc, TrainConfig(run_dir="unused"))
+    with pytest.raises(ValueError):
+        pipe.data_report(split="bogus")
+
+
+
 def test_modality_counts_groups_and_sorts_descending():
     from kairos.dataset import modality_counts
 

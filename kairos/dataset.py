@@ -203,6 +203,45 @@ def diagnose_multimodal_examples(
     return DataDiagnosticReport(rows=rows, max_len=max_len, total_examples=len(examples))
 
 
+@dataclass
+class BuiltDatasetReport:
+    """Token-level per-modality composition of an already-tokenized (built) dataset."""
+
+    modality_tokens: dict[str, int]  # modality name -> token count in the sample
+    sampled_rows: int
+    total_rows: int
+
+    def __str__(self) -> str:
+        total = sum(self.modality_tokens.values()) or 1
+        lines = [
+            "Kairos built-dataset diagnostic (token-level, sampled from already-tokenized rows)",
+            "-------------------------------------------------------------------------------",
+            f"Total rows:  {self.total_rows}  (sampled: {self.sampled_rows})",
+            "",
+            f"{'modality':<10} {'tokens':>12} {'%':>6}",
+        ]
+        for name, count in sorted(self.modality_tokens.items(), key=lambda kv: -kv[1]):
+            lines.append(f"{name:<10} {count:>12} {100 * count / total:>5.1f}%")
+        return "\n".join(lines)
+
+
+def diagnose_built_dataset(built_dataset, sample_size: int = 2000, seed: int = 0) -> BuiltDatasetReport:
+    """Token-level modality composition of a built KairosPretrainingDataset (post pipe.build())."""
+    total_rows = len(built_dataset)
+    sample_n = min(sample_size, total_rows)
+    idx = random.Random(seed).sample(range(total_rows), sample_n) if total_rows else []
+    plain = built_dataset.with_format(None)
+    batch = plain[idx] if idx else {"modality_ids": []}
+
+    id_to_name = {m.value: m.name for m in Modality}
+    counts: dict[str, int] = {}
+    for mod_ids in batch["modality_ids"]:
+        for m in mod_ids:
+            name = id_to_name.get(m, str(m))
+            counts[name] = counts.get(name, 0) + 1
+    return BuiltDatasetReport(modality_tokens=counts, sampled_rows=sample_n, total_rows=total_rows)
+
+
 def modality_counts(examples) -> dict[str, int]:
     """Raw example count per modality, no tokenization — cheap, safe to run on a full corpus."""
     counts: dict[str, int] = {}
