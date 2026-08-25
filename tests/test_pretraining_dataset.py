@@ -124,6 +124,22 @@ def test_control_uses_action_and_state_disjoint(tokenizer, rng):
     assert set(action_pos).isdisjoint(state_pos)
 
 
+def test_control_interleaves_state_and_action_per_tick(tokenizer, rng):
+    """State/action must alternate per tick (S1,A1,S2,...), not be two separate giant blocks."""
+    from kairos.dataset import _segments_for
+
+    ex = make_example(
+        "control",
+        action=rng.uniform(-1, 1, 80_000).astype(np.float32),
+        state=rng.uniform(-1, 1, 80_000).astype(np.float32),
+        sample_rate=8000,
+    )
+    segments = _segments_for(ex, {})
+    modalities = [s.modality for s in segments]
+    assert len(modalities) > 2  # more than one tick given a long enough signal
+    assert modalities == [Modality.STATE, Modality.ACTION] * (len(modalities) // 2)
+
+
 def test_long_example_gets_chunked(tokenizer, rng):
     big_image = rng.integers(0, 255, (40, 40, 3), dtype=np.uint8)
     ex = [make_example("image_caption", caption="big", image=big_image)]

@@ -258,15 +258,24 @@ class KairosTokenizer(ByT5Tokenizer):
         return values.reshape(-1, scale_factor).mean(axis=1).astype(values.dtype)
 
     @classmethod
+    def _encode_pcm_ticks(
+        cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, family_cycle: tuple, n_bytes: int, scale_factor: int
+    ) -> list[list]:
+        """Same as _encode_pcm but returns one marker-list per tick, for interleaving."""
+        values = cls._decimate_1d(values, scale_factor)
+        planes = _quantize_planes(values, lo, hi, n_bytes)  # (N, n_bytes), one family id per byte-plane
+        ticks = []
+        for start in range(0, len(planes), tick_samples):
+            ticks.append([("bytes", planes[start : start + tick_samples].tobytes(), family_cycle), ("marker", "<TICK>")])
+        return ticks
+
+    @classmethod
     def _encode_pcm(
         cls, values: np.ndarray, lo: float, hi: float, tick_samples: int, family_cycle: tuple, n_bytes: int, scale_factor: int
     ) -> list:
-        values = cls._decimate_1d(values, scale_factor)
-        planes = _quantize_planes(values, lo, hi, n_bytes)  # (N, n_bytes), one family id per byte-plane
         out = []
-        for start in range(0, len(planes), tick_samples):
-            out.append(("bytes", planes[start : start + tick_samples].tobytes(), family_cycle))
-            out.append(("marker", "<TICK>"))
+        for tick in cls._encode_pcm_ticks(values, lo, hi, tick_samples, family_cycle, n_bytes, scale_factor):
+            out.extend(tick)
         return out
 
     def _decode_pcm(self, ids: list[int], lo: float, hi: float, n_bytes: int) -> np.ndarray:
@@ -318,6 +327,19 @@ class KairosTokenizer(ByT5Tokenizer):
 
     def decode_signal(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
         return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, n_bytes)
+
+    @classmethod
+    def encode_signal_ticks(
+        cls, values: np.ndarray, family: str, tick_samples: int | None = None, n_bytes: int = 2, scale_factor: int | None = None
+    ) -> list[list]:
+        """Same as encode_signal but returns one marker-list per tick, for interleaving."""
+        if values.dtype != np.float32:
+            raise ValueError("encode_signal expects a float32 array in [-1, 1]")
+        family_cycle = tuple(f"{family}{p}" for p in range(n_bytes))
+        factor = scale_factor if scale_factor is not None else cls.PCM_SCALE_FACTOR
+        return cls._encode_pcm_ticks(
+            values, *cls.SIGNAL_VALUE_RANGE, tick_samples or cls.AUDIO_TICK_SAMPLES, family_cycle, n_bytes, factor
+        )
 
     # ---------------- LIDAR: point groups + fixed quantization bounds ----------------
     @classmethod

@@ -97,6 +97,16 @@ def test_signal_roundtrip_precision_beats_8bit(tokenizer):
     assert np.max(np.abs(recon - values)) < (2 / 255)  # much tighter than the old 8-bit step
 
 
+def test_encode_signal_ticks_matches_flattened_encode_signal(tokenizer):
+    rng = np.random.default_rng(0)
+    values = rng.uniform(-1, 1, 30_000).astype(np.float32)
+    ticks = KairosTokenizer.encode_signal_ticks(values, family="STA", tick_samples=8000, scale_factor=1)
+    flat = KairosTokenizer.encode_signal(values, family="STA", tick_samples=8000, scale_factor=1)
+    assert len(ticks) > 1  # multiple ticks given a signal longer than tick_samples
+    joined = [m for tick in ticks for m in tick]
+    assert joined == flat  # concatenating ticks must reproduce the flat encoding exactly
+
+
 def test_signal_and_audio_share_the_small_value_vocab_but_not_family(tokenizer):
     # values are shared (that's the point - small vocab); family is what disambiguates them
     values = np.zeros(4, dtype=np.float32)

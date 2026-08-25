@@ -6,6 +6,7 @@ project_structure*
 /checkpoints
 /tmp*
 /unused
+/archives
 
 *.zim
 *.bz2

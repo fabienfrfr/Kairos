@@ -105,13 +105,20 @@ def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[Multim
     if modality == "control":
         sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
         sf = modality_scale_factors.get("control")
-        action_markers = KairosTokenizer.encode_signal(arrays["action"], family="ACT", tick_samples=sample_rate, scale_factor=sf)
-        state_markers = KairosTokenizer.encode_signal(arrays["state"], family="STA", tick_samples=sample_rate, scale_factor=sf)
+        state_ticks = KairosTokenizer.encode_signal_ticks(arrays["state"], family="STA", tick_samples=sample_rate, scale_factor=sf)
+        action_ticks = KairosTokenizer.encode_signal_ticks(arrays["action"], family="ACT", tick_samples=sample_rate, scale_factor=sf)
         segments = []
         if caption:
             segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
-        segments.append(MultimodalSegment(Modality.ACTION, action_markers))
-        segments.append(MultimodalSegment(Modality.STATE, state_markers))
+        # interleave per tick: S1,A1,S2,A2,... so the model sees state->action causally, not
+        # one giant state block followed by one giant action block
+        for s_tick, a_tick in zip(state_ticks, action_ticks):
+            segments.append(MultimodalSegment(Modality.STATE, s_tick))
+            segments.append(MultimodalSegment(Modality.ACTION, a_tick))
+        for s_tick in state_ticks[len(action_ticks) :]:
+            segments.append(MultimodalSegment(Modality.STATE, s_tick))
+        for a_tick in action_ticks[len(state_ticks) :]:
+            segments.append(MultimodalSegment(Modality.ACTION, a_tick))
         return segments
     return None
 
