@@ -61,12 +61,15 @@ def _():
 
     tokenizer = KairosTokenizer()
     print(f"vocab size: {len(tokenizer)}")
+
+    TESTING = True
     return (
         DataConfig,
         KairosConfig,
         KairosMultimodalPipeline,
         Modality,
         Path,
+        TESTING,
         TrainConfig,
         make_progress_callback,
         modality_counts,
@@ -79,16 +82,20 @@ def _():
 
 
 @app.cell
-def _():
+def _(TESTING):
     # ---- data settings ----
     MULTIMODAL_SOURCE = "hf"  # "hf" or "local" (.pt built
     MULTIMODAL_LOCAL_PATH = "data/keep-it-simple-multimodal.pt"
     BUILD_LOCAL_IF_MISSING = False
 
     TEXT_SOURCE = "hf"  # "hf" (ffurfaro/keep-it-simple) or "inline" (tiny
-    TEXT_PCT = 10  # % of keep-it-simple to load; was 2%, too little data for enough optimizer steps
 
-    EVAL_PCT = 10  # % held out for eval
+    if TESTING:
+        TEXT_PCT = 1  # % of keep-it-simple to load
+        EVAL_PCT = 0.1  # % held out for eval
+    else:
+        TEXT_PCT = 100  # % of keep-it-simple to load
+        EVAL_PCT = 0.001  # % held out for eval
     return (
         BUILD_LOCAL_IF_MISSING,
         EVAL_PCT,
@@ -531,7 +538,14 @@ def _():
 
 
 @app.cell
-def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, pipe):
+def _(
+    OVERFIT_EXAMPLES,
+    OVERFIT_RUN,
+    OVERFIT_STEPS,
+    make_progress_callback,
+    mo,
+    pipe,
+):
     # walks whichever of the MAE / transition / diffusion stages are configured, proportionally
     if OVERFIT_RUN:
         if mo.running_in_notebook():
@@ -548,14 +562,13 @@ def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, 
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
         overfit_logs = []
-    return (overfit_logs,)
+    return
 
 
 @app.cell
 def _():
     FORCE_RESTART = True  # True = restart from scratch, False = resume, landing in the right stage
     return (FORCE_RESTART,)
-
 
 
 @app.cell
