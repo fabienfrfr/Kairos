@@ -6,6 +6,7 @@ import copy
 import itertools
 import json
 import math
+import os
 import random
 import time
 import warnings
@@ -50,8 +51,9 @@ class DataConfig:
     shuffle: bool = True
     drop_last: bool = True
     pack: bool = False  # concatenate samples before chunking so
-    num_workers: int | None = None  # None: 4 if batch_size > 1 else 0. Set explicitly to
-    # override to e.g. 0 on a memory-constrained machine: each worker forks the parent process.
+    # None: min(4, os.cpu_count()-1) if batch_size > 1 else 0. Override to e.g. 0 on a
+    # memory-constrained machine (each worker forks the parent process).
+    num_workers: int | None = None
     # per-modality-key encode_* scale_factor override; unset keys use tokenizer defaults
     modality_scale_factors: dict | None = None
 
@@ -76,6 +78,8 @@ class TrainConfig:
     mask_mae_p_max: float = 0.3  # MAE-stage fixed-ish corruption ceiling (cheap/stable to optimize)
     mask_mae_reweight: bool = False  # MAE-stage: plain CE, no 1/p variance blowup
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
+    # train-time self-conditioning rate; 0.0 disables it (generate() then sees OOD input).
+    self_conditioning_prob: float = 0.5
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
@@ -175,7 +179,12 @@ class KairosMultimodalPipeline:
     def _num_workers(self) -> int:
         if self.data_config.num_workers is not None:
             return self.data_config.num_workers
-        return 4 if self.data_config.batch_size > 1 else 0
+        if self.data_config.batch_size <= 1:
+            return 0
+        # cap at available CPUs so we never fork more workers than the box can run in
+        # parallel - a flat "4" can stall/hang on a 1-2 core machine.
+        cpu_count = os.cpu_count() or 1
+        return max(0, min(4, cpu_count - 1))
 
     # ------------------------------------------------------------------ build
     def _build_dataset(self, data_config: DataConfig | None = None) -> KairosPretrainingDataset:
@@ -268,6 +277,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_p_max = tc.mask_p_max
         self.hf_trainer.mask_reweight = tc.mask_reweight
         self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
+        self.hf_trainer.self_conditioning_prob = tc.self_conditioning_prob
         self.writer = SummaryWriter(str(self.tb_dir))
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt:
@@ -654,7 +664,7 @@ class KairosMultimodalPipeline:
                         tc.mask_reweight,
                     )
                     with self._autocast():
-                        loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
+                        loss = self.hf_trainer.compute_loss(self.model_forward, batch, cache_params=cache_params)
                     loss_val = loss.item()
                     if use_memory_gate:
                         for scale_cache in cache_params.caches:

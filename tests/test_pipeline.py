@@ -88,6 +88,70 @@ def test_build_wires_mask_curriculum_config_to_trainer(tmp_path, model_config, t
     assert pipe.hf_trainer.mask_reweight is False
 
 
+def test_build_wires_self_conditioning_prob_to_trainer(tmp_path, model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"), self_conditioning_prob=0.75)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    assert pipe.hf_trainer.self_conditioning_prob == 0.75
+
+
+# --------------------------------------------------------------------- num_workers
+def test_num_workers_explicit_override_is_respected(model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8, num_workers=2)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 2
+
+
+def test_num_workers_zero_when_batch_size_is_one(model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=1)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 0
+
+
+def test_num_workers_default_caps_at_available_cpus(model_config, text_examples, monkeypatch):
+    """Regression: a flat default of 4 workers can stall/hang on a 1-2 core machine."""
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: 1)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 0  # cpu_count - 1 == 0: main process only, no forking
+
+
+def test_num_workers_default_never_exceeds_four_on_a_big_machine(model_config, text_examples, monkeypatch):
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: 64)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 4
+
+
+def test_num_workers_default_handles_cpu_count_none(model_config, text_examples, monkeypatch):
+    """os.cpu_count() can return None; must not crash and must stay conservative."""
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: None)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 0
+
+
+def test_build_loader_num_workers_matches_capped_value(tmp_path, model_config, text_examples, monkeypatch):
+    """End-to-end: the built DataLoader must use the capped value, not a flat 4."""
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: 1)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    assert pipe.loader.num_workers == 0
+
+
 def test_training_converges_with_moe_enabled(tmp_path):
     # regression: use_moe=True used to NaN or block convergence; keep MoE small here
     model_config = KairosConfig(
@@ -879,6 +943,42 @@ def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text
 
     assert len(logs) > 0
     assert new_pipe.global_step != 999  # did not pick up the
+
+
+def test_train_calls_compute_loss_with_model_forward_not_bare_model(built_pipeline, monkeypatch):
+    """Regression: train() used to call compute_loss(self.model, ...) directly, skipping
+    self.model_forward (DataParallel-wrapped when n_gpus > 1), unlike every other method."""
+    # distinct proxy identity, so we can prove train() calls model_forward and not self.model
+    class _Proxy(torch.nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def forward(self, *args, **kwargs):
+            return self.wrapped(*args, **kwargs)
+
+        def __getattr__(self, name):
+            # fall back to the wrapped model so `model.lm_head` etc. still resolve
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.wrapped, name)
+
+    proxy = _Proxy(built_pipeline.model)
+    built_pipeline.model_forward = proxy
+
+    real_compute_loss = built_pipeline.hf_trainer.compute_loss
+    seen_models = []
+
+    def _spy_compute_loss(model, batch, **kw):
+        seen_models.append(model)
+        return real_compute_loss(model, batch, **kw)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _spy_compute_loss)
+    built_pipeline.train(resume=False)
+
+    assert seen_models  # at least one training step ran
+    assert all(m is built_pipeline.model_forward for m in seen_models)
 
 
 def test_train_skips_nonfinite_loss_batches(built_pipeline, monkeypatch):

@@ -1,3 +1,5 @@
+import random
+
 import torch
 import torch.nn.functional as F
 from transformers import Trainer
@@ -20,12 +22,18 @@ def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0):
 
 
 def compute_masked_diffusion_losses(
-    model, x0, noise_mask, p, modality_ids=None, family_ids=None, cache_params=None, reweight=True
+    model,
+    x0,
+    noise_mask,
+    p,
+    modality_ids=None,
+    family_ids=None,
+    cache_params=None,
+    reweight=True,
+    self_conditioning_prob=0.0,
 ):
-    """Noises ``x0`` (and ``family_ids``, if given) on ``noise_mask``.
-
-    Returns (per-token CE, logits, octet_logits or None, octet_targets or None).
-    """
+    """Noises ``x0`` on ``noise_mask``. With self_conditioning_prob>0, warms up with a no-grad
+    pass and feeds its detached logits back in, matching generate()'s inference-time usage."""
     xt = x0.clone()
     noise = torch.randint_like(x0, model.lm_head.vocab_size)
     xt[noise_mask] = noise[noise_mask]
@@ -38,11 +46,25 @@ def compute_masked_diffusion_losses(
         xt_family[noise_mask] = noise_family[noise_mask]
         octet_targets = family_ids[noise_mask]
 
+    self_cond = None
+    if self_conditioning_prob > 0 and random.random() < self_conditioning_prob:
+        with torch.no_grad():
+            warm_out = model(
+                decoder_input_ids=xt,
+                modality_ids=modality_ids,
+                family_ids=xt_family,
+                logits_mask=noise_mask,
+            )
+        vocab_size = model.lm_head.vocab_size
+        self_cond = torch.zeros(*x0.shape, vocab_size, device=x0.device, dtype=warm_out.logits.dtype)
+        self_cond[noise_mask] = warm_out.logits.detach()
+
     # logits_mask: only project noised positions - lm_head cost scales with vocab_size
     out = model(
         decoder_input_ids=xt,
         modality_ids=modality_ids,
         family_ids=xt_family,
+        self_conditioning_logits=self_cond,
         cache_params=cache_params,
         logits_mask=noise_mask,
     )
@@ -105,6 +127,8 @@ class KairosDiffusionTrainer(Trainer):
     mask_p_max: float = 1.0  # ceiling of p; 1.0 = full diffusion, cap for MAE-style corruption
     mask_reweight: bool = True  # divide CE by p; False for plain CE
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
+    # train-time self-conditioning rate; keep >0 so generate()'s usage isn't out-of-distribution.
+    self_conditioning_prob: float = 0.5
 
     def compute_loss(self, model, inputs, return_outputs=False, cache_params=None):
         x0 = inputs["input_ids"]
@@ -123,7 +147,15 @@ class KairosDiffusionTrainer(Trainer):
                     noise_mask[i, row_idx[0]] = True
 
         per_token_loss, logits, octet_logits, octet_targets = compute_masked_diffusion_losses(
-            model, x0, noise_mask, p, modality_ids, family_ids, cache_params, reweight=self.mask_reweight
+            model,
+            x0,
+            noise_mask,
+            p,
+            modality_ids,
+            family_ids,
+            cache_params,
+            reweight=self.mask_reweight,
+            self_conditioning_prob=self.self_conditioning_prob,
         )
         loss = per_token_loss.mean()
         if octet_logits is not None and octet_targets is not None:
