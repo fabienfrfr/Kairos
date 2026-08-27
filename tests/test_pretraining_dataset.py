@@ -124,20 +124,68 @@ def test_control_uses_action_and_state_disjoint(tokenizer, rng):
     assert set(action_pos).isdisjoint(state_pos)
 
 
-def test_control_interleaves_state_and_action_per_tick(tokenizer, rng):
-    """State/action must alternate per tick (S1,A1,S2,...), not be two separate giant blocks."""
+def test_control_state_and_action_pair_one_to_one(tokenizer, rng):
+    """One row = one atomic (state, action) transition: exactly one STATE segment
+    and one ACTION segment, in that order (S then A)."""
     from kairos.dataset import _segments_for
 
     ex = make_example(
         "control",
-        action=rng.uniform(-1, 1, 80_000).astype(np.float32),
-        state=rng.uniform(-1, 1, 80_000).astype(np.float32),
+        action=rng.uniform(-1, 1, 480).astype(np.float32),  # ~0.06s @ 8kHz, prod-realistic
+        state=rng.uniform(-1, 1, 480).astype(np.float32),
         sample_rate=8000,
     )
     segments = _segments_for(ex, {})
     modalities = [s.modality for s in segments]
-    assert len(modalities) > 2  # more than one tick given a long enough signal
-    assert modalities == [Modality.STATE, Modality.ACTION] * (len(modalities) // 2)
+
+    assert modalities.count(Modality.STATE) == modalities.count(Modality.ACTION) == 1
+    assert modalities.index(Modality.STATE) < modalities.index(Modality.ACTION)
+
+
+def test_control_warns_on_state_action_token_count_mismatch(tokenizer, rng):
+    """Regression: state/action arrays of different lengths used to silently break
+    the S,A pairing (via now-removed tick-splitting); must warn instead."""
+    from kairos.dataset import _segments_for
+
+    ex = make_example(
+        "control",
+        action=rng.uniform(-1, 1, 480).astype(np.float32),
+        state=rng.uniform(-1, 1, 200).astype(np.float32),  # mismatched length
+        sample_rate=8000,
+    )
+    with pytest.warns(UserWarning, match="mismatch"):
+        _segments_for(ex, {})
+
+
+def test_control_equal_length_arrays_never_warn(tokenizer, rng, recwarn):
+    from kairos.dataset import _segments_for
+
+    ex = make_example(
+        "control",
+        action=rng.uniform(-1, 1, 480).astype(np.float32),
+        state=rng.uniform(-1, 1, 480).astype(np.float32),
+        sample_rate=8000,
+    )
+    _segments_for(ex, {})
+    assert not [w for w in recwarn.list if "mismatch" in str(w.message)]
+
+
+def test_control_scale_factor_shrinks_token_count(tokenizer, rng):
+    """The scale_factor knob (decimation) is how token count is reduced for control."""
+    from kairos.dataset import _segments_for
+
+    ex = make_example(
+        "control",
+        action=rng.uniform(-1, 1, 480).astype(np.float32),
+        state=rng.uniform(-1, 1, 480).astype(np.float32),
+        sample_rate=8000,
+    )
+    coarse = _segments_for(ex, {"control": 8})  # more decimation
+    fine = _segments_for(ex, {"control": 2})  # less decimation
+
+    coarse_bytes = sum(len(item[1]) for s in coarse if s.modality == Modality.STATE for item in s.data if item[0] == "bytes")
+    fine_bytes = sum(len(item[1]) for s in fine if s.modality == Modality.STATE for item in s.data if item[0] == "bytes")
+    assert coarse_bytes < fine_bytes
 
 
 def test_long_example_gets_chunked(tokenizer, rng):
@@ -437,6 +485,65 @@ def test_split_examples_respects_eval_pct_and_is_deterministic():
     assert len(train_a) == 80
     assert train_a == train_b and eval_a == eval_b  # same seed -> same split
     assert {ex["text"] for ex in train_a}.isdisjoint(ex["text"] for ex in eval_a)
+
+
+def test_split_examples_keeps_contiguous_modality_runs_adjacent_and_ordered():
+    """Regression: control transitions were scattered essentially at random by a plain
+    per-example shuffle, destroying the S,A,S,A pattern once examples are packed."""
+    from kairos.dataset import split_examples
+
+    examples = (
+        [{"modality": "text", "id": f"t{i}"} for i in range(20)]
+        + [{"modality": "control", "id": f"c{i}"} for i in range(6)]
+        + [{"modality": "image_caption", "id": f"i{i}"} for i in range(20)]
+    )
+    # eval_pct=0: nothing to force the run apart, so we can check pure adjacency/order
+    train, eval_ = split_examples(examples, eval_pct=0, seed=0, contiguous_modalities={"control"})
+    control_ids = [ex["id"] for ex in train if ex["modality"] == "control"]
+
+    assert control_ids == [f"c{i}" for i in range(6)]  # relative order preserved, all adjacent
+    assert eval_ == []
+
+
+def test_split_examples_contiguous_run_survives_being_split_across_train_eval():
+    """A run that straddles the train/eval cutoff must still keep its relative order
+    within each split (a train/eval boundary can still cut through a run)."""
+    from kairos.dataset import split_examples
+
+    examples = [{"modality": "control", "id": f"c{i}"} for i in range(6)]
+    train, eval_ = split_examples(examples, eval_pct=50, seed=0, contiguous_modalities={"control"})
+    train_ids = [ex["id"] for ex in train]
+    eval_ids = [ex["id"] for ex in eval_]
+    original_order = [f"c{i}" for i in range(6)]
+
+    assert train_ids == [i for i in original_order if i in train_ids]
+    assert eval_ids == [i for i in original_order if i in eval_ids]
+    assert set(train_ids) | set(eval_ids) == set(original_order)  # nothing lost
+
+
+def test_split_examples_non_grouped_modalities_still_shuffle_independently():
+    """Only modalities in contiguous_modalities get block-shuffled; everything else keeps
+    the ordinary per-example shuffle (no accidental grouping of unrelated examples)."""
+    from kairos.dataset import split_examples
+
+    examples = [{"modality": "text", "id": f"t{i}"} for i in range(50)]
+    train, eval_ = split_examples(examples, eval_pct=50, seed=0, contiguous_modalities={"control"})
+    pool_ids = [ex["id"] for ex in train + eval_]
+    original_ids = [f"t{i}" for i in range(50)]
+    assert set(pool_ids) == set(original_ids)  # nothing lost or duplicated
+    assert pool_ids != original_ids  # actually shuffled, not left in input order
+
+
+def test_split_examples_default_groups_control_without_explicit_opt_in():
+    from kairos.dataset import split_examples
+
+    examples = [{"modality": "control", "id": f"c{i}"} for i in range(6)] + [
+        {"modality": "text", "id": f"t{i}"} for i in range(20)
+    ]
+    train, eval_ = split_examples(examples, eval_pct=10, seed=1)  # no contiguous_modalities passed
+    pool = train + eval_
+    control_ids = [ex["id"] for ex in pool if ex["modality"] == "control"]
+    assert control_ids == [f"c{i}" for i in range(6)]
 
 
 def test_text_dataset_defaults_to_cosmopedia_when_no_texts_given(tokenizer, monkeypatch):

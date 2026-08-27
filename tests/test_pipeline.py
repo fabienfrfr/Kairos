@@ -1235,6 +1235,67 @@ def test_train_logs_periodic_eval_loss(tmp_path, model_config):
     assert pipe.eval_log_rows[-1]["step"] == pipe.global_step
 
 
+# --------------------------------------------------------- fractional-epoch eval cadence
+def test_eval_every_epochs_default_runs_seven_times_over_full_curriculum(tmp_path, model_config):
+    """Default cadence: eval at step 0, then every 0.5 epoch. mae+transition+diffusion=3
+    epochs by default -> 6 periodic evals + 1 at start = 7."""
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 8
+    eval_texts = [{"modality": "text", "text": "a different held-out sentence"}] * 4
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)  # 4 steps/epoch
+    eval_data_config = DataConfig(text_examples=eval_texts, max_len=32, batch_size=2)
+    train_config = TrainConfig(save_every=1000, eval_batches=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+    steps_per_epoch = len(pipe.loader)  # dataset chunking may yield more steps than raw examples
+
+    pipe.train(resume=False)
+
+    eval_every_steps = round(0.5 * steps_per_epoch)
+    assert len(pipe.eval_log_rows) == 7
+    assert [row["step"] for row in pipe.eval_log_rows] == [i * eval_every_steps for i in range(7)]
+
+
+def test_eval_at_start_runs_before_the_first_training_step(tmp_path, model_config, text_examples):
+    eval_data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, save_every=1000, eval_every_epochs=None, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+
+    pipe.train(resume=False)
+
+    assert pipe.eval_log_rows[0]["step"] == 0
+
+
+def test_eval_at_start_false_skips_the_initial_eval(tmp_path, model_config, text_examples):
+    eval_data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1, save_every=1000, eval_every_epochs=None, eval_at_start=False, run_dir=str(tmp_path / "run")
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+
+    pipe.train(resume=False)
+
+    assert pipe.eval_log_rows == []  # no start eval, and no periodic cadence configured
+
+
+def test_eval_every_steps_overrides_eval_every_epochs(tmp_path, model_config, text_examples):
+    """An explicit eval_every (steps) must win over the eval_every_epochs default."""
+    eval_data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1, save_every=1000, eval_every=1, eval_at_start=False, run_dir=str(tmp_path / "run")
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+
+    pipe.train(resume=False)
+
+    assert [row["step"] for row in pipe.eval_log_rows] == list(range(1, pipe.global_step + 1))
+
+
 def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config):
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)

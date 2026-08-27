@@ -103,22 +103,26 @@ def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[Multim
         return [MultimodalSegment(Modality.STATE, markers)]
 
     if modality == "control":
-        sample_rate = meta.get("sample_rate", KairosTokenizer.AUDIO_SAMPLE_RATE)
         sf = modality_scale_factors.get("control")
-        state_ticks = KairosTokenizer.encode_signal_ticks(arrays["state"], family="STA", tick_samples=sample_rate, scale_factor=sf)
-        action_ticks = KairosTokenizer.encode_signal_ticks(arrays["action"], family="ACT", tick_samples=sample_rate, scale_factor=sf)
+        # each row is one atomic (state, action) transition (~0.06s clip), not a trajectory -
+        # a single pair per row, not per-tick chunking. scale_factor decimates to shrink tokens.
+        state_tokens = KairosTokenizer.encode_signal(arrays["state"], family="STA", scale_factor=sf)
+        action_tokens = KairosTokenizer.encode_signal(arrays["action"], family="ACT", scale_factor=sf)
+        state_nbytes = sum(len(item[1]) for item in state_tokens if item[0] == "bytes")
+        action_nbytes = sum(len(item[1]) for item in action_tokens if item[0] == "bytes")
+        if state_nbytes != action_nbytes:
+            warnings.warn(
+                f"control example: state ({state_nbytes} bytes) vs action ({action_nbytes} "
+                f"bytes) length mismatch - check arrays['state']/['action']",
+                stacklevel=2,
+            )
         segments = []
         if caption:
             segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
-        # interleave per tick: S1,A1,S2,A2,... so the model sees state->action causally, not
-        # one giant state block followed by one giant action block
-        for s_tick, a_tick in zip(state_ticks, action_ticks):
-            segments.append(MultimodalSegment(Modality.STATE, s_tick))
-            segments.append(MultimodalSegment(Modality.ACTION, a_tick))
-        for s_tick in state_ticks[len(action_ticks) :]:
-            segments.append(MultimodalSegment(Modality.STATE, s_tick))
-        for a_tick in action_ticks[len(state_ticks) :]:
-            segments.append(MultimodalSegment(Modality.ACTION, a_tick))
+        # S then A: alternation across a longer S,A,S,A,... sequence comes from concatenating
+        # consecutive control rows, not from splitting a single row into ticks.
+        segments.append(MultimodalSegment(Modality.STATE, state_tokens))
+        segments.append(MultimodalSegment(Modality.ACTION, action_tokens))
         return segments
     return None
 
@@ -257,10 +261,29 @@ def modality_counts(examples) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
-def split_examples(examples, eval_pct: float = 10, seed: int = 0) -> tuple[list, list]:
-    """Shuffles then splits examples into (train, eval); eval_pct% goes to eval."""
-    shuffled = list(examples)
-    random.Random(seed).shuffle(shuffled)
+def split_examples(
+    examples, eval_pct: float = 10, seed: int = 0, contiguous_modalities: frozenset = frozenset({"control"})
+) -> tuple[list, list]:
+    """Shuffles then splits into (train, eval). Examples whose modality is in
+    contiguous_modalities keep relative order as one block, instead of being scattered."""
+    if not contiguous_modalities:
+        shuffled = list(examples)
+        random.Random(seed).shuffle(shuffled)
+    else:
+        runs, current, current_mod = [], [], None
+        for ex in examples:
+            mod = ex.get("modality")
+            if current and mod in contiguous_modalities and mod == current_mod:
+                current.append(ex)
+            else:
+                if current:
+                    runs.append(current)
+                # non-grouped modalities get a unique sentinel so each stays its own run
+                current, current_mod = [ex], mod if mod in contiguous_modalities else object()
+        if current:
+            runs.append(current)
+        random.Random(seed).shuffle(runs)
+        shuffled = [ex for run in runs for ex in run]
     n_eval = int(len(shuffled) * eval_pct / 100)
     return shuffled[n_eval:], shuffled[:n_eval]
 

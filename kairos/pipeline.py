@@ -69,7 +69,9 @@ class TrainConfig:
     diffusion_epochs: int = 1  # stage 3: full masked-diffusion at mask_p_max/mask_reweight
     save_every: int = 200
     last_ckpt_every: int = 20  # how often last.pt (resume point)
-    eval_every: int = 0  # run eval on the held-out set every N steps (0 = off)
+    eval_every: int = 0  # explicit step-based cadence; 0 = derive from eval_every_epochs instead
+    eval_every_epochs: float | None = 0.5  # cadence in epochs; ignored if eval_every > 0
+    eval_at_start: bool = True  # also evaluate once before the first training step
     eval_batches: int = 2  # eval batches per evaluation, capped; keep small
     grad_clip: float = 1.0
     mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows as this shrinks
@@ -632,10 +634,20 @@ class KairosMultimodalPipeline:
         total_steps = tc.epochs * len(self.loader)
         mae_steps = tc.mae_epochs * len(self.loader)
         transition_steps = tc.transition_epochs * len(self.loader)
+        # eval_every (steps) wins if set explicitly; else derive from eval_every_epochs
+        if tc.eval_every > 0:
+            eval_every_steps = tc.eval_every
+        elif tc.eval_every_epochs:
+            eval_every_steps = max(1, round(tc.eval_every_epochs * len(self.loader)))
+        else:
+            eval_every_steps = 0
         skipped_nonfinite = 0
         consecutive_nan = 0
         prev_cache = None
         use_memory_gate = getattr(self.model_config, "use_memory_gate", False)
+
+        if tc.eval_at_start and self.eval_loader is not None:
+            self.evaluate(step=self.global_step)
 
         try:
             for epoch in range(start_epoch, tc.epochs + 1):
@@ -711,7 +723,7 @@ class KairosMultimodalPipeline:
                     if progress_callback is not None:
                         progress_callback(self.global_step, total_steps, loss_val)
 
-                    if tc.eval_every > 0 and self.global_step % tc.eval_every == 0:
+                    if eval_every_steps > 0 and self.global_step % eval_every_steps == 0:
                         eval_row = self.evaluate()
                         if eval_row is not None:
                             print(
@@ -739,7 +751,8 @@ class KairosMultimodalPipeline:
                         self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
 
             last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume
-            if tc.eval_every > 0:
+            # skip if the last step already triggered a periodic eval (avoids a duplicate)
+            if eval_every_steps > 0 and self.global_step % eval_every_steps != 0:
                 self.evaluate()  # final eval on the converged weights
         finally:
             self.skipped_nonfinite_steps = skipped_nonfinite
