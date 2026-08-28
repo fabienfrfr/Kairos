@@ -1172,6 +1172,86 @@ def test_inspect_batch_ignores_padding_tail_in_repeat_run(built_pipeline):
     assert reports[0]["max_repeat_run"]["length"] < seq_len - real_len
 
 
+# ------------------------------------------------ control_alternation_report / plot_row
+def test_control_alternation_report_runs_without_control_content(built_pipeline):
+    report = built_pipeline.control_alternation_report()
+    assert report.n_rows_with_control == 0
+    assert report.mismatched_rows == []
+
+
+def test_control_alternation_report_finds_control_rows(tmp_path, model_config, text_examples, rng):
+    control_examples = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 480).astype(np.float32),
+            sample_rate=8000,
+        )
+        for _ in range(6)
+    ]
+    data_config = DataConfig(text_examples=text_examples, multimodal_examples=control_examples, max_len=100_000, batch_size=2)
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    report = pipe.control_alternation_report(sample_size=len(pipe.loader.dataset.ds))
+
+    assert report.n_rows_with_control > 0
+    assert report.total_state_tokens == report.total_action_tokens
+
+
+def test_control_alternation_report_invalid_split_raises(built_pipeline):
+    with pytest.raises(ValueError, match="split"):
+        built_pipeline.control_alternation_report(split="bogus")
+
+
+def test_plot_row_runs_without_raising(built_pipeline, monkeypatch):
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless backend - no display in a test environment
+    built_pipeline.plot_row(row=0)  # must not raise
+
+
+def test_plot_row_invalid_split_raises(built_pipeline):
+    with pytest.raises(ValueError, match="split"):
+        built_pipeline.plot_row(row=0, split="bogus")
+
+
+def test_show_random_rows_runs_without_raising(built_pipeline):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    built_pipeline.show(n=2)  # must not raise
+
+
+def test_show_filters_by_modality(built_pipeline, capsys):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    built_pipeline.show(n=2, modality="image")
+    out = capsys.readouterr().out
+    assert "--- row" in out
+
+
+def test_show_reports_when_modality_absent(built_pipeline, capsys):
+    built_pipeline.show(n=2, modality="video")  # not in built_pipeline's fixtures
+    out = capsys.readouterr().out
+    assert "no rows with modality" in out
+
+
+def test_show_invalid_split_raises(built_pipeline):
+    with pytest.raises(ValueError, match="split"):
+        built_pipeline.show(n=2, split="bogus")
+
+
+def test_inspect_batch_df_matches_inspect_batch(built_pipeline):
+    reports = built_pipeline.inspect_batch(n=1)
+    df = built_pipeline.inspect_batch_df(n=1)
+    assert len(df) == len(reports)
+    assert list(df["row"]) == [r["row"] for r in reports]
+    assert "pad_frac" in df.columns
+
+
 def test_locate_nan_source_returns_none_before_any_skip(built_pipeline):
     assert built_pipeline.locate_nan_source() is None
 

@@ -37,6 +37,11 @@ def sample_lidar():
     return pts
 
 
+@pytest.fixture
+def rng():
+    return np.random.default_rng(0)
+
+
 # ========================= Vocab / backward compatibility =========================
 def test_vocab_size_is_291(tokenizer):
     """Regression: 259 base + 30 modality/channel tags == 289 (+SEP+MASK=291)."""
@@ -424,3 +429,64 @@ def test_encode_multimodal_returns_octet_family_ids_same_shape_as_input_ids(toke
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
     assert out["octet_family_ids"].shape == out["input_ids"].shape
     assert out["octet_family_ids"].max().item() > 0  # image bytes got a real (nonzero) family
+
+
+# ========================= reconstruct_segments =========================
+def test_reconstruct_segments_roundtrips_image(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert len(result) == 1
+    assert result[0]["modality"] == "IMAGE"
+    assert "error" not in result[0]
+    assert np.array_equal(result[0]["decoded"], sample_image)
+
+
+def test_reconstruct_segments_roundtrips_audio(tokenizer, sample_audio):
+    markers = KairosTokenizer.encode_audio(sample_audio, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "AUDIO"
+    assert "duration_s" in result[0]
+    assert result[0]["decoded"].shape[0] == sample_audio.shape[0]
+
+
+def test_reconstruct_segments_roundtrips_control_state_and_action(tokenizer, rng):
+    state = rng.uniform(-1, 1, 480).astype(np.float32)
+    action = rng.uniform(-1, 1, 480).astype(np.float32)
+    segs = [
+        MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(state, family="STA", scale_factor=1)),
+        MultimodalSegment(Modality.ACTION, KairosTokenizer.encode_signal(action, family="ACT", scale_factor=1)),
+    ]
+    out = tokenizer.encode_multimodal(segs)
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    modalities = [r["modality"] for r in result]
+    assert modalities == ["STATE", "ACTION"]  # order preserved: the alternation is visible here
+    assert result[0]["decoded"].shape[0] == result[1]["decoded"].shape[0]  # same length back out
+
+
+def test_reconstruct_segments_decodes_text_as_str(tokenizer):
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.TEXT, "hello world".encode("utf-8"))])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "TEXT"
+    assert result[0]["decoded"] == "hello world"
+
+
+def test_reconstruct_segments_reports_error_instead_of_raising_on_truncated_segment(tokenizer, sample_image):
+    """A window boundary can truncate a segment mid-byte-plane; this must be surfaced as an
+    error entry, not crash the whole diagnostic over one corrupted row."""
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    truncated = out["input_ids"][:-5]  # cut off before the closing tag / mid-payload
+    result = tokenizer.reconstruct_segments(truncated)
+    assert result  # decode_multimodal still finds the (now unterminated) segment
+    assert result[0]["decoded"] is None
+    assert "error" in result[0]
+
+
+def test_reconstruct_segments_n_tokens_matches_segment_length(tokenizer, sample_lidar):
+    markers = KairosTokenizer.encode_lidar(sample_lidar)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.LIDAR, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    decoded_ids = tokenizer.decode_multimodal(out["input_ids"])
+    assert result[0]["n_tokens"] == len(decoded_ids[0].data)

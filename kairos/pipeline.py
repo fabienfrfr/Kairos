@@ -19,7 +19,14 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
-from .dataset import KairosPretrainingDataset, diagnose_built_dataset, diagnose_multimodal_examples
+from .dataset import (
+    KairosPretrainingDataset,
+    diagnose_built_dataset,
+    diagnose_control_alternation,
+    diagnose_multimodal_examples,
+    find_rows_with_modality,
+    plot_tokenized_row,
+)
 from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import (
@@ -443,6 +450,71 @@ class KairosMultimodalPipeline:
             raise RuntimeError(f"data_report(split={split!r}) needs multimodal_examples/multimodal_path, or a built pipeline")
         finally:
             self._release_transient_memory()
+
+    def control_alternation_report(self, sample_size: int = 200, split: str = "train"):
+        """Localizes a STATE/ACTION token imbalance to specific rows (see dataset module)."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"control_alternation_report(split={split!r}) needs a built pipeline")
+        return diagnose_control_alternation(loader.dataset.ds, sample_size=sample_size)
+
+    def plot_row(self, row: int = 0, split: str = "train", max_segments: int | None = None) -> None:
+        """Reconstructs and plots row `row` of the built (tokenized) dataset in document order."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"plot_row(split={split!r}) needs a built pipeline")
+        input_ids = loader.dataset.ds.with_format("torch")[row]["input_ids"]
+        plot_tokenized_row(self.tokenizer, input_ids, max_segments=max_segments)
+
+    def show(
+        self, n: int = 3, modality: str | None = None, split: str = "train", seed: int = 0, max_segments: int | None = None
+    ) -> None:
+        """The easy entry point: plots n real tokenized rows. modality=None picks n random
+        rows; modality="image"/"control"/"audio"/... only shows rows containing it."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"show(split={split!r}) needs a built pipeline")
+        built = loader.dataset.ds
+
+        if modality is None:
+            total = len(built)
+            rows = random.Random(seed).sample(range(total), min(n, total)) if total else []
+        else:
+            rows = find_rows_with_modality(built, modality, n=n, seed=seed)
+            if not rows:
+                print(f"no rows with modality={modality!r} found in this sample")
+                return
+
+        for row in rows:
+            print(f"--- row {row} ---")
+            self.plot_row(row=row, split=split, max_segments=max_segments)
+
+    def inspect_batch_df(self, n: int = 1, from_loader: bool = True):
+        """inspect_batch(), pre-flattened into a pandas DataFrame ready to print."""
+        import pandas as pd
+
+        reports = self.inspect_batch(n=n, from_loader=from_loader)
+        return pd.DataFrame(
+            [
+                {
+                    "row": r["row"],
+                    "modality_counts": r["modality_counts"],
+                    "token_id_range": r["token_id_range"],
+                    "top_token_ids": r["top_token_ids"],
+                    "max_repeat_run": r["max_repeat_run"],
+                    "out_of_bounds_tokens": len(r["out_of_bounds"]["token_ids"]),
+                    "out_of_bounds_modality": len(r["out_of_bounds"]["modality_ids"]),
+                    "pad_frac": round(r["pad_frac"], 3) if r["pad_frac"] is not None else None,
+                }
+                for r in reports
+            ]
+        )
 
     @staticmethod
     def _release_transient_memory() -> None:

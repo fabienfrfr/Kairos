@@ -288,6 +288,52 @@ def split_examples(
     return shuffled[n_eval:], shuffled[:n_eval]
 
 
+@dataclass
+class RawControlBalanceReport:
+    """Sums raw state/action array lengths across "control" examples, before any
+    tokenization/windowing - checks the source data itself, not the pipeline downstream."""
+
+    n_control_examples: int
+    total_state_samples: int
+    total_action_samples: int
+    mismatched_examples: list[dict]  # [{"index": i, "state_samples": ..., "action_samples": ...}]
+
+    def __str__(self) -> str:
+        lines = [
+            "Kairos raw control state/action balance (pre-tokenization)",
+            "-------------------------------------------------------------",
+            f"control examples: {self.n_control_examples}",
+            f"total state samples: {self.total_state_samples}  total action samples: {self.total_action_samples}",
+            f"examples with a raw state/action length mismatch: {len(self.mismatched_examples)}",
+        ]
+        if self.mismatched_examples:
+            lines.append("First few mismatches:")
+            for m in self.mismatched_examples[:5]:
+                lines.append(f"  example {m['index']}: state={m['state_samples']} action={m['action_samples']}")
+        return "\n".join(lines)
+
+
+def diagnose_raw_control_balance(examples) -> RawControlBalanceReport:
+    """Checks every "control" example's raw state/action arrays for equal length, before
+    any tokenization - run this first to rule out a source-data problem vs. a pipeline one."""
+    n = 0
+    total_state = total_action = 0
+    mismatched: list[dict] = []
+    for i, ex in enumerate(examples):
+        if ex.get("modality") != "control":
+            continue
+        arrays = unpack_multimodal_data(ex["data"])
+        state_n, action_n = len(arrays["state"]), len(arrays["action"])
+        n += 1
+        total_state += state_n
+        total_action += action_n
+        if state_n != action_n:
+            mismatched.append({"index": i, "state_samples": state_n, "action_samples": action_n})
+    return RawControlBalanceReport(
+        n_control_examples=n, total_state_samples=total_state, total_action_samples=total_action, mismatched_examples=mismatched
+    )
+
+
 def preview_multimodal_examples(examples, n: int = 3, seed: int = 0) -> None:
     """Prints caption/meta and plots a small sample of each multimodal modality (matplotlib)."""
     import matplotlib.pyplot as plt
@@ -345,6 +391,166 @@ def _plot_multimodal_row(plt, modality: str, arrays: dict) -> None:
         plt.plot(arrays["action"], label="action")
         plt.legend(fontsize=6)
         plt.show()
+
+
+def plot_tokenized_row(tokenizer, input_ids, max_segments: int | None = None) -> None:
+    """Decodes a real (post-tokenization/packing) row and plots each segment in document
+    order - e.g. to confirm STATE/ACTION alternation or spot a truncated segment."""
+    import matplotlib.pyplot as plt
+
+    segments = tokenizer.reconstruct_segments(input_ids)
+    if max_segments is not None:
+        segments = segments[:max_segments]
+    print(" -> ".join(f"{s['modality']}({s['n_tokens']})" for s in segments))
+
+    for i, seg in enumerate(segments):
+        modality, decoded = seg["modality"], seg["decoded"]
+        if seg.get("error"):
+            print(f"  [{i}] {modality}: decode failed ({seg['error']})")
+        elif modality == "TEXT":
+            print(f"  [{i}] TEXT: {decoded[:120]!r}")
+        elif modality == "IMAGE":
+            plt.figure(figsize=(1.5, 1.5))
+            plt.title(f"[{i}] IMAGE", fontsize=6)
+            plt.imshow(decoded)
+            plt.axis("off")
+            plt.show()
+        elif modality == "VIDEO":
+            n_frames = min(4, decoded.shape[0])
+            _fig, axes = plt.subplots(1, n_frames, figsize=(n_frames * 1.0, 1.0))
+            for j, ax in enumerate(axes if n_frames > 1 else [axes]):
+                ax.imshow(decoded[j])
+                ax.axis("off")
+            _fig.suptitle(f"[{i}] VIDEO", fontsize=6)
+            plt.show()
+        elif modality == "AUDIO":
+            plt.figure(figsize=(3, 1))
+            plt.title(f"[{i}] AUDIO ({seg.get('duration_s', 0):.3f}s)", fontsize=6)
+            plt.plot(decoded, linewidth=0.5)
+            plt.axis("off")
+            plt.show()
+        elif modality == "LIDAR":
+            points = decoded
+            fig = plt.figure(figsize=(2, 2))
+            ax = fig.add_subplot(projection="3d") if points.shape[1] >= 3 else fig.add_subplot()
+            if points.shape[1] >= 3:
+                ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1)
+            else:
+                ax.scatter(points[:, 0], points[:, 1], s=1)
+            ax.set_title(f"[{i}] LIDAR", fontsize=6)
+            plt.show()
+        elif modality in ("STATE", "ACTION"):
+            plt.figure(figsize=(2.5, 0.8))
+            color = "tab:blue" if modality == "STATE" else "tab:orange"
+            plt.plot(decoded, linewidth=0.7, color=color)
+            plt.title(f"[{i}] {modality} ({len(decoded)} samples)", fontsize=6)
+            plt.axis("off")
+            plt.show()
+
+
+@dataclass
+class ControlAlternationReport:
+    """Per-row STATE/ACTION segment stats from decode_multimodal, to pinpoint exactly where
+    a STATE-vs-ACTION token-count gap comes from (see plot_tokenized_row for the visual view)."""
+
+    n_rows_with_control: int
+    n_rows_sampled: int
+    total_state_tokens: int
+    total_action_tokens: int
+    non_alternating_rows: list[int]  # row indices where STATE/ACTION segments didn't strictly S,A,S,A...
+    mismatched_rows: list[dict]  # rows where a row's own state/action token counts differ
+
+    def __str__(self) -> str:
+        lines = [
+            "Kairos control S,A-alternation diagnostic",
+            "------------------------------------------",
+            f"Rows sampled: {self.n_rows_sampled}  (with control content: {self.n_rows_with_control})",
+            f"STATE tokens total: {self.total_state_tokens}  ACTION tokens total: {self.total_action_tokens}",
+            f"Non-alternating rows: {len(self.non_alternating_rows)}",
+            f"Rows with a state != action token mismatch: {len(self.mismatched_rows)}",
+        ]
+        if self.mismatched_rows:
+            lines.append("First few mismatches:")
+            for m in self.mismatched_rows[:5]:
+                lines.append(f"  row {m['row']}: state={m['state_tokens']} action={m['action_tokens']}")
+        return "\n".join(lines)
+
+
+def find_rows_with_modality(built_dataset, modality: str, n: int = 3, sample_size: int = 200, seed: int = 0) -> list[int]:
+    """Row indices (from a random sample) whose modality_ids contain `modality` (case-
+    insensitive: "image", "control" (STATE or ACTION), "state", "action", "text", ...)."""
+    key = modality.lower()
+    if key == "control":
+        wanted = {int(Modality.STATE), int(Modality.ACTION)}
+    else:
+        try:
+            wanted = {int(Modality[key.upper()])}
+        except KeyError:
+            valid = ", ".join(m.name.lower() for m in Modality) + ", control"
+            raise ValueError(f"unknown modality {modality!r}; expected one of: {valid}") from None
+
+    total_rows = len(built_dataset)
+    sample_n = min(sample_size, total_rows)
+    idx = random.Random(seed).sample(range(total_rows), sample_n) if total_rows else []
+    plain = built_dataset.with_format(None)
+    batch = plain[idx] if idx else {"modality_ids": []}
+
+    found = []
+    for row_i, mods in zip(idx, batch["modality_ids"]):
+        if any(m in wanted for m in mods):
+            found.append(row_i)
+            if len(found) >= n:
+                break
+    return found
+
+
+def diagnose_control_alternation(built_dataset, sample_size: int = 200, seed: int = 0) -> ControlAlternationReport:
+    """Per sampled row: do STATE/ACTION segments strictly alternate and match in token
+    count? Localizes a STATE/ACTION imbalance to specific rows instead of guessing."""
+    total_rows = len(built_dataset)
+    sample_n = min(sample_size, total_rows)
+    idx = random.Random(seed).sample(range(total_rows), sample_n) if total_rows else []
+    plain = built_dataset.with_format(None)
+    batch = plain[idx] if idx else {"modality_ids": []}
+
+    n_with_control = 0
+    total_state = total_action = 0
+    non_alternating: list[int] = []
+    mismatched: list[dict] = []
+    sa_ids = {int(Modality.STATE), int(Modality.ACTION)}
+
+    for row_i, mods in zip(idx, batch["modality_ids"]):
+        # run-length encode consecutive same-modality tokens directly from modality_ids -
+        # unlike decode_multimodal's open/close-tag matching, this can't silently drop a
+        # segment truncated at a window boundary (no closing tag survives the cut there).
+        runs = []
+        for m in mods:
+            if m not in sa_ids:
+                continue
+            if runs and runs[-1][0] == m:
+                runs[-1] = (m, runs[-1][1] + 1)
+            else:
+                runs.append((m, 1))
+        if not runs:
+            continue
+        n_with_control += 1
+        state_tok = sum(n for m, n in runs if m == int(Modality.STATE))
+        action_tok = sum(n for m, n in runs if m == int(Modality.ACTION))
+        total_state += state_tok
+        total_action += action_tok
+        if state_tok != action_tok:
+            mismatched.append({"row": row_i, "state_tokens": state_tok, "action_tokens": action_tok})
+        if any(runs[i][0] == runs[i + 1][0] for i in range(len(runs) - 1)):
+            non_alternating.append(row_i)
+
+    return ControlAlternationReport(
+        n_rows_with_control=n_with_control,
+        n_rows_sampled=sample_n,
+        total_state_tokens=total_state,
+        total_action_tokens=total_action,
+        non_alternating_rows=non_alternating,
+        mismatched_rows=mismatched,
+    )
 
 
 class KairosPretrainingDataset(Dataset):

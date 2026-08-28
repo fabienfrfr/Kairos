@@ -54,7 +54,7 @@ def _():
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
     from kairos.utils import make_progress_callback
-    from kairos.dataset import modality_counts, split_examples, preview_multimodal_examples
+    from kairos.dataset import diagnose_raw_control_balance, modality_counts, split_examples, preview_multimodal_examples
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
@@ -68,6 +68,7 @@ def _():
         Modality,
         Path,
         TrainConfig,
+        diagnose_raw_control_balance,
         make_progress_callback,
         modality_counts,
         pd,
@@ -160,6 +161,18 @@ def _(modality_counts, multimodal_examples, text_examples):
 def _():
     SHOW_PREVIEW = True  # set False to skip decoding/plotting
     return (SHOW_PREVIEW,)
+
+
+@app.cell
+def _(SHOW_PREVIEW, diagnose_raw_control_balance, multimodal_examples):
+    # source-data sanity check, before any tokenization/windowing: raw control state/action
+    # sample counts must match exactly here, regardless of where multimodal_examples came from
+    if SHOW_PREVIEW and multimodal_examples:
+        _raw_report = diagnose_raw_control_balance(multimodal_examples)
+        print(_raw_report)
+        if _raw_report.n_control_examples and _raw_report.mismatched_examples:
+            print("\n^ mismatch found in the SOURCE data itself, before tokenization")
+    return
 
 
 @app.cell
@@ -490,24 +503,10 @@ def _(RUN_BENCHMARK, pipe):
 
 
 @app.cell
-def _(pd, pipe):
+def _(pipe):
     # visualize the tokenized input as fed to the model, post-collation
     _reports = pipe.inspect_batch(n=1)
-    _table = pd.DataFrame(
-        [
-            {
-                "row": r["row"],
-                "modality_counts": r["modality_counts"],
-                "token_id_range": r["token_id_range"],
-                "top_token_ids": r["top_token_ids"],  # [(id, count), ...] - most
-                "max_repeat_run": r["max_repeat_run"],  # longest run of one id
-                "out_of_bounds_tokens": len(r["out_of_bounds"]["token_ids"]),
-                "out_of_bounds_modality": len(r["out_of_bounds"]["modality_ids"]),
-                "pad_frac": round(r["pad_frac"], 3) if r["pad_frac"] is not None else None,
-            }
-            for r in _reports
-        ]
-    )
+    _table = pipe.inspect_batch_df(n=1)
     n_oob = _table["out_of_bounds_tokens"].sum() + _table["out_of_bounds_modality"].sum()
     if n_oob:
         print(f"WARNING: {n_oob} out-of-bounds ids found in this batch - inspect before training")
@@ -519,6 +518,30 @@ def _(pd, pipe):
     # raw numeric view of the first
     print("\nrow 0 input_ids  :", _reports[0]["input_ids"])
     print("row 0 modality_ids:", _reports[0]["modality_ids"])
+    return
+
+
+@app.cell
+def _(RUN_BENCHMARK, pipe):
+    # localizes a STATE/ACTION token imbalance to specific rows (not just an aggregate %)
+    report = None
+    if RUN_BENCHMARK:
+        report = pipe.control_alternation_report(split="train")
+        print(report)
+        if pipe.eval_data_config is not None:
+            print()
+            print(pipe.control_alternation_report(split="eval"))
+    return (report,)
+
+
+@app.cell
+def _(RUN_BENCHMARK, pipe, report):
+    # visually reconstruct real tokenized rows - modality=None: random sample; or pass
+    # modality="image"/"audio"/"control"/... to only see rows containing that modality
+    if RUN_BENCHMARK and report is not None and report.mismatched_rows:
+        pipe.plot_row(row=report.mismatched_rows[0]["row"], split="train")
+    elif RUN_BENCHMARK:
+        pipe.show(n=3, split="train")  # a few random rows, any modality
     return
 
 

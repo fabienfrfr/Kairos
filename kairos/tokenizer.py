@@ -460,6 +460,38 @@ class KairosTokenizer(ByT5Tokenizer):
                 i += 1
         return segments
 
+    def reconstruct_segments(self, input_ids) -> list[dict]:
+        """Decodes input_ids back to typed content per segment (TEXT->str, IMAGE/VIDEO/LIDAR/
+        AUDIO/STATE/ACTION->arrays). "decoded" is None with an "error" key if decode failed."""
+        if not torch.is_tensor(input_ids):
+            input_ids = torch.as_tensor(input_ids)
+        results = []
+        for seg in self.decode_multimodal(input_ids):
+            n_tokens = len(seg.data)
+            entry = {"modality": seg.modality.name, "n_tokens": n_tokens}
+            try:
+                if seg.modality is Modality.TEXT:
+                    entry["decoded"] = seg.data.decode("utf-8", errors="replace")
+                elif seg.modality is Modality.IMAGE:
+                    entry["decoded"] = self.decode_image(seg.data)
+                elif seg.modality is Modality.VIDEO:
+                    entry["decoded"] = self.decode_video(seg.data)
+                elif seg.modality is Modality.AUDIO:
+                    waveform, duration = self.decode_audio(seg.data)
+                    entry["decoded"] = waveform
+                    entry["duration_s"] = duration
+                elif seg.modality is Modality.LIDAR:
+                    entry["decoded"] = self.decode_lidar(seg.data)
+                elif seg.modality in (Modality.STATE, Modality.ACTION):
+                    entry["decoded"] = self.decode_signal(seg.data)
+                else:
+                    entry["decoded"] = seg.data
+            except Exception as e:  # noqa: BLE001 — surface a corrupt/truncated segment, don't crash
+                entry["decoded"] = None
+                entry["error"] = str(e)
+            results.append(entry)
+        return results
+
 
 # len(KairosTokenizer()) == 259 base bytes/specials + 30 modality/channel/structural tags == 289.
 # The (up to) 17 "which byte/channel" families live in a separate small octet_family_ids stream

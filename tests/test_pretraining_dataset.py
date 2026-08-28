@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pytest
 import torch
+from datasets import Dataset as HFDataset
 
 from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
 from kairos.tokenizer import KairosTokenizer, Modality
@@ -124,6 +125,58 @@ def test_control_uses_action_and_state_disjoint(tokenizer, rng):
     assert set(action_pos).isdisjoint(state_pos)
 
 
+# ============================= diagnose_raw_control_balance =============================
+def test_diagnose_raw_control_balance_clean_data(rng):
+    from kairos.dataset import diagnose_raw_control_balance
+
+    examples = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 480).astype(np.float32),
+            sample_rate=8000,
+        )
+        for _ in range(5)
+    ]
+    report = diagnose_raw_control_balance(examples)
+
+    assert report.n_control_examples == 5
+    assert report.total_state_samples == report.total_action_samples == 2400
+    assert report.mismatched_examples == []
+
+
+def test_diagnose_raw_control_balance_flags_source_data_mismatch(rng):
+    """This is what would catch a stale/broken *source* dataset (e.g. an old published HF
+    snapshot built before a pipeline fix) - before any tokenization/windowing is involved."""
+    from kairos.dataset import diagnose_raw_control_balance
+
+    examples = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 300).astype(np.float32),  # genuinely shorter, upstream
+            sample_rate=8000,
+        )
+    ]
+    report = diagnose_raw_control_balance(examples)
+
+    assert report.n_control_examples == 1
+    assert len(report.mismatched_examples) == 1
+    assert report.mismatched_examples[0] == {"index": 0, "state_samples": 300, "action_samples": 480}
+
+
+def test_diagnose_raw_control_balance_ignores_other_modalities(rng):
+    from kairos.dataset import diagnose_raw_control_balance
+
+    examples = [
+        {"modality": "text", "text": "hello"},
+        make_example("image_caption", caption="a cat", image=rng.integers(0, 255, (8, 8, 3), dtype=np.uint8)),
+    ]
+    report = diagnose_raw_control_balance(examples)
+    assert report.n_control_examples == 0
+    assert report.total_state_samples == report.total_action_samples == 0
+
+
 def test_control_state_and_action_pair_one_to_one(tokenizer, rng):
     """One row = one atomic (state, action) transition: exactly one STATE segment
     and one ACTION segment, in that order (S then A)."""
@@ -186,6 +239,162 @@ def test_control_scale_factor_shrinks_token_count(tokenizer, rng):
     coarse_bytes = sum(len(item[1]) for s in coarse if s.modality == Modality.STATE for item in s.data if item[0] == "bytes")
     fine_bytes = sum(len(item[1]) for s in fine if s.modality == Modality.STATE for item in s.data if item[0] == "bytes")
     assert coarse_bytes < fine_bytes
+
+
+def test_control_state_action_totals_match_end_to_end_even_with_window_truncation(tokenizer, rng):
+    """The real invariant: summed over the whole packed+chunked dataset, STATE tokens must
+    equal ACTION tokens exactly - even when windows are small enough to cut mid-segment."""
+    texts = [f"filler {i}" for i in range(80)]
+    multimodal = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 480).astype(np.float32),
+            sample_rate=8000,
+        )
+        for _ in range(30)
+    ]
+    # max_len well under one control segment's size, to force mid-segment window boundaries
+    ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=64, multimodal_examples=multimodal, pack=True)
+
+    state_tok = sum((ds[i]["modality_ids"] == Modality.STATE.value).sum().item() for i in range(len(ds)))
+    action_tok = sum((ds[i]["modality_ids"] == Modality.ACTION.value).sum().item() for i in range(len(ds)))
+
+    assert len(ds) > 30  # sanity: truncation actually happened, this isn't a trivial no-op
+    assert state_tok == action_tok
+    assert state_tok > 0
+
+
+def test_diagnose_control_alternation_reports_clean_dataset_as_clean(tokenizer, rng):
+    from kairos.dataset import diagnose_control_alternation
+
+    texts = [f"filler {i}" for i in range(40)]
+    multimodal = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 480).astype(np.float32),
+            sample_rate=8000,
+        )
+        for _ in range(10)
+    ]
+    # max_len large enough that the whole packed stream fits in one row - no mid-segment
+    # window cuts, so per-row balance is guaranteed too (not just the aggregate total).
+    ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=100_000, multimodal_examples=multimodal, pack=True)
+
+    report = diagnose_control_alternation(ds.ds, sample_size=len(ds), seed=0)
+
+    assert report.n_rows_with_control > 0
+    assert report.total_state_tokens == report.total_action_tokens
+    assert report.mismatched_rows == []
+    assert report.non_alternating_rows == []
+
+
+def test_diagnose_control_alternation_per_row_mismatch_is_expected_under_truncation(tokenizer, rng):
+    """A per-row mismatch is a normal side effect of a window cutting a segment in half (the
+    remainder lands in the next row) - only the aggregate total is a real invariant."""
+    from kairos.dataset import diagnose_control_alternation
+
+    texts = [f"filler {i}" for i in range(40)]
+    multimodal = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 480).astype(np.float32),
+            sample_rate=8000,
+        )
+        for _ in range(10)
+    ]
+    ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=1024, multimodal_examples=multimodal, pack=True)
+
+    report = diagnose_control_alternation(ds.ds, sample_size=len(ds), seed=0)
+
+    assert report.total_state_tokens == report.total_action_tokens  # aggregate: still exact
+    assert report.mismatched_rows  # but individual rows can legitimately disagree
+
+
+def test_diagnose_control_alternation_flags_a_broken_row(tokenizer, rng):
+    """Directly poking a state-only segment (no matching action) into a row must surface
+    as both a token-count mismatch and (trivially) as the row having no alternation to break."""
+    from kairos.dataset import diagnose_control_alternation
+    from kairos.tokenizer import MultimodalSegment
+
+    state_only = tokenizer.encode_multimodal(
+        [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(rng.uniform(-1, 1, 100).astype(np.float32), family="STA"))]
+    )
+    clean = tokenizer.encode_multimodal(
+        [
+            MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(rng.uniform(-1, 1, 100).astype(np.float32), family="STA")),
+            MultimodalSegment(Modality.ACTION, KairosTokenizer.encode_signal(rng.uniform(-1, 1, 100).astype(np.float32), family="ACT")),
+        ]
+    )
+
+    def pad_mods(row, length):
+        mods = row["modality_ids"].tolist()
+        return mods + [int(Modality.TEXT)] * (length - len(mods))
+
+    length = max(len(state_only["modality_ids"]), len(clean["modality_ids"]))
+    fake_ds = HFDataset.from_dict({"modality_ids": [pad_mods(state_only, length), pad_mods(clean, length)]})
+
+    report = diagnose_control_alternation(fake_ds, sample_size=2, seed=0)
+
+    assert report.n_rows_with_control == 2
+    assert len(report.mismatched_rows) == 1  # only the state-only row is unbalanced
+    assert report.mismatched_rows[0]["action_tokens"] == 0
+
+
+# ============================= find_rows_with_modality =============================
+def test_find_rows_with_modality_finds_the_right_rows(tokenizer, rng):
+    from kairos.dataset import find_rows_with_modality
+
+    texts = [f"filler {i}" for i in range(30)]
+    multimodal = [make_example("image_caption", caption="a cat", image=rng.integers(0, 255, (8, 8, 3), dtype=np.uint8))]
+    ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=100_000, multimodal_examples=multimodal, pack=True)
+
+    rows = find_rows_with_modality(ds.ds, "image", n=5)
+    assert rows  # the single image_caption example must be found
+    for row_i in rows:
+        mods = ds.ds[row_i]["modality_ids"]
+        assert int(Modality.IMAGE) in mods
+
+
+def test_find_rows_with_modality_control_matches_state_or_action(tokenizer, rng):
+    from kairos.dataset import find_rows_with_modality
+
+    multimodal = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 480).astype(np.float32),
+            sample_rate=8000,
+        )
+    ]
+    ds = KairosPretrainingDataset(multimodal_examples=multimodal, tokenizer=tokenizer, max_len=100_000, pack=True)
+
+    rows = find_rows_with_modality(ds.ds, "control", n=5)
+    assert rows
+
+
+def test_find_rows_with_modality_returns_empty_when_absent(tokenizer):
+    from kairos.dataset import find_rows_with_modality
+
+    ds = KairosPretrainingDataset(texts=["hello world"], tokenizer=tokenizer, max_len=256)
+    assert find_rows_with_modality(ds.ds, "lidar", n=5) == []
+
+
+def test_find_rows_with_modality_rejects_unknown_modality(tokenizer):
+    from kairos.dataset import find_rows_with_modality
+
+    ds = KairosPretrainingDataset(texts=["hello world"], tokenizer=tokenizer, max_len=256)
+    with pytest.raises(ValueError, match="unknown modality"):
+        find_rows_with_modality(ds.ds, "bogus", n=5)
+
+
+def test_find_rows_with_modality_is_case_insensitive(tokenizer):
+    from kairos.dataset import find_rows_with_modality
+
+    ds = KairosPretrainingDataset(texts=["hello world"], tokenizer=tokenizer, max_len=256)
+    assert find_rows_with_modality(ds.ds, "TEXT", n=5) == find_rows_with_modality(ds.ds, "text", n=5)
 
 
 def test_long_example_gets_chunked(tokenizer, rng):
