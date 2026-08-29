@@ -104,12 +104,18 @@ def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[Multim
 
     if modality == "control":
         sf = modality_scale_factors.get("control")
-        # each row is one atomic (state, action) transition (~0.06s clip), not a trajectory -
-        # a single pair per row, not per-tick chunking. scale_factor decimates to shrink tokens.
-        state_tokens = KairosTokenizer.encode_signal(arrays["state"], family="STA", scale_factor=sf)
-        action_tokens = KairosTokenizer.encode_signal(arrays["action"], family="ACT", scale_factor=sf)
-        state_nbytes = sum(len(item[1]) for item in state_tokens if item[0] == "bytes")
-        action_nbytes = sum(len(item[1]) for item in action_tokens if item[0] == "bytes")
+        n_bytes = 2  # same default as encode_signal
+        # per-sample ticks (tick_samples=1), NOT per-tick chunking of a trajectory: each control
+        # row is one atomic (state, action) transition, and encode_signal_ticks with a 1-sample
+        # tick is just how we get one quantized-sample-sized token group per side to interleave.
+        state_ticks = KairosTokenizer.encode_signal_ticks(
+            arrays["state"], family="STA", tick_samples=1, n_bytes=n_bytes, scale_factor=sf
+        )
+        action_ticks = KairosTokenizer.encode_signal_ticks(
+            arrays["action"], family="ACT", tick_samples=1, n_bytes=n_bytes, scale_factor=sf
+        )
+        state_nbytes = sum(len(item[1]) for tick in state_ticks for item in tick if item[0] == "bytes")
+        action_nbytes = sum(len(item[1]) for tick in action_ticks for item in tick if item[0] == "bytes")
         if state_nbytes != action_nbytes:
             warnings.warn(
                 f"control example: state ({state_nbytes} bytes) vs action ({action_nbytes} "
@@ -119,10 +125,14 @@ def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[Multim
         segments = []
         if caption:
             segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
-        # S then A: alternation across a longer S,A,S,A,... sequence comes from concatenating
-        # consecutive control rows, not from splitting a single row into ticks.
-        segments.append(MultimodalSegment(Modality.STATE, state_tokens))
-        segments.append(MultimodalSegment(Modality.ACTION, action_tokens))
+        # token-level alternation A,S,A,S,... (not two contiguous SSSS/AAAA blocks): each pair
+        # is one quantized sample per side, so a row can never end up with more STATE tokens
+        # than ACTION tokens (or vice versa) for the interleaved portion. Any surplus from
+        # unequal raw lengths (the mismatch warned about above) is dropped here rather than
+        # baked into a lopsided trailing block.
+        for action_tick, state_tick in zip(action_ticks, state_ticks):
+            segments.append(MultimodalSegment(Modality.ACTION, action_tick))
+            segments.append(MultimodalSegment(Modality.STATE, state_tick))
         return segments
     return None
 
@@ -398,8 +408,13 @@ def _plot_multimodal_row(plt, modality: str, arrays: dict) -> None:
         plt.show()
 
 
+# the modality kinds preview_tokenized_examples guarantees coverage of when modality=None -
+# "control" covers both STATE and ACTION (see find_rows_with_modality).
+_ALL_PREVIEW_MODALITIES = ("text", "image", "audio", "video", "lidar", "control")
+
+
 def preview_tokenized_examples(
-    tokenizer, built_dataset, n: int = 3, modality: str | None = None, sample_size: int = 200, seed: int = 0
+    tokenizer, built_dataset, n: int = 1, modality: str | None = None, sample_size: int = 200, seed: int = 0
 ) -> None:
     """Post-tokenization/detokenization equivalent of preview_multimodal_examples: reconstructs
     real rows from input_ids and renders every segment found (TEXT/IMAGE/VIDEO/AUDIO/LIDAR via
@@ -407,12 +422,18 @@ def preview_tokenized_examples(
     as the raw preview, so the two are directly comparable).
 
     `modality`: restrict to rows containing this modality (e.g. "control", "image", ...) - see
-    find_rows_with_modality for valid names. None (default) samples n rows of any modality.
+    find_rows_with_modality for valid names. None (default) does NOT just grab n purely random
+    rows - on a large dataset that tends to land on mostly-TEXT rows and silently skip rarer
+    modalities. Instead it looks up to `n` representative row(s) for EACH modality in
+    _ALL_PREVIEW_MODALITIES, so every modality actually present in the dataset shows up at
+    least once.
 
-    A STATE/ACTION pair from the same row is expected to match; a trailing STATE (or ACTION)
-    with no partner in this row - or an undecodable tail from a mid-byte window cut - is a
-    truncation artifact (see test_..._per_row_mismatch_is_expected_under_truncation), reported
-    separately and not flagged as a mismatch.
+    A STATE/ACTION pair from the same row is expected to match (encode-time interleaving now
+    forces this per clip - see _segments_for); a small gap (at most 2) between the concatenated
+    STATE and ACTION arrays in a row is a benign window-truncation artifact - a packed row can
+    be cut at its start and/or its end, each contributing at most +/-1 sample - and is labeled
+    as such rather than flagged red. A larger gap is a real anomaly and gets the red
+    /!\\ LENGTH MISMATCH title.
     """
     import matplotlib.pyplot as plt
 
@@ -422,8 +443,15 @@ def preview_tokenized_examples(
             print(f"no rows with {modality!r} content found in this sample")
             return
     else:
-        total_rows = len(built_dataset)
-        rows = random.Random(seed).sample(range(total_rows), min(n, total_rows)) if total_rows else []
+        rows, seen = [], set()
+        for kind in _ALL_PREVIEW_MODALITIES:
+            for row_i in find_rows_with_modality(built_dataset, kind, n=n, sample_size=sample_size, seed=seed):
+                if row_i not in seen:
+                    seen.add(row_i)
+                    rows.append(row_i)
+        if not rows:
+            print("no rows found in this sample")
+            return
     plain = built_dataset.with_format(None)
 
     for row_i in rows:
@@ -431,41 +459,43 @@ def preview_tokenized_examples(
         segments = tokenizer.reconstruct_segments(input_ids)
         print(f"--- row {row_i}: " + " -> ".join(f"{s['modality']}({s['n_tokens']})" for s in segments) + " ---")
 
-        pending_state = None
+        # STATE/ACTION now arrive as many tiny per-sample segments (token-level A,S,A,S,...
+        # alternation - see _segments_for), not one big STATE block and one big ACTION block.
+        # Concatenate everything decodable in this row into two flat arrays and overlay those
+        # once, instead of pairing segment-by-segment. Since _segments_for truncates each clip
+        # to equal STATE/ACTION counts at the source, a real per-clip imbalance can no longer
+        # reach this point - the only expected discrepancy is +/-1 from a window cutting the
+        # alternating stream at an odd position, which we tolerate rather than flag red.
+        state_vals, action_vals, undecodable = [], [], []
         for i, seg in enumerate(segments):
             if seg["modality"] not in ("STATE", "ACTION"):
                 _render_tokenized_segment(seg, i)
                 continue
             if seg.get("error"):
-                # window cut mid-byte: the trailing partial segment won't decode cleanly.
-                # Still a truncation artifact, not a mismatch - report it as such.
-                if pending_state is not None:
-                    print(f"  [truncated] STATE ({len(pending_state)} samples) with no ACTION partner in this row")
-                    pending_state = None
-                print(f"  [truncated] {seg['modality']}: undecodable tail ({seg['error']})")
+                undecodable.append(f"  [truncated] {seg['modality']}: undecodable tail ({seg['error']})")
                 continue
-            if seg["modality"] == "STATE":
-                if pending_state is not None:
-                    print(f"  [truncated] STATE ({len(pending_state)} samples) with no ACTION partner in this row")
-                pending_state = seg["decoded"]
-                continue
-            # seg["modality"] == "ACTION"
-            if pending_state is None:
-                print(f"  [truncated] ACTION ({len(seg['decoded'])} samples) with no STATE partner in this row")
-                continue
-            state_n, action_n = len(pending_state), len(seg["decoded"])
+            (state_vals if seg["modality"] == "STATE" else action_vals).append(seg["decoded"])
+
+        if state_vals or action_vals:
+            state_arr = np.concatenate(state_vals) if state_vals else np.array([], dtype=np.float32)
+            action_arr = np.concatenate(action_vals) if action_vals else np.array([], dtype=np.float32)
+            state_n, action_n = len(state_arr), len(action_arr)
             plt.figure(figsize=(3, 1.2))
-            plt.plot(pending_state, label=f"state ({state_n})")
-            plt.plot(seg["decoded"], label=f"action ({action_n})")
+            plt.plot(state_arr, label=f"state ({state_n})")
+            plt.plot(action_arr, label=f"action ({action_n})")
             plt.legend(fontsize=6)
+            gap = abs(state_n - action_n)
             title = f"row {row_i}: state={state_n} action={action_n}"
-            if state_n != action_n:
+            # a packed row can have at most two truncation edges (its own start and end cut),
+            # each contributing at most +/-1, so a legitimate gap is at most 2.
+            if gap > 2:
                 title += "  /!\\ LENGTH MISMATCH"
-            plt.title(title, fontsize=6, color="red" if state_n != action_n else "black")
+            elif gap > 0:
+                title += "  (window-edge truncation)"
+            plt.title(title, fontsize=6, color="red" if gap > 2 else "black")
             plt.show()
-            pending_state = None
-        if pending_state is not None:
-            print(f"  [truncated] trailing STATE ({len(pending_state)} samples) with no ACTION partner in this row")
+        for msg in undecodable:
+            print(msg)
 
 
 def _render_tokenized_segment(seg: dict, i: int) -> None:

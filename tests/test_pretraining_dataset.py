@@ -5,8 +5,8 @@ import pytest
 import torch
 from datasets import Dataset as HFDataset
 
-from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
-from kairos.tokenizer import KairosTokenizer, Modality
+from kairos.dataset import KairosPretrainingDataset, _MULTIMODAL_FEATURES, pack_multimodal_data
+from kairos.tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 
 def make_example(modality, caption=None, source="test", **fields):
@@ -178,8 +178,10 @@ def test_diagnose_raw_control_balance_ignores_other_modalities(rng):
 
 
 def test_control_state_and_action_pair_one_to_one(tokenizer, rng):
-    """One row = one atomic (state, action) transition: exactly one STATE segment
-    and one ACTION segment, in that order (S then A)."""
+    """One row = one atomic (state, action) transition, encoded as token-level alternation:
+    A,S,A,S,... (one quantized sample per side per step), not two contiguous S...S/A...A
+    blocks - so STATE and ACTION segment counts always match, and every ACTION segment is
+    immediately followed by its paired STATE segment."""
     from kairos.dataset import _segments_for
 
     ex = make_example(
@@ -191,8 +193,46 @@ def test_control_state_and_action_pair_one_to_one(tokenizer, rng):
     segments = _segments_for(ex, {})
     modalities = [s.modality for s in segments]
 
-    assert modalities.count(Modality.STATE) == modalities.count(Modality.ACTION) == 1
-    assert modalities.index(Modality.STATE) < modalities.index(Modality.ACTION)
+    assert modalities.count(Modality.STATE) == modalities.count(Modality.ACTION) > 1
+    for i in range(0, len(modalities), 2):
+        assert modalities[i] == Modality.ACTION
+        assert modalities[i + 1] == Modality.STATE
+
+
+def test_control_forces_equal_state_action_token_counts_even_with_unequal_raw_lengths(tokenizer, rng):
+    """The real requirement: token-level A,S,A,S,... alternation means a control row can never
+    end up with unbalanced STATE/ACTION token totals, even when the raw arrays came in with
+    genuinely different lengths (still warned about below) - any surplus samples on the longer
+    side are dropped rather than baked into a lopsided trailing block."""
+    from kairos.dataset import _segments_for
+
+    ex = make_example(
+        "control", action=rng.uniform(-1, 1, 300).astype(np.float32), state=rng.uniform(-1, 1, 450).astype(np.float32)
+    )
+    with pytest.warns(UserWarning, match="length mismatch"):
+        segments = _segments_for(ex, {"control": 1})  # scale_factor=1: no decimation, exact counts
+
+    modalities = [s.modality for s in segments]
+    assert modalities.count(Modality.STATE) == modalities.count(Modality.ACTION)
+    # dropped down to the shorter side (300 action samples), not padded/stretched to 450
+    assert modalities.count(Modality.ACTION) == 300
+
+    enc = tokenizer.encode_multimodal(segments)
+    decoded = tokenizer.reconstruct_segments(enc["input_ids"])
+    state_tok = sum(s["n_tokens"] for s in decoded if s["modality"] == "STATE")
+    action_tok = sum(s["n_tokens"] for s in decoded if s["modality"] == "ACTION")
+    assert state_tok == action_tok
+
+
+def test_control_alternates_action_then_state_per_sample(tokenizer, rng):
+    """Every ACTION segment is immediately followed by the STATE segment for that same sample -
+    never two ACTION (or two STATE) segments back to back."""
+    from kairos.dataset import _segments_for
+
+    ex = make_example("control", action=rng.uniform(-1, 1, 50).astype(np.float32), state=rng.uniform(-1, 1, 50).astype(np.float32))
+    segments = [s for s in _segments_for(ex, {}) if s.modality in (Modality.STATE, Modality.ACTION)]
+    pattern = [s.modality for s in segments]
+    assert pattern == [Modality.ACTION, Modality.STATE] * (len(pattern) // 2)
 
 
 def test_control_warns_on_state_action_token_count_mismatch(tokenizer, rng):
@@ -809,27 +849,32 @@ def test_preview_tokenized_examples_shows_every_modality(tokenizer, all_kinds_ex
 
 
 def test_preview_tokenized_examples_flags_real_state_action_mismatch(tokenizer, rng, capsys):
+    """_segments_for now truncates every control clip to equal STATE/ACTION counts at the
+    source (see test_control_forces_equal_state_action_token_counts...), so a real per-clip
+    imbalance can no longer reach preview_tokenized_examples through the normal pipeline. This
+    test instead checks the safety net directly: hand-build a row with a genuinely lopsided
+    STATE/ACTION stream (as if something upstream regressed) and confirm it's still caught."""
     import matplotlib
-    import warnings
+    from datasets import Dataset as HFDataset
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     plt.close("all")
-    bad_example = make_example(
-        "control",
-        caption="bad clip",
-        state=rng.uniform(-1, 1, 300).astype(np.float32),
-        action=rng.uniform(-1, 1, 450).astype(np.float32),  # genuinely different length
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ds = KairosPretrainingDataset(
-            tokenizer=tokenizer, max_len=4096, pack=False, texts=[], multimodal_examples=[bad_example]
-        )
+    action_ticks = KairosTokenizer.encode_signal_ticks(rng.uniform(-1, 1, 20).astype(np.float32), family="ACT", tick_samples=1)
+    state_ticks = KairosTokenizer.encode_signal_ticks(rng.uniform(-1, 1, 5).astype(np.float32), family="STA", tick_samples=1)
+    segments = []
+    for a, s in zip(action_ticks, state_ticks):
+        segments += [MultimodalSegment(Modality.ACTION, a), MultimodalSegment(Modality.STATE, s)]
+    segments += [MultimodalSegment(Modality.ACTION, a) for a in action_ticks[len(state_ticks) :]]  # unpaired surplus
+
+    enc = tokenizer.encode_multimodal(segments)
+    row = {k: [v] for k, v in enc.items()} | {"mask": [[1] * len(enc["input_ids"])], "prompt_len": [0]}
+    ds = HFDataset.from_dict(row, features=_MULTIMODAL_FEATURES)
+
     from kairos.dataset import preview_tokenized_examples
 
-    preview_tokenized_examples(tokenizer, ds.ds, n=1, sample_size=1)
+    preview_tokenized_examples(tokenizer, ds, n=1, sample_size=1)
     titles = _figure_titles()
     assert any("MISMATCH" in t for t in titles), f"expected a red mismatch title, got: {titles}"
 
@@ -842,8 +887,9 @@ def test_preview_tokenized_examples_reports_truncation_not_mismatch(tokenizer, r
     import matplotlib.pyplot as plt
 
     plt.close("all")
-    # equal-length state/action per clip - any mismatch we see must come from window truncation,
-    # never a real length difference, so no title should ever say MISMATCH.
+    # equal-length state/action per clip - _segments_for guarantees equal STATE/ACTION counts
+    # per clip, so any gap we see in a packed+truncated row must be at most 2 (independent
+    # start/end window cuts), never a real mismatch, and must never get the red title.
     clips = [
         make_example("control", caption=f"clip {i}", state=rng.uniform(-1, 1, 480).astype(np.float32),
                       action=rng.uniform(-1, 1, 480).astype(np.float32))
@@ -853,11 +899,10 @@ def test_preview_tokenized_examples_reports_truncation_not_mismatch(tokenizer, r
     from kairos.dataset import preview_tokenized_examples
 
     preview_tokenized_examples(tokenizer, ds.ds, n=len(ds.ds), sample_size=len(ds.ds))
-    out = capsys.readouterr().out
     titles = _figure_titles()
 
-    assert "[truncated]" in out, "expected at least one row to report a legitimate truncation"
-    assert not any("MISMATCH" in t for t in titles), f"truncation must never be flagged as a mismatch: {titles}"
+    assert titles, "expected at least one row with STATE/ACTION content to plot"
+    assert not any("MISMATCH" in t for t in titles), f"a +/-1 window-edge gap must never be flagged as a mismatch: {titles}"
 
 
 def test_preview_tokenized_examples_modality_filter(tokenizer, all_kinds_examples, capsys):

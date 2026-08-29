@@ -536,17 +536,17 @@ def _(RUN_BENCHMARK, pipe):
 
 @app.cell
 def _(RUN_BENCHMARK, pipe, report):
-    # visually reconstruct real tokenized rows, ANY modality (image/audio/video/lidar/control/
-    # text all shown as they come up). preview_tokenized overlays STATE/ACTION pairs (flags a
-    # real mismatch in red, and labels legitimate window-truncation separately) instead of
-    # plotting them apart, so it's the direct visual check for the alignment issue - alongside
-    # whatever other modalities happen to share those rows.
+    # visually reconstruct real tokenized rows. preview_tokenized(modality=None) shows one
+    # representative row per modality actually present (text/image/audio/video/lidar/control) -
+    # not n purely random rows, which on a large dataset tend to be mostly TEXT and silently
+    # skip rarer modalities. STATE/ACTION are overlaid (flagged red on a real mismatch, labeled
+    # separately when it's just legitimate window truncation).
     if RUN_BENCHMARK and report is not None and report.mismatched_rows:
         pipe.plot_row(row=report.mismatched_rows[0]["row"], split="train")
-        pipe.preview_tokenized(n=6, split="train")  # modality=None: any modality, not just control
+        pipe.preview_tokenized(split="train")
     elif RUN_BENCHMARK:
         pipe.show(n=3, split="train")  # a few random rows, any modality
-        pipe.preview_tokenized(n=6, split="train")  # same idea, STATE/ACTION overlaid when present
+        pipe.preview_tokenized(split="train")  # one representative row per modality, STATE/ACTION overlaid
     return
 
 

@@ -497,13 +497,17 @@ class KairosMultimodalPipeline:
             self.plot_row(row=row, split=split, max_segments=max_segments)
 
     def preview_tokenized(
-        self, n: int = 3, modality: str | None = None, split: str = "train", sample_size: int = 200, seed: int = 0
+        self, n: int = 1, modality: str | None = None, split: str = "train", sample_size: int = 200, seed: int = 0
     ) -> None:
         """Post-tokenization/detokenization equivalent of pipe.show(): overlays STATE/ACTION
         pairs (with explicit sample counts, flagged red on a real mismatch) instead of plotting
         them separately, while still rendering every other modality found in the row. Use this
         to visually confirm whether a STATE/ACTION imbalance is a real per-clip defect or just a
-        window-truncation artifact (see diagnose_control_alternation)."""
+        window-truncation artifact (see diagnose_control_alternation).
+
+        modality=None (default) shows up to `n` representative row(s) for EACH modality present
+        (text/image/audio/video/lidar/control), not n purely random rows - so a rare modality
+        isn't silently skipped just because a random sample didn't happen to include it."""
         if split not in ("train", "eval"):
             raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
         loader = self.loader if split == "train" else self.eval_loader
