@@ -772,3 +772,116 @@ def test_text_dataset_defaults_to_cosmopedia_when_no_texts_given(tokenizer, monk
     monkeypatch.setattr("kairos.dataset.concatenate_datasets", fake_concatenate)
     ds = KairosPretrainingDataset(texts=None, tokenizer=tokenizer, max_len=32, stride=4)
     assert len(ds) > 0
+
+
+# ========================= preview_tokenized_examples =========================
+# post-tokenization/detokenization equivalent of preview_multimodal_examples - must show every
+# modality (not just control), overlay real STATE/ACTION mismatches in red, and never confuse a
+# window-truncation artifact (see test_diagnose_control_alternation_per_row_mismatch_is_expected_
+# under_truncation) with a real mismatch.
+
+
+def _figure_titles():
+    import matplotlib.pyplot as plt
+
+    return [ax.get_title() for num in plt.get_fignums() for ax in plt.figure(num).axes]
+
+
+def test_preview_tokenized_examples_shows_every_modality(tokenizer, all_kinds_examples, capsys):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+    ds = KairosPretrainingDataset(
+        tokenizer=tokenizer, max_len=4096, pack=False, texts=[], multimodal_examples=all_kinds_examples
+    )
+    from kairos.dataset import preview_tokenized_examples
+
+    preview_tokenized_examples(tokenizer, ds.ds, n=len(all_kinds_examples), sample_size=len(ds.ds))
+    out = capsys.readouterr().out
+
+    # every modality from all_kinds_examples must show up somewhere in the reconstructed rows:
+    # text, image_caption, audio_caption, video_caption, lidar, imu (STATE-only), control (S+A)
+    for modality_token in ("TEXT", "IMAGE", "AUDIO", "VIDEO", "LIDAR", "STATE", "ACTION"):
+        assert modality_token in out, f"{modality_token} never appeared in preview_tokenized_examples output"
+
+
+def test_preview_tokenized_examples_flags_real_state_action_mismatch(tokenizer, rng, capsys):
+    import matplotlib
+    import warnings
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+    bad_example = make_example(
+        "control",
+        caption="bad clip",
+        state=rng.uniform(-1, 1, 300).astype(np.float32),
+        action=rng.uniform(-1, 1, 450).astype(np.float32),  # genuinely different length
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ds = KairosPretrainingDataset(
+            tokenizer=tokenizer, max_len=4096, pack=False, texts=[], multimodal_examples=[bad_example]
+        )
+    from kairos.dataset import preview_tokenized_examples
+
+    preview_tokenized_examples(tokenizer, ds.ds, n=1, sample_size=1)
+    titles = _figure_titles()
+    assert any("MISMATCH" in t for t in titles), f"expected a red mismatch title, got: {titles}"
+
+
+def test_preview_tokenized_examples_reports_truncation_not_mismatch(tokenizer, rng, capsys):
+    import matplotlib
+    import warnings
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+    # equal-length state/action per clip - any mismatch we see must come from window truncation,
+    # never a real length difference, so no title should ever say MISMATCH.
+    clips = [
+        make_example("control", caption=f"clip {i}", state=rng.uniform(-1, 1, 480).astype(np.float32),
+                      action=rng.uniform(-1, 1, 480).astype(np.float32))
+        for i in range(10)
+    ]
+    ds = KairosPretrainingDataset(tokenizer=tokenizer, max_len=200, pack=True, multimodal_examples=clips)
+    from kairos.dataset import preview_tokenized_examples
+
+    preview_tokenized_examples(tokenizer, ds.ds, n=len(ds.ds), sample_size=len(ds.ds))
+    out = capsys.readouterr().out
+    titles = _figure_titles()
+
+    assert "[truncated]" in out, "expected at least one row to report a legitimate truncation"
+    assert not any("MISMATCH" in t for t in titles), f"truncation must never be flagged as a mismatch: {titles}"
+
+
+def test_preview_tokenized_examples_modality_filter(tokenizer, all_kinds_examples, capsys):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+    ds = KairosPretrainingDataset(
+        tokenizer=tokenizer, max_len=4096, pack=False, texts=[], multimodal_examples=all_kinds_examples
+    )
+    from kairos.dataset import preview_tokenized_examples
+
+    preview_tokenized_examples(tokenizer, ds.ds, n=3, modality="lidar", sample_size=len(ds.ds))
+    out = capsys.readouterr().out
+    assert "LIDAR" in out
+    assert "IMAGE" not in out  # filtered rows only contain the lidar example's own segments
+
+
+def test_preview_tokenized_examples_reports_when_modality_absent(tokenizer, capsys):
+    ds = KairosPretrainingDataset(tokenizer=tokenizer, max_len=64, texts=["hello world", "another sentence here"])
+    from kairos.dataset import preview_tokenized_examples
+
+    preview_tokenized_examples(tokenizer, ds.ds, n=3, modality="image", sample_size=len(ds.ds))
+    out = capsys.readouterr().out
+    assert "no rows with" in out

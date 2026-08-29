@@ -1505,3 +1505,9 @@ def test_train_does_not_step_optimizer_on_nonfinite_loss(built_pipeline, monkeyp
     after = built_pipeline.model.state_dict()
     for key, val in before.items():
         assert torch.equal(val, after[key]), f"param {key} changed despite every batch being non-finite"
+
+def test_preview_tokenized_runs_without_raising(built_pipeline, monkeypatch):
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(plt, "show", lambda: None)
+    built_pipeline.preview_tokenized(n=3, split="train")
+    built_pipeline.preview_tokenized(n=2, modality="control", split="train")

@@ -451,6 +451,19 @@ def test_reconstruct_segments_roundtrips_audio(tokenizer, sample_audio):
     assert result[0]["decoded"].shape[0] == sample_audio.shape[0]
 
 
+def test_reconstruct_segments_roundtrips_video(tokenizer, sample_video):
+    """Regression: decode_video returns (frames, duration) - reconstruct_segments used to store
+    the raw tuple under "decoded" instead of unpacking it (unlike the AUDIO branch just above),
+    so any caller doing decoded.shape crashed with AttributeError on a tuple."""
+    markers = KairosTokenizer.encode_video(sample_video)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.VIDEO, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "VIDEO"
+    assert "error" not in result[0]
+    assert "duration_s" in result[0]
+    assert np.array_equal(result[0]["decoded"], sample_video)
+
+
 def test_reconstruct_segments_roundtrips_control_state_and_action(tokenizer, rng):
     state = rng.uniform(-1, 1, 480).astype(np.float32)
     action = rng.uniform(-1, 1, 480).astype(np.float32)

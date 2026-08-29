@@ -475,7 +475,9 @@ class KairosTokenizer(ByT5Tokenizer):
                 elif seg.modality is Modality.IMAGE:
                     entry["decoded"] = self.decode_image(seg.data)
                 elif seg.modality is Modality.VIDEO:
-                    entry["decoded"] = self.decode_video(seg.data)
+                    frames, duration = self.decode_video(seg.data)
+                    entry["decoded"] = frames
+                    entry["duration_s"] = duration
                 elif seg.modality is Modality.AUDIO:
                     waveform, duration = self.decode_audio(seg.data)
                     entry["decoded"] = waveform

@@ -386,10 +386,128 @@ def _plot_multimodal_row(plt, modality: str, arrays: dict) -> None:
             ax.scatter(points[:, 0], points[:, 1], s=1)
         plt.show()
     elif modality == "control":
+        state_n, action_n = len(arrays["state"]), len(arrays["action"])
         plt.figure(figsize=(3, 1.2))
-        plt.plot(arrays["state"], label="state")
-        plt.plot(arrays["action"], label="action")
+        plt.plot(arrays["state"], label=f"state ({state_n})")
+        plt.plot(arrays["action"], label=f"action ({action_n})")
         plt.legend(fontsize=6)
+        title = f"state={state_n} action={action_n}"
+        if state_n != action_n:
+            title += "  /!\\ LENGTH MISMATCH"
+        plt.title(title, fontsize=6, color="red" if state_n != action_n else "black")
+        plt.show()
+
+
+def preview_tokenized_examples(
+    tokenizer, built_dataset, n: int = 3, modality: str | None = None, sample_size: int = 200, seed: int = 0
+) -> None:
+    """Post-tokenization/detokenization equivalent of preview_multimodal_examples: reconstructs
+    real rows from input_ids and renders every segment found (TEXT/IMAGE/VIDEO/AUDIO/LIDAR via
+    _render_tokenized_segment, STATE/ACTION as overlaid pairs with explicit sample counts, same
+    as the raw preview, so the two are directly comparable).
+
+    `modality`: restrict to rows containing this modality (e.g. "control", "image", ...) - see
+    find_rows_with_modality for valid names. None (default) samples n rows of any modality.
+
+    A STATE/ACTION pair from the same row is expected to match; a trailing STATE (or ACTION)
+    with no partner in this row - or an undecodable tail from a mid-byte window cut - is a
+    truncation artifact (see test_..._per_row_mismatch_is_expected_under_truncation), reported
+    separately and not flagged as a mismatch.
+    """
+    import matplotlib.pyplot as plt
+
+    if modality is not None:
+        rows = find_rows_with_modality(built_dataset, modality, n=n, sample_size=sample_size, seed=seed)
+        if not rows:
+            print(f"no rows with {modality!r} content found in this sample")
+            return
+    else:
+        total_rows = len(built_dataset)
+        rows = random.Random(seed).sample(range(total_rows), min(n, total_rows)) if total_rows else []
+    plain = built_dataset.with_format(None)
+
+    for row_i in rows:
+        input_ids = plain[row_i]["input_ids"]
+        segments = tokenizer.reconstruct_segments(input_ids)
+        print(f"--- row {row_i}: " + " -> ".join(f"{s['modality']}({s['n_tokens']})" for s in segments) + " ---")
+
+        pending_state = None
+        for i, seg in enumerate(segments):
+            if seg["modality"] not in ("STATE", "ACTION"):
+                _render_tokenized_segment(seg, i)
+                continue
+            if seg.get("error"):
+                # window cut mid-byte: the trailing partial segment won't decode cleanly.
+                # Still a truncation artifact, not a mismatch - report it as such.
+                if pending_state is not None:
+                    print(f"  [truncated] STATE ({len(pending_state)} samples) with no ACTION partner in this row")
+                    pending_state = None
+                print(f"  [truncated] {seg['modality']}: undecodable tail ({seg['error']})")
+                continue
+            if seg["modality"] == "STATE":
+                if pending_state is not None:
+                    print(f"  [truncated] STATE ({len(pending_state)} samples) with no ACTION partner in this row")
+                pending_state = seg["decoded"]
+                continue
+            # seg["modality"] == "ACTION"
+            if pending_state is None:
+                print(f"  [truncated] ACTION ({len(seg['decoded'])} samples) with no STATE partner in this row")
+                continue
+            state_n, action_n = len(pending_state), len(seg["decoded"])
+            plt.figure(figsize=(3, 1.2))
+            plt.plot(pending_state, label=f"state ({state_n})")
+            plt.plot(seg["decoded"], label=f"action ({action_n})")
+            plt.legend(fontsize=6)
+            title = f"row {row_i}: state={state_n} action={action_n}"
+            if state_n != action_n:
+                title += "  /!\\ LENGTH MISMATCH"
+            plt.title(title, fontsize=6, color="red" if state_n != action_n else "black")
+            plt.show()
+            pending_state = None
+        if pending_state is not None:
+            print(f"  [truncated] trailing STATE ({len(pending_state)} samples) with no ACTION partner in this row")
+
+
+def _render_tokenized_segment(seg: dict, i: int) -> None:
+    """Shared per-segment renderer for TEXT/IMAGE/VIDEO/AUDIO/LIDAR, used by both
+    plot_tokenized_row (single-row deep dive) and preview_tokenized_examples (multi-row,
+    all-modality overview)."""
+    import matplotlib.pyplot as plt
+
+    modality, decoded = seg["modality"], seg["decoded"]
+    if seg.get("error"):
+        print(f"  [{i}] {modality}: decode failed ({seg['error']})")
+    elif modality == "TEXT":
+        print(f"  [{i}] TEXT: {decoded[:120]!r}")
+    elif modality == "IMAGE":
+        plt.figure(figsize=(1.5, 1.5))
+        plt.title(f"[{i}] IMAGE", fontsize=6)
+        plt.imshow(decoded)
+        plt.axis("off")
+        plt.show()
+    elif modality == "VIDEO":
+        n_frames = min(4, decoded.shape[0])
+        _fig, axes = plt.subplots(1, n_frames, figsize=(n_frames * 1.0, 1.0))
+        for j, ax in enumerate(axes if n_frames > 1 else [axes]):
+            ax.imshow(decoded[j])
+            ax.axis("off")
+        _fig.suptitle(f"[{i}] VIDEO", fontsize=6)
+        plt.show()
+    elif modality == "AUDIO":
+        plt.figure(figsize=(3, 1))
+        plt.title(f"[{i}] AUDIO ({seg.get('duration_s', 0):.3f}s)", fontsize=6)
+        plt.plot(decoded, linewidth=0.5)
+        plt.axis("off")
+        plt.show()
+    elif modality == "LIDAR":
+        points = decoded
+        fig = plt.figure(figsize=(2, 2))
+        ax = fig.add_subplot(projection="3d") if points.shape[1] >= 3 else fig.add_subplot()
+        if points.shape[1] >= 3:
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1)
+        else:
+            ax.scatter(points[:, 0], points[:, 1], s=1)
+        ax.set_title(f"[{i}] LIDAR", fontsize=6)
         plt.show()
 
 
@@ -405,47 +523,15 @@ def plot_tokenized_row(tokenizer, input_ids, max_segments: int | None = None) ->
 
     for i, seg in enumerate(segments):
         modality, decoded = seg["modality"], seg["decoded"]
-        if seg.get("error"):
-            print(f"  [{i}] {modality}: decode failed ({seg['error']})")
-        elif modality == "TEXT":
-            print(f"  [{i}] TEXT: {decoded[:120]!r}")
-        elif modality == "IMAGE":
-            plt.figure(figsize=(1.5, 1.5))
-            plt.title(f"[{i}] IMAGE", fontsize=6)
-            plt.imshow(decoded)
-            plt.axis("off")
-            plt.show()
-        elif modality == "VIDEO":
-            n_frames = min(4, decoded.shape[0])
-            _fig, axes = plt.subplots(1, n_frames, figsize=(n_frames * 1.0, 1.0))
-            for j, ax in enumerate(axes if n_frames > 1 else [axes]):
-                ax.imshow(decoded[j])
-                ax.axis("off")
-            _fig.suptitle(f"[{i}] VIDEO", fontsize=6)
-            plt.show()
-        elif modality == "AUDIO":
-            plt.figure(figsize=(3, 1))
-            plt.title(f"[{i}] AUDIO ({seg.get('duration_s', 0):.3f}s)", fontsize=6)
-            plt.plot(decoded, linewidth=0.5)
-            plt.axis("off")
-            plt.show()
-        elif modality == "LIDAR":
-            points = decoded
-            fig = plt.figure(figsize=(2, 2))
-            ax = fig.add_subplot(projection="3d") if points.shape[1] >= 3 else fig.add_subplot()
-            if points.shape[1] >= 3:
-                ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1)
-            else:
-                ax.scatter(points[:, 0], points[:, 1], s=1)
-            ax.set_title(f"[{i}] LIDAR", fontsize=6)
-            plt.show()
-        elif modality in ("STATE", "ACTION"):
+        if modality in ("STATE", "ACTION") and not seg.get("error"):
             plt.figure(figsize=(2.5, 0.8))
             color = "tab:blue" if modality == "STATE" else "tab:orange"
             plt.plot(decoded, linewidth=0.7, color=color)
             plt.title(f"[{i}] {modality} ({len(decoded)} samples)", fontsize=6)
             plt.axis("off")
             plt.show()
+        else:
+            _render_tokenized_segment(seg, i)
 
 
 @dataclass

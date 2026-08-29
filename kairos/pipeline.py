@@ -26,6 +26,7 @@ from .dataset import (
     diagnose_multimodal_examples,
     find_rows_with_modality,
     plot_tokenized_row,
+    preview_tokenized_examples,
 )
 from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
@@ -494,6 +495,23 @@ class KairosMultimodalPipeline:
         for row in rows:
             print(f"--- row {row} ---")
             self.plot_row(row=row, split=split, max_segments=max_segments)
+
+    def preview_tokenized(
+        self, n: int = 3, modality: str | None = None, split: str = "train", sample_size: int = 200, seed: int = 0
+    ) -> None:
+        """Post-tokenization/detokenization equivalent of pipe.show(): overlays STATE/ACTION
+        pairs (with explicit sample counts, flagged red on a real mismatch) instead of plotting
+        them separately, while still rendering every other modality found in the row. Use this
+        to visually confirm whether a STATE/ACTION imbalance is a real per-clip defect or just a
+        window-truncation artifact (see diagnose_control_alternation)."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"preview_tokenized(split={split!r}) needs a built pipeline")
+        preview_tokenized_examples(
+            self.tokenizer, loader.dataset.ds, n=n, modality=modality, sample_size=sample_size, seed=seed
+        )
 
     def inspect_batch_df(self, n: int = 1, from_loader: bool = True):
         """inspect_batch(), pre-flattened into a pandas DataFrame ready to print."""
