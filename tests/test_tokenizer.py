@@ -43,9 +43,9 @@ def rng():
 
 
 # ========================= Vocab / backward compatibility =========================
-def test_vocab_size_is_291(tokenizer):
-    """Regression: 259 base + 30 modality/channel tags == 289 (+SEP+MASK=291)."""
-    assert len(tokenizer) == 291
+def test_vocab_size_is_293(tokenizer):
+    """259 base + 32 modality/channel tags (added <CONTROL></CONTROL>) == 291 (+SEP+MASK=293)."""
+    assert len(tokenizer) == 293
 
 
 def test_no_native_bos(tokenizer):
@@ -464,7 +464,37 @@ def test_reconstruct_segments_roundtrips_video(tokenizer, sample_video):
     assert np.array_equal(result[0]["decoded"], sample_video)
 
 
-def test_reconstruct_segments_roundtrips_control_state_and_action(tokenizer, rng):
+def test_encode_decode_control_roundtrips(tokenizer, rng):
+    state = rng.uniform(-1, 1, 50).astype(np.float32)
+    action = rng.uniform(-1, 1, 50).astype(np.float32)
+    markers = KairosTokenizer.encode_control(state, action, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.CONTROL, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "CONTROL"
+    rec_state, rec_action = result[0]["decoded"]["state"], result[0]["decoded"]["action"]
+    assert len(rec_state) == len(rec_action) == 50
+    assert np.allclose(rec_state, state, atol=2 / 65535)
+    assert np.allclose(rec_action, action, atol=2 / 65535)
+
+
+def test_encode_control_truncates_to_shorter_side(rng):
+    state = rng.uniform(-1, 1, 30).astype(np.float32)
+    action = rng.uniform(-1, 1, 20).astype(np.float32)
+    markers = KairosTokenizer.encode_control(state, action, scale_factor=1)
+    n_bytes_payload = sum(len(item[1]) for item in markers if item[0] == "bytes")
+    assert n_bytes_payload == 20 * 2 * 2  # 20 samples (shorter side) x 2 sides x n_bytes=2
+
+
+def test_decode_control_rejects_payload_not_multiple_of_step(tokenizer):
+    broken = MultimodalSegment(Modality.CONTROL, [("bytes", b"\x00\x01\x02", ("ACT0", "ACT1", "STA0", "STA1"))])
+    out = tokenizer.encode_multimodal([broken])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["decoded"] is None
+    assert "error" in result[0]
+
+
+def test_reconstruct_segments_roundtrips_generic_state_and_action_modalities(tokenizer, rng):
+    """STATE/ACTION as standalone modalities (e.g. imu) still round-trip via encode_signal/decode_signal, independent of the fused CONTROL path used for paired control clips."""
     state = rng.uniform(-1, 1, 480).astype(np.float32)
     action = rng.uniform(-1, 1, 480).astype(np.float32)
     segs = [
@@ -474,7 +504,7 @@ def test_reconstruct_segments_roundtrips_control_state_and_action(tokenizer, rng
     out = tokenizer.encode_multimodal(segs)
     result = tokenizer.reconstruct_segments(out["input_ids"])
     modalities = [r["modality"] for r in result]
-    assert modalities == ["STATE", "ACTION"]  # order preserved: the alternation is visible here
+    assert modalities == ["STATE", "ACTION"]  # segment order preserved
     assert result[0]["decoded"].shape[0] == result[1]["decoded"].shape[0]  # same length back out
 
 

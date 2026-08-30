@@ -88,7 +88,7 @@ def test_all_kinds_cover_expected_modalities(tokenizer, all_kinds_examples):
         int(Modality.VIDEO),
         int(Modality.LIDAR),
         int(Modality.STATE),
-        int(Modality.ACTION),
+        int(Modality.CONTROL),
     }
 
 
@@ -106,7 +106,9 @@ def test_imu_uses_state_modality(tokenizer, rng):
     assert set(item["modality_ids"][item["mask"] == 1].tolist()) == {int(Modality.STATE)}
 
 
-def test_control_uses_action_and_state_disjoint(tokenizer, rng):
+def test_control_uses_single_control_modality(tokenizer, rng):
+    """State/action are fused into one CONTROL segment (interleaved inside encode_control), not
+    separate STATE/ACTION modality ids."""
     ex = [
         make_example(
             "control",
@@ -117,12 +119,10 @@ def test_control_uses_action_and_state_disjoint(tokenizer, rng):
         )
     ]
     ds = KairosPretrainingDataset(multimodal_examples=ex, tokenizer=tokenizer, max_len=4096, stride=1)
-    item = ds[0]
-    mods = item["modality_ids"].tolist()
-    action_pos = [i for i, m in enumerate(mods) if m == int(Modality.ACTION)]
-    state_pos = [i for i, m in enumerate(mods) if m == int(Modality.STATE)]
-    assert action_pos and state_pos
-    assert set(action_pos).isdisjoint(state_pos)
+    mods = ds[0]["modality_ids"].tolist()
+    assert int(Modality.CONTROL) in mods
+    assert int(Modality.ACTION) not in mods
+    assert int(Modality.STATE) not in mods
 
 
 # ============================= diagnose_raw_control_balance =============================
@@ -177,11 +177,9 @@ def test_diagnose_raw_control_balance_ignores_other_modalities(rng):
     assert report.total_state_samples == report.total_action_samples == 0
 
 
-def test_control_state_and_action_pair_one_to_one(tokenizer, rng):
-    """One row = one atomic (state, action) transition, encoded as token-level alternation:
-    A,S,A,S,... (one quantized sample per side per step), not two contiguous S...S/A...A
-    blocks - so STATE and ACTION segment counts always match, and every ACTION segment is
-    immediately followed by its paired STATE segment."""
+def test_control_produces_one_control_segment(tokenizer, rng):
+    """One row = one atomic (state, action) transition, encoded as a single interleaved
+    CONTROL segment (encode_control), not separate STATE/ACTION segments."""
     from kairos.dataset import _segments_for
 
     ex = make_example(
@@ -191,19 +189,12 @@ def test_control_state_and_action_pair_one_to_one(tokenizer, rng):
         sample_rate=8000,
     )
     segments = _segments_for(ex, {})
-    modalities = [s.modality for s in segments]
-
-    assert modalities.count(Modality.STATE) == modalities.count(Modality.ACTION) > 1
-    for i in range(0, len(modalities), 2):
-        assert modalities[i] == Modality.ACTION
-        assert modalities[i + 1] == Modality.STATE
+    assert [s.modality for s in segments] == [Modality.CONTROL]
 
 
 def test_control_forces_equal_state_action_token_counts_even_with_unequal_raw_lengths(tokenizer, rng):
-    """The real requirement: token-level A,S,A,S,... alternation means a control row can never
-    end up with unbalanced STATE/ACTION token totals, even when the raw arrays came in with
-    genuinely different lengths (still warned about below) - any surplus samples on the longer
-    side are dropped rather than baked into a lopsided trailing block."""
+    """encode_control truncates to the shorter side, so decoded state/action counts always
+    match even when the raw arrays came in with genuinely different lengths (still warned)."""
     from kairos.dataset import _segments_for
 
     ex = make_example(
@@ -212,32 +203,27 @@ def test_control_forces_equal_state_action_token_counts_even_with_unequal_raw_le
     with pytest.warns(UserWarning, match="length mismatch"):
         segments = _segments_for(ex, {"control": 1})  # scale_factor=1: no decimation, exact counts
 
-    modalities = [s.modality for s in segments]
-    assert modalities.count(Modality.STATE) == modalities.count(Modality.ACTION)
-    # dropped down to the shorter side (300 action samples), not padded/stretched to 450
-    assert modalities.count(Modality.ACTION) == 300
-
     enc = tokenizer.encode_multimodal(segments)
     decoded = tokenizer.reconstruct_segments(enc["input_ids"])
-    state_tok = sum(s["n_tokens"] for s in decoded if s["modality"] == "STATE")
-    action_tok = sum(s["n_tokens"] for s in decoded if s["modality"] == "ACTION")
-    assert state_tok == action_tok
+    state, action = decoded[0]["decoded"]["state"], decoded[0]["decoded"]["action"]
+    assert len(state) == len(action) == 300  # dropped to the shorter side, not padded/stretched
 
 
-def test_control_alternates_action_then_state_per_sample(tokenizer, rng):
-    """Every ACTION segment is immediately followed by the STATE segment for that same sample -
-    never two ACTION (or two STATE) segments back to back."""
-    from kairos.dataset import _segments_for
+def test_control_interleaves_action_and_state_bytes_per_sample(tokenizer, rng):
+    """The raw CONTROL payload is ACT_hi,ACT_lo,STA_hi,STA_lo repeated per sample (byte-level
+    A,S alternation via family ids), not two contiguous blocks."""
+    from kairos.tokenizer import _FAMILY_ID
 
-    ex = make_example("control", action=rng.uniform(-1, 1, 50).astype(np.float32), state=rng.uniform(-1, 1, 50).astype(np.float32))
-    segments = [s for s in _segments_for(ex, {}) if s.modality in (Modality.STATE, Modality.ACTION)]
-    pattern = [s.modality for s in segments]
-    assert pattern == [Modality.ACTION, Modality.STATE] * (len(pattern) // 2)
+    action = rng.uniform(-1, 1, 5).astype(np.float32)
+    state = rng.uniform(-1, 1, 5).astype(np.float32)
+    markers = KairosTokenizer.encode_control(state, action, scale_factor=1)
+    _, families = tokenizer._resolve_markers(markers)
+    expected_cycle = [_FAMILY_ID["ACT0"], _FAMILY_ID["ACT1"], _FAMILY_ID["STA0"], _FAMILY_ID["STA1"]]
+    assert families == (expected_cycle * 5)
 
 
 def test_control_warns_on_state_action_token_count_mismatch(tokenizer, rng):
-    """Regression: state/action arrays of different lengths used to silently break
-    the S,A pairing (via now-removed tick-splitting); must warn instead."""
+    """Regression: state/action arrays of different lengths must warn, not silently truncate."""
     from kairos.dataset import _segments_for
 
     ex = make_example(
@@ -273,17 +259,19 @@ def test_control_scale_factor_shrinks_token_count(tokenizer, rng):
         state=rng.uniform(-1, 1, 480).astype(np.float32),
         sample_rate=8000,
     )
-    coarse = _segments_for(ex, {"control": 8})  # more decimation
-    fine = _segments_for(ex, {"control": 2})  # less decimation
+    coarse = _segments_for(ex, {"control": 8})[0].data  # more decimation
+    fine = _segments_for(ex, {"control": 2})[0].data  # less decimation
 
-    coarse_bytes = sum(len(item[1]) for s in coarse if s.modality == Modality.STATE for item in s.data if item[0] == "bytes")
-    fine_bytes = sum(len(item[1]) for s in fine if s.modality == Modality.STATE for item in s.data if item[0] == "bytes")
+    coarse_bytes = sum(len(item[1]) for item in coarse if item[0] == "bytes")
+    fine_bytes = sum(len(item[1]) for item in fine if item[0] == "bytes")
     assert coarse_bytes < fine_bytes
 
 
 def test_control_state_action_totals_match_end_to_end_even_with_window_truncation(tokenizer, rng):
-    """The real invariant: summed over the whole packed+chunked dataset, STATE tokens must
-    equal ACTION tokens exactly - even when windows are small enough to cut mid-segment."""
+    """The real invariant: summed over the whole packed+chunked dataset, ACT family-id bytes
+    must equal STA family-id bytes exactly - even when windows cut mid-segment."""
+    from kairos.tokenizer import _FAMILY_ID
+
     texts = [f"filler {i}" for i in range(80)]
     multimodal = [
         make_example(
@@ -297,12 +285,14 @@ def test_control_state_action_totals_match_end_to_end_even_with_window_truncatio
     # max_len well under one control segment's size, to force mid-segment window boundaries
     ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=64, multimodal_examples=multimodal, pack=True)
 
-    state_tok = sum((ds[i]["modality_ids"] == Modality.STATE.value).sum().item() for i in range(len(ds)))
-    action_tok = sum((ds[i]["modality_ids"] == Modality.ACTION.value).sum().item() for i in range(len(ds)))
+    act_ids = {_FAMILY_ID["ACT0"], _FAMILY_ID["ACT1"]}
+    sta_ids = {_FAMILY_ID["STA0"], _FAMILY_ID["STA1"]}
+    act_tok = sum(sum(f in act_ids for f in ds[i]["octet_family_ids"].tolist()) for i in range(len(ds)))
+    sta_tok = sum(sum(f in sta_ids for f in ds[i]["octet_family_ids"].tolist()) for i in range(len(ds)))
 
     assert len(ds) > 30  # sanity: truncation actually happened, this isn't a trivial no-op
-    assert state_tok == action_tok
-    assert state_tok > 0
+    assert act_tok == sta_tok
+    assert act_tok > 0
 
 
 def test_diagnose_control_alternation_reports_clean_dataset_as_clean(tokenizer, rng):
@@ -319,20 +309,20 @@ def test_diagnose_control_alternation_reports_clean_dataset_as_clean(tokenizer, 
         for _ in range(10)
     ]
     # max_len large enough that the whole packed stream fits in one row - no mid-segment
-    # window cuts, so per-row balance is guaranteed too (not just the aggregate total).
+    # window cuts, so every CONTROL segment decodes cleanly.
     ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=100_000, multimodal_examples=multimodal, pack=True)
 
-    report = diagnose_control_alternation(ds.ds, sample_size=len(ds), seed=0)
+    report = diagnose_control_alternation(ds.ds, tokenizer, sample_size=len(ds), seed=0)
 
     assert report.n_rows_with_control > 0
-    assert report.total_state_tokens == report.total_action_tokens
+    assert report.total_control_samples > 0
     assert report.mismatched_rows == []
-    assert report.non_alternating_rows == []
 
 
-def test_diagnose_control_alternation_per_row_mismatch_is_expected_under_truncation(tokenizer, rng):
-    """A per-row mismatch is a normal side effect of a window cutting a segment in half (the
-    remainder lands in the next row) - only the aggregate total is a real invariant."""
+def test_diagnose_control_alternation_reports_truncated_segments(tokenizer, rng):
+    """A small max_len forces window cuts mid-CONTROL-segment; those show up as truncated
+    (undecodable) segments, not as a state != action count mismatch (impossible by
+    construction now - encode_control always emits equal counts)."""
     from kairos.dataset import diagnose_control_alternation
 
     texts = [f"filler {i}" for i in range(40)]
@@ -345,42 +335,39 @@ def test_diagnose_control_alternation_per_row_mismatch_is_expected_under_truncat
         )
         for _ in range(10)
     ]
-    ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=1024, multimodal_examples=multimodal, pack=True)
+    ds = KairosPretrainingDataset(texts=texts, tokenizer=tokenizer, max_len=64, multimodal_examples=multimodal, pack=True)
 
-    report = diagnose_control_alternation(ds.ds, sample_size=len(ds), seed=0)
+    report = diagnose_control_alternation(ds.ds, tokenizer, sample_size=len(ds), seed=0)
 
-    assert report.total_state_tokens == report.total_action_tokens  # aggregate: still exact
-    assert report.mismatched_rows  # but individual rows can legitimately disagree
+    assert report.mismatched_rows  # some CONTROL segments got cut by a small window
 
 
 def test_diagnose_control_alternation_flags_a_broken_row(tokenizer, rng):
-    """Directly poking a state-only segment (no matching action) into a row must surface
-    as both a token-count mismatch and (trivially) as the row having no alternation to break."""
+    """A CONTROL payload with a byte count that isn't a multiple of 2*n_bytes must surface as a
+    decode failure for that row, distinct from a clean row."""
     from kairos.dataset import diagnose_control_alternation
     from kairos.tokenizer import MultimodalSegment
 
-    state_only = tokenizer.encode_multimodal(
-        [MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(rng.uniform(-1, 1, 100).astype(np.float32), family="STA"))]
-    )
+    broken = tokenizer.encode_multimodal([MultimodalSegment(Modality.CONTROL, [("bytes", b"\x00\x01\x02", ("ACT0", "ACT1", "STA0", "STA1"))])])
     clean = tokenizer.encode_multimodal(
-        [
-            MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(rng.uniform(-1, 1, 100).astype(np.float32), family="STA")),
-            MultimodalSegment(Modality.ACTION, KairosTokenizer.encode_signal(rng.uniform(-1, 1, 100).astype(np.float32), family="ACT")),
-        ]
+        [MultimodalSegment(Modality.CONTROL, KairosTokenizer.encode_control(rng.uniform(-1, 1, 20).astype(np.float32), rng.uniform(-1, 1, 20).astype(np.float32)))]
     )
 
-    def pad_mods(row, length):
-        mods = row["modality_ids"].tolist()
-        return mods + [int(Modality.TEXT)] * (length - len(mods))
+    def pad(row, length, key):
+        vals = row[key].tolist()
+        pad_val = int(Modality.TEXT) if key == "modality_ids" else 0
+        return vals + [pad_val] * (length - len(vals))
 
-    length = max(len(state_only["modality_ids"]), len(clean["modality_ids"]))
-    fake_ds = HFDataset.from_dict({"modality_ids": [pad_mods(state_only, length), pad_mods(clean, length)]})
+    length = max(len(broken["input_ids"]), len(clean["input_ids"]))
+    fake_ds = HFDataset.from_dict(
+        {"input_ids": [pad(broken, length, "input_ids"), pad(clean, length, "input_ids")]}
+    )
 
-    report = diagnose_control_alternation(fake_ds, sample_size=2, seed=0)
+    report = diagnose_control_alternation(fake_ds, tokenizer, sample_size=2, seed=0)
 
     assert report.n_rows_with_control == 2
-    assert len(report.mismatched_rows) == 1  # only the state-only row is unbalanced
-    assert report.mismatched_rows[0]["action_tokens"] == 0
+    assert len(report.mismatched_rows) == 1
+    assert report.mismatched_rows[0]["row"] == 0
 
 
 # ============================= find_rows_with_modality =============================
@@ -843,17 +830,17 @@ def test_preview_tokenized_examples_shows_every_modality(tokenizer, all_kinds_ex
     out = capsys.readouterr().out
 
     # every modality from all_kinds_examples must show up somewhere in the reconstructed rows:
-    # text, image_caption, audio_caption, video_caption, lidar, imu (STATE-only), control (S+A)
-    for modality_token in ("TEXT", "IMAGE", "AUDIO", "VIDEO", "LIDAR", "STATE", "ACTION"):
+    # text, image_caption, audio_caption, video_caption, lidar, imu (STATE-only), control (CONTROL)
+    for modality_token in ("TEXT", "IMAGE", "AUDIO", "VIDEO", "LIDAR", "STATE", "CONTROL"):
         assert modality_token in out, f"{modality_token} never appeared in preview_tokenized_examples output"
 
 
-def test_preview_tokenized_examples_flags_real_state_action_mismatch(tokenizer, rng, capsys):
-    """_segments_for now truncates every control clip to equal STATE/ACTION counts at the
-    source (see test_control_forces_equal_state_action_token_counts...), so a real per-clip
-    imbalance can no longer reach preview_tokenized_examples through the normal pipeline. This
-    test instead checks the safety net directly: hand-build a row with a genuinely lopsided
-    STATE/ACTION stream (as if something upstream regressed) and confirm it's still caught."""
+def test_preview_tokenized_examples_handles_corrupted_control_segment_gracefully(tokenizer, rng, capsys):
+    """encode_control makes a real per-clip state != action mismatch structurally impossible (a
+    single interleaved payload can't encode unequal counts), so the remaining failure mode to
+    guard is a corrupted/truncated payload (byte count not a multiple of 2*n_bytes) - it must be
+    reported as [truncated], not crash, and must never get a red MISMATCH title (no data to
+    compare)."""
     import matplotlib
     from datasets import Dataset as HFDataset
 
@@ -861,22 +848,19 @@ def test_preview_tokenized_examples_flags_real_state_action_mismatch(tokenizer, 
     import matplotlib.pyplot as plt
 
     plt.close("all")
-    action_ticks = KairosTokenizer.encode_signal_ticks(rng.uniform(-1, 1, 20).astype(np.float32), family="ACT", tick_samples=1)
-    state_ticks = KairosTokenizer.encode_signal_ticks(rng.uniform(-1, 1, 5).astype(np.float32), family="STA", tick_samples=1)
-    segments = []
-    for a, s in zip(action_ticks, state_ticks):
-        segments += [MultimodalSegment(Modality.ACTION, a), MultimodalSegment(Modality.STATE, s)]
-    segments += [MultimodalSegment(Modality.ACTION, a) for a in action_ticks[len(state_ticks) :]]  # unpaired surplus
-
-    enc = tokenizer.encode_multimodal(segments)
+    broken = MultimodalSegment(Modality.CONTROL, [("bytes", b"\x00\x01\x02", ("ACT0", "ACT1", "STA0", "STA1"))])
+    enc = tokenizer.encode_multimodal([broken])
     row = {k: [v] for k, v in enc.items()} | {"mask": [[1] * len(enc["input_ids"])], "prompt_len": [0]}
     ds = HFDataset.from_dict(row, features=_MULTIMODAL_FEATURES)
 
     from kairos.dataset import preview_tokenized_examples
 
     preview_tokenized_examples(tokenizer, ds, n=1, sample_size=1)
+    out = capsys.readouterr().out
     titles = _figure_titles()
-    assert any("MISMATCH" in t for t in titles), f"expected a red mismatch title, got: {titles}"
+
+    assert "[truncated]" in out
+    assert not any("MISMATCH" in t for t in titles)
 
 
 def test_preview_tokenized_examples_reports_truncation_not_mismatch(tokenizer, rng, capsys):
@@ -895,7 +879,7 @@ def test_preview_tokenized_examples_reports_truncation_not_mismatch(tokenizer, r
                       action=rng.uniform(-1, 1, 480).astype(np.float32))
         for i in range(10)
     ]
-    ds = KairosPretrainingDataset(tokenizer=tokenizer, max_len=200, pack=True, multimodal_examples=clips)
+    ds = KairosPretrainingDataset(tokenizer=tokenizer, max_len=600, pack=True, multimodal_examples=clips)
     from kairos.dataset import preview_tokenized_examples
 
     preview_tokenized_examples(tokenizer, ds.ds, n=len(ds.ds), sample_size=len(ds.ds))

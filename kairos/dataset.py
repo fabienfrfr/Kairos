@@ -16,8 +16,7 @@ from .tokenizer import KairosTokenizer, Modality, MultimodalSegment
 
 MAX_LEN = 3 * 2048
 
-# explicit schema for _build_multimodal: lets from_generator build a (possibly empty)
-# dataset without inferring types from a first row, and gives a stable column order.
+# explicit schema for _build_multimodal: stable column order, works even for an empty dataset.
 _MULTIMODAL_FEATURES = Features(
     {
         "input_ids": Sequence(Value("int64")),
@@ -104,35 +103,19 @@ def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[Multim
 
     if modality == "control":
         sf = modality_scale_factors.get("control")
-        n_bytes = 2  # same default as encode_signal
-        # per-sample ticks (tick_samples=1), NOT per-tick chunking of a trajectory: each control
-        # row is one atomic (state, action) transition, and encode_signal_ticks with a 1-sample
-        # tick is just how we get one quantized-sample-sized token group per side to interleave.
-        state_ticks = KairosTokenizer.encode_signal_ticks(
-            arrays["state"], family="STA", tick_samples=1, n_bytes=n_bytes, scale_factor=sf
-        )
-        action_ticks = KairosTokenizer.encode_signal_ticks(
-            arrays["action"], family="ACT", tick_samples=1, n_bytes=n_bytes, scale_factor=sf
-        )
-        state_nbytes = sum(len(item[1]) for tick in state_ticks for item in tick if item[0] == "bytes")
-        action_nbytes = sum(len(item[1]) for tick in action_ticks for item in tick if item[0] == "bytes")
-        if state_nbytes != action_nbytes:
+        if len(arrays["state"]) != len(arrays["action"]):
             warnings.warn(
-                f"control example: state ({state_nbytes} bytes) vs action ({action_nbytes} "
-                f"bytes) length mismatch - check arrays['state']/['action']",
+                f"control example: state ({len(arrays['state'])} samples) vs action "
+                f"({len(arrays['action'])} samples) length mismatch - check arrays['state']/['action']",
                 stacklevel=2,
             )
         segments = []
         if caption:
             segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
-        # token-level alternation A,S,A,S,... (not two contiguous SSSS/AAAA blocks): each pair
-        # is one quantized sample per side, so a row can never end up with more STATE tokens
-        # than ACTION tokens (or vice versa) for the interleaved portion. Any surplus from
-        # unequal raw lengths (the mismatch warned about above) is dropped here rather than
-        # baked into a lopsided trailing block.
-        for action_tick, state_tick in zip(action_ticks, state_ticks):
-            segments.append(MultimodalSegment(Modality.ACTION, action_tick))
-            segments.append(MultimodalSegment(Modality.STATE, state_tick))
+        # single CONTROL segment via encode_control: one tag pair per clip, not per sample
+        segments.append(
+            MultimodalSegment(Modality.CONTROL, KairosTokenizer.encode_control(arrays["state"], arrays["action"], scale_factor=sf))
+        )
         return segments
     return None
 
@@ -274,8 +257,7 @@ def modality_counts(examples) -> dict[str, int]:
 def split_examples(
     examples, eval_pct: float = 10, seed: int = 0, contiguous_modalities: frozenset = frozenset({"control"})
 ) -> tuple[list, list]:
-    """Shuffles then splits into (train, eval). Examples whose modality is in
-    contiguous_modalities keep relative order as one block, instead of being scattered."""
+    """Shuffles then splits into (train, eval); contiguous_modalities keep relative order as one block."""
     if not contiguous_modalities:
         shuffled = list(examples)
         random.Random(seed).shuffle(shuffled)
@@ -300,8 +282,7 @@ def split_examples(
 
 @dataclass
 class RawControlBalanceReport:
-    """Sums raw state/action array lengths across "control" examples, before any
-    tokenization/windowing - checks the source data itself, not the pipeline downstream."""
+    """Sums raw state/action array lengths across "control" examples, before tokenization/windowing."""
 
     n_control_examples: int
     total_state_samples: int
@@ -324,8 +305,7 @@ class RawControlBalanceReport:
 
 
 def diagnose_raw_control_balance(examples) -> RawControlBalanceReport:
-    """Checks every "control" example's raw state/action arrays for equal length, before
-    any tokenization - run this first to rule out a source-data problem vs. a pipeline one."""
+    """Checks every "control" example's raw state/action arrays for equal length, before tokenization."""
     n = 0
     total_state = total_action = 0
     mismatched: list[dict] = []
@@ -408,33 +388,14 @@ def _plot_multimodal_row(plt, modality: str, arrays: dict) -> None:
         plt.show()
 
 
-# the modality kinds preview_tokenized_examples guarantees coverage of when modality=None -
-# "control" covers both STATE and ACTION (see find_rows_with_modality).
+# modality kinds preview_tokenized_examples covers when modality=None (see find_rows_with_modality).
 _ALL_PREVIEW_MODALITIES = ("text", "image", "audio", "video", "lidar", "control")
 
 
 def preview_tokenized_examples(
     tokenizer, built_dataset, n: int = 1, modality: str | None = None, sample_size: int = 200, seed: int = 0
 ) -> None:
-    """Post-tokenization/detokenization equivalent of preview_multimodal_examples: reconstructs
-    real rows from input_ids and renders every segment found (TEXT/IMAGE/VIDEO/AUDIO/LIDAR via
-    _render_tokenized_segment, STATE/ACTION as overlaid pairs with explicit sample counts, same
-    as the raw preview, so the two are directly comparable).
-
-    `modality`: restrict to rows containing this modality (e.g. "control", "image", ...) - see
-    find_rows_with_modality for valid names. None (default) does NOT just grab n purely random
-    rows - on a large dataset that tends to land on mostly-TEXT rows and silently skip rarer
-    modalities. Instead it looks up to `n` representative row(s) for EACH modality in
-    _ALL_PREVIEW_MODALITIES, so every modality actually present in the dataset shows up at
-    least once.
-
-    A STATE/ACTION pair from the same row is expected to match (encode-time interleaving now
-    forces this per clip - see _segments_for); a small gap (at most 2) between the concatenated
-    STATE and ACTION arrays in a row is a benign window-truncation artifact - a packed row can
-    be cut at its start and/or its end, each contributing at most +/-1 sample - and is labeled
-    as such rather than flagged red. A larger gap is a real anomaly and gets the red
-    /!\\ LENGTH MISMATCH title.
-    """
+    """Tokenized preview_multimodal_examples; modality=None: n rows/modality; gap<=2=truncation."""
     import matplotlib.pyplot as plt
 
     if modality is not None:
@@ -459,22 +420,20 @@ def preview_tokenized_examples(
         segments = tokenizer.reconstruct_segments(input_ids)
         print(f"--- row {row_i}: " + " -> ".join(f"{s['modality']}({s['n_tokens']})" for s in segments) + " ---")
 
-        # STATE/ACTION now arrive as many tiny per-sample segments (token-level A,S,A,S,...
-        # alternation - see _segments_for), not one big STATE block and one big ACTION block.
-        # Concatenate everything decodable in this row into two flat arrays and overlay those
-        # once, instead of pairing segment-by-segment. Since _segments_for truncates each clip
-        # to equal STATE/ACTION counts at the source, a real per-clip imbalance can no longer
-        # reach this point - the only expected discrepancy is +/-1 from a window cutting the
-        # alternating stream at an odd position, which we tolerate rather than flag red.
+        # CONTROL carries state+action interleaved; encode_control forces equal counts per clip.
         state_vals, action_vals, undecodable = [], [], []
         for i, seg in enumerate(segments):
-            if seg["modality"] not in ("STATE", "ACTION"):
+            if seg["modality"] not in ("STATE", "ACTION", "CONTROL"):
                 _render_tokenized_segment(seg, i)
                 continue
             if seg.get("error"):
                 undecodable.append(f"  [truncated] {seg['modality']}: undecodable tail ({seg['error']})")
                 continue
-            (state_vals if seg["modality"] == "STATE" else action_vals).append(seg["decoded"])
+            if seg["modality"] == "CONTROL":
+                state_vals.append(seg["decoded"]["state"])
+                action_vals.append(seg["decoded"]["action"])
+            else:
+                (state_vals if seg["modality"] == "STATE" else action_vals).append(seg["decoded"])
 
         if state_vals or action_vals:
             state_arr = np.concatenate(state_vals) if state_vals else np.array([], dtype=np.float32)
@@ -486,8 +445,7 @@ def preview_tokenized_examples(
             plt.legend(fontsize=6)
             gap = abs(state_n - action_n)
             title = f"row {row_i}: state={state_n} action={action_n}"
-            # a packed row can have at most two truncation edges (its own start and end cut),
-            # each contributing at most +/-1, so a legitimate gap is at most 2.
+            # a packed row has 2 truncation edges max (start+end cut), each +/-1: gap<=2 is legit.
             if gap > 2:
                 title += "  /!\\ LENGTH MISMATCH"
             elif gap > 0:
@@ -499,9 +457,7 @@ def preview_tokenized_examples(
 
 
 def _render_tokenized_segment(seg: dict, i: int) -> None:
-    """Shared per-segment renderer for TEXT/IMAGE/VIDEO/AUDIO/LIDAR, used by both
-    plot_tokenized_row (single-row deep dive) and preview_tokenized_examples (multi-row,
-    all-modality overview)."""
+    """Shared per-segment renderer for TEXT/IMAGE/VIDEO/AUDIO/LIDAR, used by both plot helpers."""
     import matplotlib.pyplot as plt
 
     modality, decoded = seg["modality"], seg["decoded"]
@@ -542,8 +498,7 @@ def _render_tokenized_segment(seg: dict, i: int) -> None:
 
 
 def plot_tokenized_row(tokenizer, input_ids, max_segments: int | None = None) -> None:
-    """Decodes a real (post-tokenization/packing) row and plots each segment in document
-    order - e.g. to confirm STATE/ACTION alternation or spot a truncated segment."""
+    """Decodes a real tokenized row and plots each segment in order; spots a truncated segment."""
     import matplotlib.pyplot as plt
 
     segments = tokenizer.reconstruct_segments(input_ids)
@@ -560,44 +515,49 @@ def plot_tokenized_row(tokenizer, input_ids, max_segments: int | None = None) ->
             plt.title(f"[{i}] {modality} ({len(decoded)} samples)", fontsize=6)
             plt.axis("off")
             plt.show()
+        elif modality == "CONTROL" and not seg.get("error"):
+            plt.figure(figsize=(3, 1))
+            plt.plot(decoded["state"], linewidth=0.7, label=f"state ({len(decoded['state'])})")
+            plt.plot(decoded["action"], linewidth=0.7, label=f"action ({len(decoded['action'])})")
+            plt.legend(fontsize=6)
+            plt.title(f"[{i}] CONTROL", fontsize=6)
+            plt.axis("off")
+            plt.show()
         else:
             _render_tokenized_segment(seg, i)
 
 
 @dataclass
 class ControlAlternationReport:
-    """Per-row STATE/ACTION segment stats from decode_multimodal, to pinpoint exactly where
-    a STATE-vs-ACTION token-count gap comes from (see plot_tokenized_row for the visual view)."""
+    """Per-row CONTROL stats: rows with control content, total decoded samples, and rows with a segment truncated mid-byte by a window cut (state/action counts are always equal for any segment that decodes at all - encode_control enforces it)."""
 
     n_rows_with_control: int
     n_rows_sampled: int
-    total_state_tokens: int
-    total_action_tokens: int
-    non_alternating_rows: list[int]  # row indices where STATE/ACTION segments didn't strictly S,A,S,A...
-    mismatched_rows: list[dict]  # rows where a row's own state/action token counts differ
+    total_control_samples: int
+    mismatched_rows: list[dict]  # rows with a CONTROL segment that failed to decode (window-truncated)
 
     def __str__(self) -> str:
         lines = [
-            "Kairos control S,A-alternation diagnostic",
-            "------------------------------------------",
+            "Kairos control diagnostic",
+            "--------------------------",
             f"Rows sampled: {self.n_rows_sampled}  (with control content: {self.n_rows_with_control})",
-            f"STATE tokens total: {self.total_state_tokens}  ACTION tokens total: {self.total_action_tokens}",
-            f"Non-alternating rows: {len(self.non_alternating_rows)}",
-            f"Rows with a state != action token mismatch: {len(self.mismatched_rows)}",
+            f"Total decoded control samples: {self.total_control_samples}",
+            f"Rows with a truncated CONTROL segment: {len(self.mismatched_rows)}",
         ]
         if self.mismatched_rows:
-            lines.append("First few mismatches:")
+            lines.append("First few:")
             for m in self.mismatched_rows[:5]:
-                lines.append(f"  row {m['row']}: state={m['state_tokens']} action={m['action_tokens']}")
+                lines.append(f"  row {m['row']}: {m['error']}")
         return "\n".join(lines)
 
 
 def find_rows_with_modality(built_dataset, modality: str, n: int = 3, sample_size: int = 200, seed: int = 0) -> list[int]:
-    """Row indices (from a random sample) whose modality_ids contain `modality` (case-
-    insensitive: "image", "control" (STATE or ACTION), "state", "action", "text", ...)."""
+    """Row indices (sampled) whose modality_ids contain `modality` (case-insensitive: "image", "control", "state" (imu or control), "action" (control), "text", ...)."""
     key = modality.lower()
-    if key == "control":
-        wanted = {int(Modality.STATE), int(Modality.ACTION)}
+    if key in ("control", "action"):
+        wanted = {int(Modality.CONTROL)}
+    elif key == "state":
+        wanted = {int(Modality.STATE), int(Modality.CONTROL)}  # STATE alone (imu) or inside CONTROL
     else:
         try:
             wanted = {int(Modality[key.upper()])}
@@ -620,51 +580,33 @@ def find_rows_with_modality(built_dataset, modality: str, n: int = 3, sample_siz
     return found
 
 
-def diagnose_control_alternation(built_dataset, sample_size: int = 200, seed: int = 0) -> ControlAlternationReport:
-    """Per sampled row: do STATE/ACTION segments strictly alternate and match in token
-    count? Localizes a STATE/ACTION imbalance to specific rows instead of guessing."""
+def diagnose_control_alternation(built_dataset, tokenizer, sample_size: int = 200, seed: int = 0) -> ControlAlternationReport:
+    """Decodes each sampled row's CONTROL segments and counts samples, surfacing any segment truncated mid-byte by a window cut."""
     total_rows = len(built_dataset)
     sample_n = min(sample_size, total_rows)
     idx = random.Random(seed).sample(range(total_rows), sample_n) if total_rows else []
     plain = built_dataset.with_format(None)
-    batch = plain[idx] if idx else {"modality_ids": []}
 
     n_with_control = 0
-    total_state = total_action = 0
-    non_alternating: list[int] = []
+    total_samples = 0
     mismatched: list[dict] = []
-    sa_ids = {int(Modality.STATE), int(Modality.ACTION)}
 
-    for row_i, mods in zip(idx, batch["modality_ids"]):
-        # run-length encode consecutive same-modality tokens directly from modality_ids -
-        # unlike decode_multimodal's open/close-tag matching, this can't silently drop a
-        # segment truncated at a window boundary (no closing tag survives the cut there).
-        runs = []
-        for m in mods:
-            if m not in sa_ids:
-                continue
-            if runs and runs[-1][0] == m:
-                runs[-1] = (m, runs[-1][1] + 1)
-            else:
-                runs.append((m, 1))
-        if not runs:
+    for row_i in idx:
+        segments = tokenizer.reconstruct_segments(plain[row_i]["input_ids"])
+        control_segs = [s for s in segments if s["modality"] == "CONTROL"]
+        if not control_segs:
             continue
         n_with_control += 1
-        state_tok = sum(n for m, n in runs if m == int(Modality.STATE))
-        action_tok = sum(n for m, n in runs if m == int(Modality.ACTION))
-        total_state += state_tok
-        total_action += action_tok
-        if state_tok != action_tok:
-            mismatched.append({"row": row_i, "state_tokens": state_tok, "action_tokens": action_tok})
-        if any(runs[i][0] == runs[i + 1][0] for i in range(len(runs) - 1)):
-            non_alternating.append(row_i)
+        for seg in control_segs:
+            if seg.get("error"):
+                mismatched.append({"row": row_i, "error": seg["error"]})
+            else:
+                total_samples += len(seg["decoded"]["state"])
 
     return ControlAlternationReport(
         n_rows_with_control=n_with_control,
         n_rows_sampled=sample_n,
-        total_state_tokens=total_state,
-        total_action_tokens=total_action,
-        non_alternating_rows=non_alternating,
+        total_control_samples=total_samples,
         mismatched_rows=mismatched,
     )
 
@@ -708,12 +650,7 @@ class KairosPretrainingDataset(Dataset):
         self.ds.set_format("torch")
 
     def _chunk(self, token_ids, modality_ids, family_ids):
-        """Fixed-length windowing shared by text and multimodal, padded to self.target_len.
-
-        token_ids/modality_ids/family_ids may be plain lists or array.array — always
-        materialize the final chunk as a plain list, since that's what pyarrow/torch
-        expect downstream and a single target_len-sized list is cheap either way.
-        """
+        """Fixed-length windowing for text/multimodal, padded to target_len; returns plain lists."""
         for i in range(0, len(token_ids), self.max_len):
             ids_chunk = list(token_ids[i : i + self.max_len])
             mod_chunk = list(modality_ids[i : i + self.max_len])
@@ -726,15 +663,9 @@ class KairosPretrainingDataset(Dataset):
             yield ids_chunk, mod_chunk, fam_chunk, mask
 
     def _collect_chunks(self, chunk_sources):
-        """Run each (ids, modality_ids, family_ids) triple through self._chunk and flatten.
-
-        Yields one chunk at a time instead of building giant Python lists in RAM —
-        callers should feed this straight into Dataset.from_generator.
-        """
+        """Runs each (ids, modality_ids, family_ids) through _chunk, flattened; yields lazily."""
         if self.pack:
-            # "H" (uint16, 2 bytes) covers vocab sizes up to 65536 — plenty for 291.
-            # "B" (uint8, 1 byte) covers modality/family ids. Both are ~14-28x cheaper
-            # than a Python int per element, which is what a plain list stores.
+            # "H"/"B" (uint16/uint8) are far cheaper per element than a plain Python-list int.
             packed_ids = array.array("H")
             packed_mods = array.array("B")
             packed_fams = array.array("B")
@@ -761,8 +692,7 @@ class KairosPretrainingDataset(Dataset):
                     continue
                 yield tokens, [int(Modality.TEXT)] * len(tokens), [0] * len(tokens)
 
-        # still one batch's worth at a time (this runs inside ds.map(batched=True)),
-        # so materializing here is fine — arrow already chunks across batches.
+        # one batch's worth at a time (inside ds.map(batched=True)); arrow chunks across batches.
         all_input_ids, all_modality_ids, all_family_ids, all_masks = [], [], [], []
         for ids_chunk, mod_chunk, fam_chunk, mask in self._collect_chunks(sources()):
             all_input_ids.append(ids_chunk)
@@ -799,8 +729,7 @@ class KairosPretrainingDataset(Dataset):
                 ].tolist()
 
         def rows():
-            # one dict per row, streamed straight to the arrow writer — nothing
-            # accumulates for the full dataset in Python memory at any point.
+            # one dict per row, streamed straight to the arrow writer; nothing sits in RAM at once.
             for ids_chunk, mod_chunk, fam_chunk, mask in self._collect_chunks(sources()):
                 yield {
                     "input_ids": ids_chunk,
@@ -810,28 +739,15 @@ class KairosPretrainingDataset(Dataset):
                     "prompt_len": 0,
                 }
 
-        # writer_batch_size caps how many rows sit in the arrow write buffer at once
-        # (default is 1000, already reasonable, but explicit here since it's the knob
-        # to turn down further if RAM is still tight with very long/heavy sequences).
-        # An explicit schema (features=) lets this succeed even when every example is
-        # skipped (zero rows) — from_generator can't infer a schema from nothing.
+        # writer_batch_size caps rows buffered before an arrow write; turn down if RAM is tight.
+        # An explicit schema (features=) lets from_generator succeed even with zero rows.
         try:
-            # from_generator caches its output to disk keyed by a fingerprint of the generator
-            # function, and a second call with a similarly-shaped generator can silently reuse
-            # that cache — skipping our generator entirely (so any skip-warnings never fire,
-            # and any dataset-construction-time errors never surface) while still returning a
-            # dataset that looks fine. A dataset is rebuilt from live Python examples every time
-            # this is called, so a stale cache hit is never correct here — force a fresh
-            # fingerprint each call. Do NOT set keep_in_memory=True to "solve" this: that forces
-            # the whole table into a real in-process buffer instead of the memory-mapped file
-            # backing from_generator uses by default, which defeats the entire point of
-            # streaming this through the writer in the first place on any real-sized dataset.
+            # fresh fingerprint each call (avoid stale cache reuse); never keep_in_memory=True.
             self.ds = HFDataset.from_generator(
                 rows, features=_MULTIMODAL_FEATURES, writer_batch_size=256, fingerprint=uuid.uuid4().hex
             )
         except ValueError as e:
-            # from_generator can still fail on a truly empty stream even with an explicit
-            # schema (no arrow shard gets written at all) — build the empty dataset directly.
+            # can still fail on a truly empty stream; build the empty dataset directly in that case.
             if "corresponds to no data" in str(e):
                 self.ds = HFDataset.from_dict(
                     {"input_ids": [], "modality_ids": [], "octet_family_ids": [], "mask": [], "prompt_len": []},
@@ -840,16 +756,14 @@ class KairosPretrainingDataset(Dataset):
             else:
                 raise
         except Exception as e:
-            # datasets wraps generator errors in DatasetGenerationError — surface the
-            # original exception (e.g. the ValueError from an unknown modality) instead.
+            # surface the original exception (e.g. ValueError), not DatasetGenerationError's wrapper.
             cause = e.__cause__ or e.__context__
             if isinstance(cause, ValueError):
                 raise cause from None
             raise
         self.ds.set_format("torch")
 
-        # warn here, not inside sources(): warnings emitted from within the generator
-        # that from_generator consumes don't reliably propagate to the caller.
+        # warn here, not in sources(): warnings from inside the consumed generator may not propagate.
         for i, msg in enumerate(skip_messages, 1):
             warnings.warn(f"skipping corrupt example ({msg}); {i} skipped so far", stacklevel=2)
 

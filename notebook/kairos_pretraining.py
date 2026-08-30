@@ -228,11 +228,11 @@ def _():
 
 @app.cell
 def _(Modality):
-    # scale 0: finest temporal res (text,
+    # scale 0: finest temporal res (text, state, control); scale 3: coarsest (meta)
     modality_scales = {
         int(Modality.TEXT): [0, 1],
         int(Modality.STATE): [0],
-        int(Modality.ACTION): [0],
+        int(Modality.CONTROL): [0],  # replaces separate STATE/ACTION control rows (fused modality)
         int(Modality.IMAGE): [1, 2],
         int(Modality.LIDAR): [1],
         int(Modality.AUDIO): [2],
@@ -283,7 +283,7 @@ def _(
         n_layers=CFG_N_LAYERS,
         stride=CFG_STRIDE,
         vocab_size=len(tokenizer),
-        num_modalities=8,
+        num_modalities=9,
         num_scales=CFG_NUM_SCALES,
         modality_scales=modality_scales,
         intermediate_size=CFG_INTERMEDIATE,

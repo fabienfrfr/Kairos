@@ -453,13 +453,13 @@ class KairosMultimodalPipeline:
             self._release_transient_memory()
 
     def control_alternation_report(self, sample_size: int = 200, split: str = "train"):
-        """Localizes a STATE/ACTION token imbalance to specific rows (see dataset module)."""
+        """Decodes each sampled row's CONTROL segments; surfaces rows truncated mid-byte by a window cut (see dataset module)."""
         if split not in ("train", "eval"):
             raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
         loader = self.loader if split == "train" else self.eval_loader
         if loader is None or getattr(loader.dataset, "ds", None) is None:
             raise RuntimeError(f"control_alternation_report(split={split!r}) needs a built pipeline")
-        return diagnose_control_alternation(loader.dataset.ds, sample_size=sample_size)
+        return diagnose_control_alternation(loader.dataset.ds, self.tokenizer, sample_size=sample_size)
 
     def plot_row(self, row: int = 0, split: str = "train", max_segments: int | None = None) -> None:
         """Reconstructs and plots row `row` of the built (tokenized) dataset in document order."""

@@ -53,7 +53,7 @@ class KairosConfig(PretrainedConfig):
         self.sliding_window_size = self.window_size = window_size
         self.vocab_size = vocab_size
 
-        self.num_modalities = kwargs.get("num_modalities", 8)
+        self.num_modalities = kwargs.get("num_modalities", 9)
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
         self.codec_mode = kwargs.get("codec_mode", "conv")

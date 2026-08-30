@@ -1197,7 +1197,8 @@ def test_control_alternation_report_finds_control_rows(tmp_path, model_config, t
     report = pipe.control_alternation_report(sample_size=len(pipe.loader.dataset.ds))
 
     assert report.n_rows_with_control > 0
-    assert report.total_state_tokens == report.total_action_tokens
+    assert report.total_control_samples > 0
+    assert report.mismatched_rows == []  # max_len is huge, no window cuts a segment mid-byte
 
 
 def test_control_alternation_report_invalid_split_raises(built_pipeline):

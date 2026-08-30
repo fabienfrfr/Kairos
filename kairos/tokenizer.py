@@ -21,6 +21,7 @@ class Modality(enum.IntEnum):
     STATE = 5
     ACTION = 6
     META = 7
+    CONTROL = 8
 
 
 _MODALITY_TAGS: dict[Modality, tuple[str, str]] = {
@@ -32,6 +33,7 @@ _MODALITY_TAGS: dict[Modality, tuple[str, str]] = {
     Modality.STATE: ("<STATE>", "</STATE>"),
     Modality.ACTION: ("<ACTION>", "</ACTION>"),
     Modality.META: ("<META>", "</META>"),
+    Modality.CONTROL: ("<CONTROL>", "</CONTROL>"),
 }
 
 # sub-channel tags, e.g. RGB planes or channel-stacked audio
@@ -52,11 +54,7 @@ ALL_SPECIAL_TOKENS = (
     + ["<SEP>", "<MASK>"]
 )
 
-# Octet-family ids: WHICH byte-plane/channel a position's *value* belongs to, carried as a small
-# parallel stream (octet_family_ids) instead of inflating the main token vocab. Byte values 0-255
-# are shared by every modality (a value id never encodes "which family" by itself); the family
-# tells the model whether that value is e.g. an image R channel byte, an audio hi byte, etc.
-# Family 0 is the catch-all for text and structural/marker tokens.
+# Octet-family ids: which byte-plane/channel a value belongs to (e.g. image R, audio hi byte).
 _FAMILY_NAMES = (
     [f"IMG{c}" for c in range(3)]  # R, G, B (shared by video)
     + [f"AUD{p}" for p in range(2)]  # hi, lo byte of a 16-bit audio sample
@@ -328,6 +326,33 @@ class KairosTokenizer(ByT5Tokenizer):
     def decode_signal(self, ids: list[int], n_bytes: int = 2) -> np.ndarray:
         return self._decode_pcm(ids, *self.SIGNAL_VALUE_RANGE, n_bytes)
 
+    # ------------- CONTROL: one interleaved (action, state) stream per clip -------------
+    @classmethod
+    def encode_control(cls, state: np.ndarray, action: np.ndarray, n_bytes: int = 2, scale_factor: int | None = None) -> list:
+        """One <CONTROL> segment, action+state interleaved per sample; truncates to shorter side."""
+        if state.dtype != np.float32 or action.dtype != np.float32:
+            raise ValueError("encode_control expects float32 arrays in [-1, 1]")
+        factor = scale_factor if scale_factor is not None else cls.PCM_SCALE_FACTOR
+        s = cls._decimate_1d(state, factor)
+        a = cls._decimate_1d(action, factor)
+        n = min(len(s), len(a))
+        s_planes = _quantize_planes(s[:n], *cls.SIGNAL_VALUE_RANGE, n_bytes)  # (n, n_bytes)
+        a_planes = _quantize_planes(a[:n], *cls.SIGNAL_VALUE_RANGE, n_bytes)  # (n, n_bytes)
+        interleaved = np.concatenate([a_planes, s_planes], axis=1).reshape(-1)  # ACT.. then STA.. per sample
+        family_cycle = tuple(f"ACT{p}" for p in range(n_bytes)) + tuple(f"STA{p}" for p in range(n_bytes))
+        return [("bytes", interleaved.tobytes(), family_cycle)]
+
+    def decode_control(self, ids: list[int], n_bytes: int = 2) -> tuple[np.ndarray, np.ndarray]:
+        """Inverse of encode_control; returns (state, action), each float32 in [-1, 1]."""
+        raw = self._ids_to_bytes(ids)
+        step = 2 * n_bytes
+        if len(raw) % step != 0:
+            raise ValueError(f"payload ({len(raw)} bytes) not a multiple of {step} (2 x n_bytes={n_bytes})")
+        planes = np.frombuffer(raw, dtype=np.uint8).reshape(-1, step)
+        action = _dequantize_planes(planes[:, :n_bytes], *self.SIGNAL_VALUE_RANGE, n_bytes).astype(np.float32)
+        state = _dequantize_planes(planes[:, n_bytes:], *self.SIGNAL_VALUE_RANGE, n_bytes).astype(np.float32)
+        return state, action
+
     @classmethod
     def encode_signal_ticks(
         cls, values: np.ndarray, family: str, tick_samples: int | None = None, n_bytes: int = 2, scale_factor: int | None = None
@@ -461,8 +486,7 @@ class KairosTokenizer(ByT5Tokenizer):
         return segments
 
     def reconstruct_segments(self, input_ids) -> list[dict]:
-        """Decodes input_ids back to typed content per segment (TEXT->str, IMAGE/VIDEO/LIDAR/
-        AUDIO/STATE/ACTION->arrays). "decoded" is None with an "error" key if decode failed."""
+        """Decodes input_ids per segment; "decoded" is None with an "error" key if decode failed."""
         if not torch.is_tensor(input_ids):
             input_ids = torch.as_tensor(input_ids)
         results = []
@@ -486,6 +510,9 @@ class KairosTokenizer(ByT5Tokenizer):
                     entry["decoded"] = self.decode_lidar(seg.data)
                 elif seg.modality in (Modality.STATE, Modality.ACTION):
                     entry["decoded"] = self.decode_signal(seg.data)
+                elif seg.modality is Modality.CONTROL:
+                    state, action = self.decode_control(seg.data)
+                    entry["decoded"] = {"state": state, "action": action}
                 else:
                     entry["decoded"] = seg.data
             except Exception as e:  # noqa: BLE001 — surface a corrupt/truncated segment, don't crash
@@ -495,6 +522,4 @@ class KairosTokenizer(ByT5Tokenizer):
         return results
 
 
-# len(KairosTokenizer()) == 259 base bytes/specials + 30 modality/channel/structural tags == 289.
-# The (up to) 17 "which byte/channel" families live in a separate small octet_family_ids stream
-# (see NUM_OCTET_FAMILIES), not in the main vocab - that's what keeps this vocab small.
+# len(KairosTokenizer()) == 291; families live in a separate octet_family_ids stream, not vocab.
