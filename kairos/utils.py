@@ -127,8 +127,7 @@ class DetailedMemoryReport:
             f"Gradient bytes (measured):     {self.grad_bytes / 1e6:.1f} MB",
             f"Optimizer state (measured):    {self.optimizer_state_bytes / 1e6:.1f} MB",
             f"Activation bytes (1 fwd pass): {self.activation_bytes_forward / 1e6:.1f} MB",
-            f"  largest single activation:   {self.largest_activation[0]} "
-            f"({self.largest_activation[1] / 1e6:.1f} MB)",
+            f"  largest single activation:   {self.largest_activation[0]} ({self.largest_activation[1] / 1e6:.1f} MB)",
             "",
             "Process RSS (real OS memory, /proc/self/status VmRSS):",
             f"  before step:                 {self.rss_before_mb:.1f} MB",
@@ -148,7 +147,9 @@ class DetailedMemoryReport:
             if row["n_unique_module_instances"] < row["n_module_slots"]:
                 tag = f"  [SHARED: {row['n_module_slots']} slots -> {row['n_unique_module_instances']} unique instance(s)]"
             lines.append(f"  {row['name']:<16} {row['unique_bytes'] / 1e6:8.1f} MB{tag}")
-        accounted = self.unique_param_bytes + self.grad_bytes + self.optimizer_state_bytes + self.activation_bytes_forward
+        accounted = (
+            self.unique_param_bytes + self.grad_bytes + self.optimizer_state_bytes + self.activation_bytes_forward
+        )
         unaccounted = (self.rss_after_optimizer_step_mb - self.rss_before_mb) * 1e6 - accounted
         lines += [
             "",

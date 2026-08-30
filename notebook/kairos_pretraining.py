@@ -34,7 +34,7 @@ def _():
 
 @app.cell
 def _():
-    # --force-reinstall required since pip skips reinstalling an unchanged version
+    # --force-reinstall required since pip skips reinstalling an unchanged version.
     # !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
     return
 
@@ -54,7 +54,12 @@ def _():
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
     from kairos.utils import make_progress_callback
-    from kairos.dataset import diagnose_raw_control_balance, modality_counts, split_examples, preview_multimodal_examples
+    from kairos.dataset import (
+        diagnose_raw_control_balance,
+        modality_counts,
+        split_examples,
+        preview_multimodal_examples,
+    )
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
@@ -165,8 +170,7 @@ def _():
 
 @app.cell
 def _(SHOW_PREVIEW, diagnose_raw_control_balance, multimodal_examples):
-    # source-data sanity check, before any tokenization/windowing: raw control state/action
-    # sample counts must match exactly here, regardless of where multimodal_examples came from
+    # source-data sanity check, before tokenization: raw control state/action counts must match.
     if SHOW_PREVIEW and multimodal_examples:
         _raw_report = diagnose_raw_control_balance(multimodal_examples)
         print(_raw_report)
@@ -228,11 +232,10 @@ def _():
 
 @app.cell
 def _(Modality):
-    # scale 0: finest temporal res (text, state, control); scale 3: coarsest (meta)
+    # scale 0: finest temporal res (text, control); scale 3: coarsest (meta)
     modality_scales = {
         int(Modality.TEXT): [0, 1],
-        int(Modality.STATE): [0],
-        int(Modality.CONTROL): [0],  # replaces separate STATE/ACTION control rows (fused modality)
+        int(Modality.CONTROL): [0],  # paired or observation-only (<OBS>); fuses old STATE/ACTION/imu
         int(Modality.IMAGE): [1, 2],
         int(Modality.LIDAR): [1],
         int(Modality.AUDIO): [2],
@@ -298,7 +301,9 @@ def _(
         share_backbones=CFG_SHARE_BACKBONES,
         codec_mode=CFG_CODEC_MODE,
     )
-    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE}")
+    print(
+        f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE}"
+    )
     return (model_config,)
 
 
@@ -312,8 +317,7 @@ def _():
     TRAIN_SAVE_EVERY = 200
     TRAIN_MASK_EPS = 1e-3  # floor of masked-diffusion rate p; lower -> harder to overfit fast
 
-    # ---- single-pipeline MAE -> transition -> diffusion curriculum: one train() call runs all
-    # three stages; set an *_EPOCHS to 0 to skip. TrainConfig defaults to (1, 1, 1) if unset.
+    # single-pipeline MAE -> transition -> diffusion curriculum; set an *_EPOCHS to 0 to skip.
     TRAIN_MAE_EPOCHS = 1
     TRAIN_MAE_P_MAX = 0.3  # MAE stage ceiling on p: fixed-ish low corruption, stable to optimize
     TRAIN_MAE_REWEIGHT = False  # plain CE in MAE stage: no 1/p variance blowup
@@ -536,17 +540,13 @@ def _(RUN_BENCHMARK, pipe):
 
 @app.cell
 def _(RUN_BENCHMARK, pipe, report):
-    # visually reconstruct real tokenized rows. preview_tokenized(modality=None) shows one
-    # representative row per modality actually present (text/image/audio/video/lidar/control) -
-    # not n purely random rows, which on a large dataset tend to be mostly TEXT and silently
-    # skip rarer modalities. STATE/ACTION are overlaid (flagged red on a real mismatch, labeled
-    # separately when it's just legitimate window truncation).
+    # visually reconstruct real tokenized rows; preview_tokenized: one row per modality present.
     if RUN_BENCHMARK and report is not None and report.mismatched_rows:
         pipe.plot_row(row=report.mismatched_rows[0]["row"], split="train")
         pipe.preview_tokenized(split="train")
     elif RUN_BENCHMARK:
         pipe.show(n=3, split="train")  # a few random rows, any modality
-        pipe.preview_tokenized(split="train")  # one representative row per modality, STATE/ACTION overlaid
+        pipe.preview_tokenized(split="train")  # one row per modality, CONTROL state/action overlaid
     return
 
 
@@ -567,11 +567,15 @@ def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, 
                 overfit_logs = pipe.overfit_test(
                     n_examples=OVERFIT_EXAMPLES,
                     steps=OVERFIT_STEPS,
-                    progress_callback=lambda step, total, loss_val: _bar.update(increment=1, subtitle=f"loss={loss_val:.4f}"),
+                    progress_callback=lambda step, total, loss_val: _bar.update(
+                        increment=1, subtitle=f"loss={loss_val:.4f}"
+                    ),
                 )
         else:
             overfit_logs = pipe.overfit_test(
-                n_examples=OVERFIT_EXAMPLES, steps=OVERFIT_STEPS, progress_callback=make_progress_callback(desc="overfit_test")
+                n_examples=OVERFIT_EXAMPLES,
+                steps=OVERFIT_STEPS,
+                progress_callback=make_progress_callback(desc="overfit_test"),
             )
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
@@ -583,7 +587,6 @@ def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, 
 def _():
     FORCE_RESTART = True  # True = restart from scratch, False = resume, landing in the right stage
     return (FORCE_RESTART,)
-
 
 
 @app.cell

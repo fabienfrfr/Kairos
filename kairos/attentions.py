@@ -75,6 +75,7 @@ except ImportError:
             causal_conv1d_update,
         )
 
+
 # DeltaNet runs on every layer alongside SWA (see KairosLiZAttention2); without fla/causal-conv1d
 # it silently falls back to slow pure-PyTorch kernels - warn loudly on CUDA
 def _warn_if_missing_fast_kernels(cuda_available: bool, delta_backend: str, conv_backend: str) -> None:
@@ -85,7 +86,10 @@ def _warn_if_missing_fast_kernels(cuda_available: bool, delta_backend: str, conv
 
     missing = [
         pkg
-        for pkg, ok in (("flash-linear-attention", delta_backend == "fla"), ("causal-conv1d", conv_backend == "causal_conv1d"))
+        for pkg, ok in (
+            ("flash-linear-attention", delta_backend == "fla"),
+            ("causal-conv1d", conv_backend == "causal_conv1d"),
+        )
         if not ok
     ]
     warnings.warn(

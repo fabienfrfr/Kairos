@@ -43,9 +43,9 @@ def rng():
 
 
 # ========================= Vocab / backward compatibility =========================
-def test_vocab_size_is_293(tokenizer):
-    """259 base + 32 modality/channel tags (added <CONTROL></CONTROL>) == 291 (+SEP+MASK=293)."""
-    assert len(tokenizer) == 293
+def test_vocab_size_is_290(tokenizer):
+    """259 base + 31 modality/channel/structural tags (CONTROL fused, +OBS -STATE -ACTION)."""
+    assert len(tokenizer) == 290
 
 
 def test_no_native_bos(tokenizer):
@@ -115,8 +115,8 @@ def test_encode_signal_ticks_matches_flattened_encode_signal(tokenizer):
 def test_signal_and_audio_share_the_small_value_vocab_but_not_family(tokenizer):
     # values are shared (that's the point - small vocab); family is what disambiguates them
     values = np.zeros(4, dtype=np.float32)
-    signal_ids, signal_families = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values, family="ACT"))
-    audio_ids, audio_families = tokenizer._resolve_markers(KairosTokenizer.encode_audio(values))
+    _, signal_families = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values, family="ACT"))
+    _, audio_families = tokenizer._resolve_markers(KairosTokenizer.encode_audio(values))
     byte_signal_families = [f for f in signal_families if f != 0]
     byte_audio_families = [f for f in audio_families if f != 0]
     assert set(byte_signal_families).isdisjoint(byte_audio_families)
@@ -415,7 +415,8 @@ def test_octet_family_ids_distinguish_rgb_and_place_value(tokenizer):
     aud_markers = KairosTokenizer.encode_audio(np.zeros(2, dtype=np.float32), tick_samples=2)
     _, aud_families = tokenizer._resolve_markers(aud_markers)
     r, g, b = img_families[0], img_families[1], img_families[2]
-    aud_hi, aud_lo = [f for f in aud_families if f][0], [f for f in aud_families if f][1]
+    aud_hi = next(f for f in aud_families if f)
+    aud_lo = [f for f in aud_families if f][1]
     assert len({r, g, b, aud_hi, aud_lo}) == 5
 
 
@@ -452,9 +453,7 @@ def test_reconstruct_segments_roundtrips_audio(tokenizer, sample_audio):
 
 
 def test_reconstruct_segments_roundtrips_video(tokenizer, sample_video):
-    """Regression: decode_video returns (frames, duration) - reconstruct_segments used to store
-    the raw tuple under "decoded" instead of unpacking it (unlike the AUDIO branch just above),
-    so any caller doing decoded.shape crashed with AttributeError on a tuple."""
+    """Regression: decode_video returned a raw (frames, duration) tuple instead of unpacking it."""
     markers = KairosTokenizer.encode_video(sample_video)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.VIDEO, markers)])
     result = tokenizer.reconstruct_segments(out["input_ids"])
@@ -493,31 +492,44 @@ def test_decode_control_rejects_payload_not_multiple_of_step(tokenizer):
     assert "error" in result[0]
 
 
-def test_reconstruct_segments_roundtrips_generic_state_and_action_modalities(tokenizer, rng):
-    """STATE/ACTION as standalone modalities (e.g. imu) still round-trip via encode_signal/decode_signal, independent of the fused CONTROL path used for paired control clips."""
+def test_encode_decode_control_observation_only_roundtrips(tokenizer, rng):
+    """encode_control(state, action=None) - the imu case - round-trips; action stays None."""
     state = rng.uniform(-1, 1, 480).astype(np.float32)
-    action = rng.uniform(-1, 1, 480).astype(np.float32)
-    segs = [
-        MultimodalSegment(Modality.STATE, KairosTokenizer.encode_signal(state, family="STA", scale_factor=1)),
-        MultimodalSegment(Modality.ACTION, KairosTokenizer.encode_signal(action, family="ACT", scale_factor=1)),
-    ]
-    out = tokenizer.encode_multimodal(segs)
+    markers = KairosTokenizer.encode_control(state, action=None, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.CONTROL, markers)])
     result = tokenizer.reconstruct_segments(out["input_ids"])
-    modalities = [r["modality"] for r in result]
-    assert modalities == ["STATE", "ACTION"]  # segment order preserved
-    assert result[0]["decoded"].shape[0] == result[1]["decoded"].shape[0]  # same length back out
+    assert result[0]["modality"] == "CONTROL"
+    rec_state, rec_action = result[0]["decoded"]["state"], result[0]["decoded"]["action"]
+    assert rec_action is None
+    assert len(rec_state) == 480
+    assert np.allclose(rec_state, state, atol=2 / 65535)
+
+
+def test_encode_control_observation_and_paired_never_confused_in_same_row(tokenizer, rng):
+    """The <OBS> marker distinguishes state-only from paired CONTROL segments side by side."""
+    obs = KairosTokenizer.encode_control(rng.uniform(-1, 1, 20).astype(np.float32), action=None, scale_factor=1)
+    paired = KairosTokenizer.encode_control(
+        rng.uniform(-1, 1, 15).astype(np.float32), rng.uniform(-1, 1, 15).astype(np.float32), scale_factor=1
+    )
+    out = tokenizer.encode_multimodal(
+        [MultimodalSegment(Modality.CONTROL, obs), MultimodalSegment(Modality.CONTROL, paired)]
+    )
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["decoded"]["action"] is None
+    assert len(result[0]["decoded"]["state"]) == 20
+    assert result[1]["decoded"]["action"] is not None
+    assert len(result[1]["decoded"]["state"]) == len(result[1]["decoded"]["action"]) == 15
 
 
 def test_reconstruct_segments_decodes_text_as_str(tokenizer):
-    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.TEXT, "hello world".encode("utf-8"))])
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.TEXT, b"hello world")])
     result = tokenizer.reconstruct_segments(out["input_ids"])
     assert result[0]["modality"] == "TEXT"
     assert result[0]["decoded"] == "hello world"
 
 
 def test_reconstruct_segments_reports_error_instead_of_raising_on_truncated_segment(tokenizer, sample_image):
-    """A window boundary can truncate a segment mid-byte-plane; this must be surfaced as an
-    error entry, not crash the whole diagnostic over one corrupted row."""
+    """A mid-byte-plane truncation must surface as an error, not crash the whole diagnostic."""
     markers = KairosTokenizer.encode_image(sample_image)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
     truncated = out["input_ids"][:-5]  # cut off before the closing tag / mid-payload

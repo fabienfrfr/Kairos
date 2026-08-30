@@ -857,11 +857,21 @@ def test_model_diffusion_stability_with_cache(config):
 
 def test_share_backbones_reduces_param_count():
     cfg_sep = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=False,
     )
     cfg_share = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=True,
     )
     model_sep = KairosDiffusionFM(cfg_sep, vocab_size=100)
@@ -876,7 +886,12 @@ def test_share_backbones_reduces_param_count():
 
 def test_share_backbones_forward_output_shape():
     cfg = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=True,
     )
     model = KairosDiffusionFM(cfg, vocab_size=100)
@@ -888,7 +903,12 @@ def test_share_backbones_forward_output_shape():
 
 def test_share_backbones_backward():
     cfg = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=True,
     )
     model = KairosDiffusionFM(cfg, vocab_size=100)
@@ -901,7 +921,12 @@ def test_share_backbones_backward():
 
 def test_share_backbones_all_scales_use_same_module():
     cfg = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=4, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=4,
+        num_modalities=2,
         share_backbones=True,
     )
     model = KairosDiffusionFM(cfg, vocab_size=100)

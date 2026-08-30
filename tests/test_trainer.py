@@ -287,7 +287,9 @@ def test_compute_masked_diffusion_losses_self_conditioning_prob_zero_never_calls
     assert calls[0] is None
 
 
-def test_compute_masked_diffusion_losses_self_conditioning_prob_one_always_feeds_warmup_estimate(dense_model, monkeypatch):
+def test_compute_masked_diffusion_losses_self_conditioning_prob_one_always_feeds_warmup_estimate(
+    dense_model, monkeypatch
+):
     """self_conditioning_prob=1.0 must run a no-grad warm-up pass, then feed its detached logits
     back in on the real, gradient-tracked pass - matching generate()'s inference-time usage."""
     torch.manual_seed(0)
@@ -361,8 +363,13 @@ def test_anneal_mask_schedule_handles_decreasing_ramp():
 
 def test_stage_mask_schedule_flat_during_mae_phase():
     p_max, reweight = stage_mask_schedule(
-        global_step=0, mae_steps=100, transition_steps=50, mae_p_max=0.3, mae_reweight=False,
-        target_p_max=1.0, target_reweight=True,
+        global_step=0,
+        mae_steps=100,
+        transition_steps=50,
+        mae_p_max=0.3,
+        mae_reweight=False,
+        target_p_max=1.0,
+        target_reweight=True,
     )
     assert p_max == 0.3
     assert reweight == 0.0

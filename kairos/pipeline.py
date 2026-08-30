@@ -58,9 +58,8 @@ class DataConfig:
     batch_size: int = 8
     shuffle: bool = True
     drop_last: bool = True
-    pack: bool = False  # concatenate samples before chunking so
-    # None: min(4, os.cpu_count()-1) if batch_size > 1 else 0. Override to e.g. 0 on a
-    # memory-constrained machine (each worker forks the parent process).
+    pack: bool = False  # concatenate examples before windowing (see KairosPretrainingDataset)
+    # None: min(4, os.cpu_count()-1) if batch_size > 1 else 0; override (e.g. 0) if memory-tight.
     num_workers: int | None = None
     # per-modality-key encode_* scale_factor override; unset keys use tokenizer defaults
     modality_scale_factors: dict | None = None
@@ -191,8 +190,7 @@ class KairosMultimodalPipeline:
             return self.data_config.num_workers
         if self.data_config.batch_size <= 1:
             return 0
-        # cap at available CPUs so we never fork more workers than the box can run in
-        # parallel - a flat "4" can stall/hang on a 1-2 core machine.
+        # cap at available CPUs; a flat "4" can stall/hang on a 1-2 core machine.
         cpu_count = os.cpu_count() or 1
         return max(0, min(4, cpu_count - 1))
 
@@ -330,8 +328,12 @@ class KairosMultimodalPipeline:
 
                 t0 = time.perf_counter()
                 mem_report = detailed_memory_report(
-                    self.model, self.optimizer, loss_fn, self.device,
-                    autocast_ctx=self._autocast, scaler=self.scaler,
+                    self.model,
+                    self.optimizer,
+                    loss_fn,
+                    self.device,
+                    autocast_ctx=self._autocast,
+                    scaler=self.scaler,
                 )
                 first_step_time = time.perf_counter() - t0
 
@@ -448,7 +450,9 @@ class KairosMultimodalPipeline:
                 )
             if loader is not None and getattr(loader.dataset, "ds", None) is not None:
                 return diagnose_built_dataset(loader.dataset.ds, sample_size=sample_size)
-            raise RuntimeError(f"data_report(split={split!r}) needs multimodal_examples/multimodal_path, or a built pipeline")
+            raise RuntimeError(
+                f"data_report(split={split!r}) needs multimodal_examples/multimodal_path, or a built pipeline"
+            )
         finally:
             self._release_transient_memory()
 
@@ -472,10 +476,14 @@ class KairosMultimodalPipeline:
         plot_tokenized_row(self.tokenizer, input_ids, max_segments=max_segments)
 
     def show(
-        self, n: int = 3, modality: str | None = None, split: str = "train", seed: int = 0, max_segments: int | None = None
+        self,
+        n: int = 3,
+        modality: str | None = None,
+        split: str = "train",
+        seed: int = 0,
+        max_segments: int | None = None,
     ) -> None:
-        """The easy entry point: plots n real tokenized rows. modality=None picks n random
-        rows; modality="image"/"control"/"audio"/... only shows rows containing it."""
+        """Plots n real tokenized rows; modality=None: n random, else only rows containing it."""
         if split not in ("train", "eval"):
             raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
         loader = self.loader if split == "train" else self.eval_loader
@@ -499,15 +507,7 @@ class KairosMultimodalPipeline:
     def preview_tokenized(
         self, n: int = 1, modality: str | None = None, split: str = "train", sample_size: int = 200, seed: int = 0
     ) -> None:
-        """Post-tokenization/detokenization equivalent of pipe.show(): overlays STATE/ACTION
-        pairs (with explicit sample counts, flagged red on a real mismatch) instead of plotting
-        them separately, while still rendering every other modality found in the row. Use this
-        to visually confirm whether a STATE/ACTION imbalance is a real per-clip defect or just a
-        window-truncation artifact (see diagnose_control_alternation).
-
-        modality=None (default) shows up to `n` representative row(s) for EACH modality present
-        (text/image/audio/video/lidar/control), not n purely random rows - so a rare modality
-        isn't silently skipped just because a random sample didn't happen to include it."""
+        """Tokenized pipe.show(): overlays CONTROL state/action; n rows/modality by default."""
         if split not in ("train", "eval"):
             raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
         loader = self.loader if split == "train" else self.eval_loader
@@ -633,8 +633,13 @@ class KairosMultimodalPipeline:
 
             def stage_at(_step: int) -> tuple[float, float]:
                 return stage_mask_schedule(
-                    _step, mae_steps, transition_steps,
-                    tc.mask_mae_p_max, tc.mask_mae_reweight, tc.mask_p_max, tc.mask_reweight,
+                    _step,
+                    mae_steps,
+                    transition_steps,
+                    tc.mask_mae_p_max,
+                    tc.mask_mae_reweight,
+                    tc.mask_p_max,
+                    tc.mask_reweight,
                 )
 
         n = min(n_examples, len(self.dataset))
@@ -935,7 +940,10 @@ class KairosMultimodalPipeline:
     def run_config_dict(self) -> dict:
         """model/train/data config as a plain JSON-safe dict; the actual hyperparameters behind."""
         dc = asdict(self.data_config)
-        for key, count_attr in (("text_examples", "_text_examples_count"), ("multimodal_examples", "_multimodal_examples_count")):
+        for key, count_attr in (
+            ("text_examples", "_text_examples_count"),
+            ("multimodal_examples", "_multimodal_examples_count"),
+        ):
             if dc.get(key) is not None:
                 dc[key] = f"<{len(dc[key])} examples, omitted>"
             elif getattr(self.data_config, count_attr, None):

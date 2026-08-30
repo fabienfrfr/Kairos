@@ -96,10 +96,10 @@ def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[Multim
         return [MultimodalSegment(Modality.LIDAR, KairosTokenizer.encode_lidar(arrays["points"], scale_factor=sf))]
 
     if modality == "imu":
+        # observation-only CONTROL (no action): folded into the same fused modality, <OBS>-tagged.
         sf = modality_scale_factors.get("imu")
         flat = np.clip(arrays["signal"].flatten(), -1.0, 1.0).astype(np.float32)
-        markers = KairosTokenizer.encode_signal(flat, family="STA", scale_factor=sf)
-        return [MultimodalSegment(Modality.STATE, markers)]
+        return [MultimodalSegment(Modality.CONTROL, KairosTokenizer.encode_control(flat, action=None, scale_factor=sf))]
 
     if modality == "control":
         sf = modality_scale_factors.get("control")
@@ -114,7 +114,9 @@ def _segments_for(ex, modality_scale_factors: dict | None = None) -> list[Multim
             segments.append(MultimodalSegment(Modality.TEXT, caption.encode("utf-8")))
         # single CONTROL segment via encode_control: one tag pair per clip, not per sample
         segments.append(
-            MultimodalSegment(Modality.CONTROL, KairosTokenizer.encode_control(arrays["state"], arrays["action"], scale_factor=sf))
+            MultimodalSegment(
+                Modality.CONTROL, KairosTokenizer.encode_control(arrays["state"], arrays["action"], scale_factor=sf)
+            )
         )
         return segments
     return None
@@ -320,7 +322,10 @@ def diagnose_raw_control_balance(examples) -> RawControlBalanceReport:
         if state_n != action_n:
             mismatched.append({"index": i, "state_samples": state_n, "action_samples": action_n})
     return RawControlBalanceReport(
-        n_control_examples=n, total_state_samples=total_state, total_action_samples=total_action, mismatched_examples=mismatched
+        n_control_examples=n,
+        total_state_samples=total_state,
+        total_action_samples=total_action,
+        mismatched_examples=mismatched,
     )
 
 
@@ -420,24 +425,24 @@ def preview_tokenized_examples(
         segments = tokenizer.reconstruct_segments(input_ids)
         print(f"--- row {row_i}: " + " -> ".join(f"{s['modality']}({s['n_tokens']})" for s in segments) + " ---")
 
-        # CONTROL carries state+action interleaved; encode_control forces equal counts per clip.
-        state_vals, action_vals, undecodable = [], [], []
+        # CONTROL is paired (state+action) or observation-only (<OBS>); keep the two totals apart.
+        paired_state, paired_action, obs_state, undecodable = [], [], [], []
         for i, seg in enumerate(segments):
-            if seg["modality"] not in ("STATE", "ACTION", "CONTROL"):
+            if seg["modality"] != "CONTROL":
                 _render_tokenized_segment(seg, i)
                 continue
             if seg.get("error"):
-                undecodable.append(f"  [truncated] {seg['modality']}: undecodable tail ({seg['error']})")
+                undecodable.append(f"  [truncated] CONTROL: undecodable tail ({seg['error']})")
                 continue
-            if seg["modality"] == "CONTROL":
-                state_vals.append(seg["decoded"]["state"])
-                action_vals.append(seg["decoded"]["action"])
+            if seg["decoded"]["action"] is None:
+                obs_state.append(seg["decoded"]["state"])
             else:
-                (state_vals if seg["modality"] == "STATE" else action_vals).append(seg["decoded"])
+                paired_state.append(seg["decoded"]["state"])
+                paired_action.append(seg["decoded"]["action"])
 
-        if state_vals or action_vals:
-            state_arr = np.concatenate(state_vals) if state_vals else np.array([], dtype=np.float32)
-            action_arr = np.concatenate(action_vals) if action_vals else np.array([], dtype=np.float32)
+        if paired_state or paired_action:
+            state_arr = np.concatenate(paired_state) if paired_state else np.array([], dtype=np.float32)
+            action_arr = np.concatenate(paired_action) if paired_action else np.array([], dtype=np.float32)
             state_n, action_n = len(state_arr), len(action_arr)
             plt.figure(figsize=(3, 1.2))
             plt.plot(state_arr, label=f"state ({state_n})")
@@ -451,6 +456,12 @@ def preview_tokenized_examples(
             elif gap > 0:
                 title += "  (window-edge truncation)"
             plt.title(title, fontsize=6, color="red" if gap > 2 else "black")
+            plt.show()
+        if obs_state:
+            obs_arr = np.concatenate(obs_state)
+            plt.figure(figsize=(3, 1.2))
+            plt.plot(obs_arr)
+            plt.title(f"row {row_i}: CONTROL observation-only ({len(obs_arr)} samples)", fontsize=6)
             plt.show()
         for msg in undecodable:
             print(msg)
@@ -508,19 +519,16 @@ def plot_tokenized_row(tokenizer, input_ids, max_segments: int | None = None) ->
 
     for i, seg in enumerate(segments):
         modality, decoded = seg["modality"], seg["decoded"]
-        if modality in ("STATE", "ACTION") and not seg.get("error"):
-            plt.figure(figsize=(2.5, 0.8))
-            color = "tab:blue" if modality == "STATE" else "tab:orange"
-            plt.plot(decoded, linewidth=0.7, color=color)
-            plt.title(f"[{i}] {modality} ({len(decoded)} samples)", fontsize=6)
-            plt.axis("off")
-            plt.show()
-        elif modality == "CONTROL" and not seg.get("error"):
+        if modality == "CONTROL" and not seg.get("error"):
             plt.figure(figsize=(3, 1))
-            plt.plot(decoded["state"], linewidth=0.7, label=f"state ({len(decoded['state'])})")
-            plt.plot(decoded["action"], linewidth=0.7, label=f"action ({len(decoded['action'])})")
-            plt.legend(fontsize=6)
-            plt.title(f"[{i}] CONTROL", fontsize=6)
+            if decoded["action"] is None:
+                plt.plot(decoded["state"], linewidth=0.7)
+                plt.title(f"[{i}] CONTROL observation-only ({len(decoded['state'])} samples)", fontsize=6)
+            else:
+                plt.plot(decoded["state"], linewidth=0.7, label=f"state ({len(decoded['state'])})")
+                plt.plot(decoded["action"], linewidth=0.7, label=f"action ({len(decoded['action'])})")
+                plt.legend(fontsize=6)
+                plt.title(f"[{i}] CONTROL", fontsize=6)
             plt.axis("off")
             plt.show()
         else:
@@ -551,13 +559,13 @@ class ControlAlternationReport:
         return "\n".join(lines)
 
 
-def find_rows_with_modality(built_dataset, modality: str, n: int = 3, sample_size: int = 200, seed: int = 0) -> list[int]:
-    """Row indices (sampled) whose modality_ids contain `modality` (case-insensitive: "image", "control", "state" (imu or control), "action" (control), "text", ...)."""
+def find_rows_with_modality(
+    built_dataset, modality: str, n: int = 3, sample_size: int = 200, seed: int = 0
+) -> list[int]:
+    """Row indices with modality_ids containing `modality` ("state"/"action" both mean CONTROL)."""
     key = modality.lower()
-    if key in ("control", "action"):
+    if key in ("control", "action", "state", "imu"):
         wanted = {int(Modality.CONTROL)}
-    elif key == "state":
-        wanted = {int(Modality.STATE), int(Modality.CONTROL)}  # STATE alone (imu) or inside CONTROL
     else:
         try:
             wanted = {int(Modality[key.upper()])}
@@ -580,7 +588,9 @@ def find_rows_with_modality(built_dataset, modality: str, n: int = 3, sample_siz
     return found
 
 
-def diagnose_control_alternation(built_dataset, tokenizer, sample_size: int = 200, seed: int = 0) -> ControlAlternationReport:
+def diagnose_control_alternation(
+    built_dataset, tokenizer, sample_size: int = 200, seed: int = 0
+) -> ControlAlternationReport:
     """Decodes each sampled row's CONTROL segments and counts samples, surfacing any segment truncated mid-byte by a window cut."""
     total_rows = len(built_dataset)
     sample_n = min(sample_size, total_rows)
@@ -724,9 +734,11 @@ class KairosPretrainingDataset(Dataset):
                     skip_messages.append(str(e))
                     continue
                 encoded = self.tokenizer.encode_multimodal(segments)
-                yield encoded["input_ids"].tolist(), encoded["modality_ids"].tolist(), encoded[
-                    "octet_family_ids"
-                ].tolist()
+                yield (
+                    encoded["input_ids"].tolist(),
+                    encoded["modality_ids"].tolist(),
+                    encoded["octet_family_ids"].tolist(),
+                )
 
         def rows():
             # one dict per row, streamed straight to the arrow writer; nothing sits in RAM at once.

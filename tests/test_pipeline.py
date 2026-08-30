@@ -522,9 +522,7 @@ def test_train_zero_transition_epochs_jumps_straight_from_mae_to_diffusion(
     assert all(v == pytest.approx(1.0) for v in seen_p_max[steps_per_epoch:])
 
 
-def test_train_resume_mid_curriculum_recovers_correct_stage(
-    tmp_path, model_config, text_examples, multimodal_examples
-):
+def test_train_resume_mid_curriculum_recovers_correct_stage(tmp_path, model_config, text_examples, multimodal_examples):
     """Resuming from a checkpoint taken mid-curriculum must land in the right stage automatically
     — the stage is a pure function of the persisted global_step, not of which pipeline/stage
     object originally ran it (no separate pipe_mae/pipe objects or manual hand-off anymore)."""
@@ -948,6 +946,7 @@ def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text
 def test_train_calls_compute_loss_with_model_forward_not_bare_model(built_pipeline, monkeypatch):
     """Regression: train() used to call compute_loss(self.model, ...) directly, skipping
     self.model_forward (DataParallel-wrapped when n_gpus > 1), unlike every other method."""
+
     # distinct proxy identity, so we can prove train() calls model_forward and not self.model
     class _Proxy(torch.nn.Module):
         def __init__(self, wrapped):
@@ -1189,7 +1188,9 @@ def test_control_alternation_report_finds_control_rows(tmp_path, model_config, t
         )
         for _ in range(6)
     ]
-    data_config = DataConfig(text_examples=text_examples, multimodal_examples=control_examples, max_len=100_000, batch_size=2)
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=control_examples, max_len=100_000, batch_size=2
+    )
     train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"))
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
@@ -1405,8 +1406,14 @@ def test_overfit_test_default_walks_all_three_active_stages(tmp_path, model_conf
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
     train_config = TrainConfig(
-        mae_epochs=1, transition_epochs=1, diffusion_epochs=1, run_dir=str(tmp_path / "run"),
-        mask_mae_p_max=0.3, mask_mae_reweight=False, mask_p_max=1.0, mask_reweight=True,
+        mae_epochs=1,
+        transition_epochs=1,
+        diffusion_epochs=1,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_mae_reweight=False,
+        mask_p_max=1.0,
+        mask_reweight=True,
     )
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
@@ -1432,8 +1439,12 @@ def test_overfit_test_default_skips_stages_with_zero_epochs(tmp_path, model_conf
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
     train_config = TrainConfig(
-        mae_epochs=1, transition_epochs=0, diffusion_epochs=0, run_dir=str(tmp_path / "run"),
-        mask_mae_p_max=0.3, mask_mae_reweight=False,
+        mae_epochs=1,
+        transition_epochs=0,
+        diffusion_epochs=0,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_mae_reweight=False,
     )
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
@@ -1507,8 +1518,10 @@ def test_train_does_not_step_optimizer_on_nonfinite_loss(built_pipeline, monkeyp
     for key, val in before.items():
         assert torch.equal(val, after[key]), f"param {key} changed despite every batch being non-finite"
 
+
 def test_preview_tokenized_runs_without_raising(built_pipeline, monkeypatch):
     import matplotlib.pyplot as plt
+
     monkeypatch.setattr(plt, "show", lambda: None)
     built_pipeline.preview_tokenized(n=3, split="train")
     built_pipeline.preview_tokenized(n=2, modality="control", split="train")
