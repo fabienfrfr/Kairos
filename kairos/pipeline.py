@@ -6,6 +6,7 @@ import copy
 import itertools
 import json
 import math
+import os
 import random
 import time
 import warnings
@@ -18,7 +19,15 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
-from .dataset import KairosPretrainingDataset
+from .dataset import (
+    KairosPretrainingDataset,
+    diagnose_built_dataset,
+    diagnose_control_alternation,
+    diagnose_multimodal_examples,
+    find_rows_with_modality,
+    plot_tokenized_row,
+    preview_tokenized_examples,
+)
 from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import (
@@ -29,10 +38,12 @@ from .trainer import (
 )
 from .utils import (
     DetailedMemoryReport,
+    ModuleTimeReport,
     TrainingSummary,
     benchmark_step_time,
     detailed_memory_report,
     locate_first_nonfinite_module,
+    profile_module_time,
     training_summary,
 )
 
@@ -47,9 +58,11 @@ class DataConfig:
     batch_size: int = 8
     shuffle: bool = True
     drop_last: bool = True
-    pack: bool = False  # concatenate samples before chunking so
-    num_workers: int | None = None  # None: 4 if batch_size > 1 else 0. Set explicitly to
-    # override to e.g. 0 on a memory-constrained machine: each worker forks the parent process.
+    pack: bool = False  # concatenate examples before windowing (see KairosPretrainingDataset)
+    # None: min(4, os.cpu_count()-1) if batch_size > 1 else 0; override (e.g. 0) if memory-tight.
+    num_workers: int | None = None
+    # per-modality-key encode_* scale_factor override; unset keys use tokenizer defaults
+    modality_scale_factors: dict | None = None
 
 
 @dataclass
@@ -63,7 +76,9 @@ class TrainConfig:
     diffusion_epochs: int = 1  # stage 3: full masked-diffusion at mask_p_max/mask_reweight
     save_every: int = 200
     last_ckpt_every: int = 20  # how often last.pt (resume point)
-    eval_every: int = 0  # run eval on the held-out set every N steps (0 = off)
+    eval_every: int = 0  # explicit step-based cadence; 0 = derive from eval_every_epochs instead
+    eval_every_epochs: float | None = 0.5  # cadence in epochs; ignored if eval_every > 0
+    eval_at_start: bool = True  # also evaluate once before the first training step
     eval_batches: int = 2  # eval batches per evaluation, capped; keep small
     grad_clip: float = 1.0
     mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows as this shrinks
@@ -72,6 +87,8 @@ class TrainConfig:
     mask_mae_p_max: float = 0.3  # MAE-stage fixed-ish corruption ceiling (cheap/stable to optimize)
     mask_mae_reweight: bool = False  # MAE-stage: plain CE, no 1/p variance blowup
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
+    # train-time self-conditioning rate; 0.0 disables it (generate() then sees OOD input).
+    self_conditioning_prob: float = 0.5
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
     run_dir: str = "checkpoints/kairos-multimodal/run_01"
     device: str | None = None  # None -> auto
@@ -171,7 +188,11 @@ class KairosMultimodalPipeline:
     def _num_workers(self) -> int:
         if self.data_config.num_workers is not None:
             return self.data_config.num_workers
-        return 4 if self.data_config.batch_size > 1 else 0
+        if self.data_config.batch_size <= 1:
+            return 0
+        # cap at available CPUs; a flat "4" can stall/hang on a 1-2 core machine.
+        cpu_count = os.cpu_count() or 1
+        return max(0, min(4, cpu_count - 1))
 
     # ------------------------------------------------------------------ build
     def _build_dataset(self, data_config: DataConfig | None = None) -> KairosPretrainingDataset:
@@ -192,6 +213,7 @@ class KairosMultimodalPipeline:
                 max_len=dc.max_len,
                 stride=dc.stride,
                 pack=dc.pack,
+                modality_scale_factors=dc.modality_scale_factors,
             )
         elif dc.multimodal_path:
             ds = KairosPretrainingDataset(
@@ -200,6 +222,7 @@ class KairosMultimodalPipeline:
                 max_len=dc.max_len,
                 stride=dc.stride,
                 pack=dc.pack,
+                modality_scale_factors=dc.modality_scale_factors,
             )
         else:
             raise ValueError("DataConfig needs multimodal_examples, text_examples, and/or multimodal_path")
@@ -241,6 +264,9 @@ class KairosMultimodalPipeline:
         self.model = KairosDiffusionFM(
             self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
         ).to(self.device)
+        # split each batch across visible GPUs; state_dict/generate keep using self.model
+        n_gpus = torch.cuda.device_count()
+        self.model_forward = torch.nn.DataParallel(self.model) if n_gpus > 1 else self.model
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
@@ -259,6 +285,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_p_max = tc.mask_p_max
         self.hf_trainer.mask_reweight = tc.mask_reweight
         self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
+        self.hf_trainer.self_conditioning_prob = tc.self_conditioning_prob
         self.writer = SummaryWriter(str(self.tb_dir))
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt:
@@ -284,7 +311,7 @@ class KairosMultimodalPipeline:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 self.optimizer.zero_grad()
                 with self._autocast():
-                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                    loss = self.hf_trainer.compute_loss(self.model_forward, batch)
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
@@ -297,12 +324,16 @@ class KairosMultimodalPipeline:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
                 def loss_fn():
-                    return self.hf_trainer.compute_loss(self.model, batch)
+                    return self.hf_trainer.compute_loss(self.model_forward, batch)
 
                 t0 = time.perf_counter()
                 mem_report = detailed_memory_report(
-                    self.model, self.optimizer, loss_fn, self.device,
-                    autocast_ctx=self._autocast, scaler=self.scaler,
+                    self.model,
+                    self.optimizer,
+                    loss_fn,
+                    self.device,
+                    autocast_ctx=self._autocast,
+                    scaler=self.scaler,
                 )
                 first_step_time = time.perf_counter() - t0
 
@@ -351,7 +382,7 @@ class KairosMultimodalPipeline:
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
         def loss_fn():
-            return self.hf_trainer.compute_loss(self.model, batch)
+            return self.hf_trainer.compute_loss(self.model_forward, batch)
 
         try:
             return detailed_memory_report(
@@ -367,6 +398,145 @@ class KairosMultimodalPipeline:
             self.optimizer.load_state_dict(optimizer_state)
             del model_state, optimizer_state
             self._release_transient_memory()
+
+    # ------------------------------------------------------------ time profile
+    def profile(self, n_steps: int = 3) -> ModuleTimeReport:
+        """Per-module wall-clock time (fwd+bwd), avg over n_steps; restores state after."""
+        self._require_built()
+        model_state = copy.deepcopy(self.model.state_dict())
+        optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+        loader_iter = iter(self.loader)
+        batch = next(loader_iter)
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+
+        def step_fn():
+            self.optimizer.zero_grad()
+            with self._autocast():
+                loss = self.hf_trainer.compute_loss(self.model_forward, batch)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+        try:
+            return profile_module_time(self.model, step_fn, self.device, n_steps=n_steps)
+        finally:
+            self.model.load_state_dict(model_state)
+            self.optimizer.load_state_dict(optimizer_state)
+            del model_state, optimizer_state
+            self._release_transient_memory()
+
+    def data_report(self, sample_size: int = 200, split: str = "train"):
+        """Raw-vs-tokenized per-modality stats; falls back to the built dataset if freed."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        dc = self.data_config if split == "train" else self.eval_data_config
+        loader = self.loader if split == "train" else self.eval_loader
+        if dc is None:
+            raise RuntimeError(f"data_report(split={split!r}) needs an eval_data_config on this pipeline")
+
+        examples = dc.multimodal_examples
+        if examples is None and dc.multimodal_path:
+            examples = torch.load(dc.multimodal_path, weights_only=False)
+        try:
+            if examples:
+                return diagnose_multimodal_examples(
+                    examples,
+                    tokenizer=self.tokenizer,
+                    modality_scale_factors=dc.modality_scale_factors,
+                    max_len=dc.max_len,
+                    sample_size=sample_size,
+                )
+            if loader is not None and getattr(loader.dataset, "ds", None) is not None:
+                return diagnose_built_dataset(loader.dataset.ds, sample_size=sample_size)
+            raise RuntimeError(
+                f"data_report(split={split!r}) needs multimodal_examples/multimodal_path, or a built pipeline"
+            )
+        finally:
+            self._release_transient_memory()
+
+    def control_alternation_report(self, sample_size: int = 200, split: str = "train"):
+        """Decodes each sampled row's CONTROL segments; surfaces rows truncated mid-byte by a window cut (see dataset module)."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"control_alternation_report(split={split!r}) needs a built pipeline")
+        return diagnose_control_alternation(loader.dataset.ds, self.tokenizer, sample_size=sample_size)
+
+    def plot_row(self, row: int = 0, split: str = "train", max_segments: int | None = None) -> None:
+        """Reconstructs and plots row `row` of the built (tokenized) dataset in document order."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"plot_row(split={split!r}) needs a built pipeline")
+        input_ids = loader.dataset.ds.with_format("torch")[row]["input_ids"]
+        plot_tokenized_row(self.tokenizer, input_ids, max_segments=max_segments)
+
+    def show(
+        self,
+        n: int = 3,
+        modality: str | None = None,
+        split: str = "train",
+        seed: int = 0,
+        max_segments: int | None = None,
+    ) -> None:
+        """Plots n real tokenized rows; modality=None: n random, else only rows containing it."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"show(split={split!r}) needs a built pipeline")
+        built = loader.dataset.ds
+
+        if modality is None:
+            total = len(built)
+            rows = random.Random(seed).sample(range(total), min(n, total)) if total else []
+        else:
+            rows = find_rows_with_modality(built, modality, n=n, seed=seed)
+            if not rows:
+                print(f"no rows with modality={modality!r} found in this sample")
+                return
+
+        for row in rows:
+            print(f"--- row {row} ---")
+            self.plot_row(row=row, split=split, max_segments=max_segments)
+
+    def preview_tokenized(
+        self, n: int = 1, modality: str | None = None, split: str = "train", sample_size: int = 200, seed: int = 0
+    ) -> None:
+        """Tokenized pipe.show(): overlays CONTROL state/action; n rows/modality by default."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"split must be 'train' or 'eval', got {split!r}")
+        loader = self.loader if split == "train" else self.eval_loader
+        if loader is None or getattr(loader.dataset, "ds", None) is None:
+            raise RuntimeError(f"preview_tokenized(split={split!r}) needs a built pipeline")
+        preview_tokenized_examples(
+            self.tokenizer, loader.dataset.ds, n=n, modality=modality, sample_size=sample_size, seed=seed
+        )
+
+    def inspect_batch_df(self, n: int = 1, from_loader: bool = True):
+        """inspect_batch(), pre-flattened into a pandas DataFrame ready to print."""
+        import pandas as pd
+
+        reports = self.inspect_batch(n=n, from_loader=from_loader)
+        return pd.DataFrame(
+            [
+                {
+                    "row": r["row"],
+                    "modality_counts": r["modality_counts"],
+                    "token_id_range": r["token_id_range"],
+                    "top_token_ids": r["top_token_ids"],
+                    "max_repeat_run": r["max_repeat_run"],
+                    "out_of_bounds_tokens": len(r["out_of_bounds"]["token_ids"]),
+                    "out_of_bounds_modality": len(r["out_of_bounds"]["modality_ids"]),
+                    "pad_frac": round(r["pad_frac"], 3) if r["pad_frac"] is not None else None,
+                }
+                for r in reports
+            ]
+        )
 
     @staticmethod
     def _release_transient_memory() -> None:
@@ -396,7 +566,7 @@ class KairosMultimodalPipeline:
                 for batch in self.eval_loader:
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with self._autocast():
-                        losses.append(self.hf_trainer.compute_loss(self.model, batch).item())
+                        losses.append(self.hf_trainer.compute_loss(self.model_forward, batch).item())
                     seen += 1
                     if tc.eval_batches and seen >= tc.eval_batches:
                         break
@@ -463,8 +633,13 @@ class KairosMultimodalPipeline:
 
             def stage_at(_step: int) -> tuple[float, float]:
                 return stage_mask_schedule(
-                    _step, mae_steps, transition_steps,
-                    tc.mask_mae_p_max, tc.mask_mae_reweight, tc.mask_p_max, tc.mask_reweight,
+                    _step,
+                    mae_steps,
+                    transition_steps,
+                    tc.mask_mae_p_max,
+                    tc.mask_mae_reweight,
+                    tc.mask_p_max,
+                    tc.mask_reweight,
                 )
 
         n = min(n_examples, len(self.dataset))
@@ -498,7 +673,7 @@ class KairosMultimodalPipeline:
                 opt.zero_grad()
                 self.hf_trainer.mask_p_max, self.hf_trainer.mask_reweight = stage_at(step)
                 with self._autocast():
-                    loss = self.hf_trainer.compute_loss(self.model, batch)
+                    loss = self.hf_trainer.compute_loss(self.model_forward, batch)
                 loss_val = loss.item()
                 if not math.isfinite(loss_val):
                     warnings.warn(
@@ -558,10 +733,20 @@ class KairosMultimodalPipeline:
         total_steps = tc.epochs * len(self.loader)
         mae_steps = tc.mae_epochs * len(self.loader)
         transition_steps = tc.transition_epochs * len(self.loader)
+        # eval_every (steps) wins if set explicitly; else derive from eval_every_epochs
+        if tc.eval_every > 0:
+            eval_every_steps = tc.eval_every
+        elif tc.eval_every_epochs:
+            eval_every_steps = max(1, round(tc.eval_every_epochs * len(self.loader)))
+        else:
+            eval_every_steps = 0
         skipped_nonfinite = 0
         consecutive_nan = 0
         prev_cache = None
         use_memory_gate = getattr(self.model_config, "use_memory_gate", False)
+
+        if tc.eval_at_start and self.eval_loader is not None:
+            self.evaluate(step=self.global_step)
 
         try:
             for epoch in range(start_epoch, tc.epochs + 1):
@@ -590,7 +775,7 @@ class KairosMultimodalPipeline:
                         tc.mask_reweight,
                     )
                     with self._autocast():
-                        loss = self.hf_trainer.compute_loss(self.model, batch, cache_params=cache_params)
+                        loss = self.hf_trainer.compute_loss(self.model_forward, batch, cache_params=cache_params)
                     loss_val = loss.item()
                     if use_memory_gate:
                         for scale_cache in cache_params.caches:
@@ -637,7 +822,7 @@ class KairosMultimodalPipeline:
                     if progress_callback is not None:
                         progress_callback(self.global_step, total_steps, loss_val)
 
-                    if tc.eval_every > 0 and self.global_step % tc.eval_every == 0:
+                    if eval_every_steps > 0 and self.global_step % eval_every_steps == 0:
                         eval_row = self.evaluate()
                         if eval_row is not None:
                             print(
@@ -665,7 +850,8 @@ class KairosMultimodalPipeline:
                         self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
 
             last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume
-            if tc.eval_every > 0:
+            # skip if the last step already triggered a periodic eval (avoids a duplicate)
+            if eval_every_steps > 0 and self.global_step % eval_every_steps != 0:
                 self.evaluate()  # final eval on the converged weights
         finally:
             self.skipped_nonfinite_steps = skipped_nonfinite
@@ -754,7 +940,10 @@ class KairosMultimodalPipeline:
     def run_config_dict(self) -> dict:
         """model/train/data config as a plain JSON-safe dict; the actual hyperparameters behind."""
         dc = asdict(self.data_config)
-        for key, count_attr in (("text_examples", "_text_examples_count"), ("multimodal_examples", "_multimodal_examples_count")):
+        for key, count_attr in (
+            ("text_examples", "_text_examples_count"),
+            ("multimodal_examples", "_multimodal_examples_count"),
+        ):
             if dc.get(key) is not None:
                 dc[key] = f"<{len(dc[key])} examples, omitted>"
             elif getattr(self.data_config, count_attr, None):

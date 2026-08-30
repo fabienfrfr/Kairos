@@ -88,6 +88,70 @@ def test_build_wires_mask_curriculum_config_to_trainer(tmp_path, model_config, t
     assert pipe.hf_trainer.mask_reweight is False
 
 
+def test_build_wires_self_conditioning_prob_to_trainer(tmp_path, model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"), self_conditioning_prob=0.75)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    assert pipe.hf_trainer.self_conditioning_prob == 0.75
+
+
+# --------------------------------------------------------------------- num_workers
+def test_num_workers_explicit_override_is_respected(model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8, num_workers=2)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 2
+
+
+def test_num_workers_zero_when_batch_size_is_one(model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=1)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 0
+
+
+def test_num_workers_default_caps_at_available_cpus(model_config, text_examples, monkeypatch):
+    """Regression: a flat default of 4 workers can stall/hang on a 1-2 core machine."""
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: 1)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 0  # cpu_count - 1 == 0: main process only, no forking
+
+
+def test_num_workers_default_never_exceeds_four_on_a_big_machine(model_config, text_examples, monkeypatch):
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: 64)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 4
+
+
+def test_num_workers_default_handles_cpu_count_none(model_config, text_examples, monkeypatch):
+    """os.cpu_count() can return None; must not crash and must stay conservative."""
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: None)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
+    assert pipe._num_workers == 0
+
+
+def test_build_loader_num_workers_matches_capped_value(tmp_path, model_config, text_examples, monkeypatch):
+    """End-to-end: the built DataLoader must use the capped value, not a flat 4."""
+    import kairos.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: 1)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    assert pipe.loader.num_workers == 0
+
+
 def test_training_converges_with_moe_enabled(tmp_path):
     # regression: use_moe=True used to NaN or block convergence; keep MoE small here
     model_config = KairosConfig(
@@ -150,7 +214,7 @@ def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
 
 
 def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
-    # full-width (d_model=768, matching the real KairosConfig) but trimmed batch/epochs/seq-len to stay fast in CI
+    # full-width (d_model=768) but trimmed batch/epochs/seq-len to stay fast in CI
     model_config = KairosConfig(d_model=768, n_heads=12, n_layers=2)
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog "}] * 4
     data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)
@@ -458,9 +522,7 @@ def test_train_zero_transition_epochs_jumps_straight_from_mae_to_diffusion(
     assert all(v == pytest.approx(1.0) for v in seen_p_max[steps_per_epoch:])
 
 
-def test_train_resume_mid_curriculum_recovers_correct_stage(
-    tmp_path, model_config, text_examples, multimodal_examples
-):
+def test_train_resume_mid_curriculum_recovers_correct_stage(tmp_path, model_config, text_examples, multimodal_examples):
     """Resuming from a checkpoint taken mid-curriculum must land in the right stage automatically
     — the stage is a pure function of the persisted global_step, not of which pipeline/stage
     object originally ran it (no separate pipe_mae/pipe objects or manual hand-off anymore)."""
@@ -686,6 +748,45 @@ def test_memory_report_before_build_raises():
         pipe.memory_report()
 
 
+def test_profile_returns_module_time_report(built_pipeline):
+    from kairos.utils import ModuleTimeReport
+
+    report = built_pipeline.profile(n_steps=2)
+
+    assert isinstance(report, ModuleTimeReport)
+    assert report.step_ms > 0
+    assert len(report.rows) > 0
+    assert all(r["self_ms"] >= 0 and r["calls"] >= 1 for r in report.rows)
+
+
+def test_profile_restores_model_and_optimizer_state(built_pipeline):
+    before_model = {k: v.clone() for k, v in built_pipeline.model.state_dict().items()}
+    before_optim = copy.deepcopy(built_pipeline.optimizer.state_dict())
+
+    built_pipeline.profile(n_steps=2)
+
+    after_model = built_pipeline.model.state_dict()
+    for key, val in before_model.items():
+        assert torch.equal(val, after_model[key]), f"param {key} changed after profile()"
+    after_optim = built_pipeline.optimizer.state_dict()
+    assert list(before_optim["state"].keys()) == list(after_optim["state"].keys())
+
+
+def test_profile_does_not_advance_global_step(built_pipeline):
+    step_before = built_pipeline.global_step
+    built_pipeline.profile(n_steps=2)
+    assert built_pipeline.global_step == step_before
+
+
+def test_profile_before_build_raises():
+    model_config = KairosConfig(d_model=16, n_heads=2, n_layers=2, num_modalities=8)
+    pipe = KairosMultimodalPipeline(
+        model_config, DataConfig(text_examples=[{"modality": "text", "text": "hi"}]), TrainConfig(run_dir="unused")
+    )
+    with pytest.raises(RuntimeError):
+        pipe.profile()
+
+
 def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pipeline):
     """summary(benchmark=True) should fold in the same kind of real measurement as
     memory_report() (regression test for the old behaviour: two separate deepcopy'd runs
@@ -695,7 +796,7 @@ def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pip
     assert summary.measured_memory is True
     assert summary.param_memory_mb > 0
     assert summary.optimizer_memory_mb > 0
-    # sanity: measured optimizer memory scales with trainable params (state is fp32 regardless of dtype)
+    # sanity: optimizer memory scales with trainable params (state is fp32 regardless of dtype)
     assert summary.optimizer_memory_mb > 0.5 * summary.param_memory_mb
 
 
@@ -840,6 +941,43 @@ def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text
 
     assert len(logs) > 0
     assert new_pipe.global_step != 999  # did not pick up the
+
+
+def test_train_calls_compute_loss_with_model_forward_not_bare_model(built_pipeline, monkeypatch):
+    """Regression: train() used to call compute_loss(self.model, ...) directly, skipping
+    self.model_forward (DataParallel-wrapped when n_gpus > 1), unlike every other method."""
+
+    # distinct proxy identity, so we can prove train() calls model_forward and not self.model
+    class _Proxy(torch.nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def forward(self, *args, **kwargs):
+            return self.wrapped(*args, **kwargs)
+
+        def __getattr__(self, name):
+            # fall back to the wrapped model so `model.lm_head` etc. still resolve
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.wrapped, name)
+
+    proxy = _Proxy(built_pipeline.model)
+    built_pipeline.model_forward = proxy
+
+    real_compute_loss = built_pipeline.hf_trainer.compute_loss
+    seen_models = []
+
+    def _spy_compute_loss(model, batch, **kw):
+        seen_models.append(model)
+        return real_compute_loss(model, batch, **kw)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _spy_compute_loss)
+    built_pipeline.train(resume=False)
+
+    assert seen_models  # at least one training step ran
+    assert all(m is built_pipeline.model_forward for m in seen_models)
 
 
 def test_train_skips_nonfinite_loss_batches(built_pipeline, monkeypatch):
@@ -1033,6 +1171,89 @@ def test_inspect_batch_ignores_padding_tail_in_repeat_run(built_pipeline):
     assert reports[0]["max_repeat_run"]["length"] < seq_len - real_len
 
 
+# ------------------------------------------------ control_alternation_report / plot_row
+def test_control_alternation_report_runs_without_control_content(built_pipeline):
+    report = built_pipeline.control_alternation_report()
+    assert report.n_rows_with_control == 0
+    assert report.mismatched_rows == []
+
+
+def test_control_alternation_report_finds_control_rows(tmp_path, model_config, text_examples, rng):
+    control_examples = [
+        make_example(
+            "control",
+            action=rng.uniform(-1, 1, 480).astype(np.float32),
+            state=rng.uniform(-1, 1, 480).astype(np.float32),
+            sample_rate=8000,
+        )
+        for _ in range(6)
+    ]
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=control_examples, max_len=100_000, batch_size=2
+    )
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    report = pipe.control_alternation_report(sample_size=len(pipe.loader.dataset.ds))
+
+    assert report.n_rows_with_control > 0
+    assert report.total_control_samples > 0
+    assert report.mismatched_rows == []  # max_len is huge, no window cuts a segment mid-byte
+
+
+def test_control_alternation_report_invalid_split_raises(built_pipeline):
+    with pytest.raises(ValueError, match="split"):
+        built_pipeline.control_alternation_report(split="bogus")
+
+
+def test_plot_row_runs_without_raising(built_pipeline, monkeypatch):
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless backend - no display in a test environment
+    built_pipeline.plot_row(row=0)  # must not raise
+
+
+def test_plot_row_invalid_split_raises(built_pipeline):
+    with pytest.raises(ValueError, match="split"):
+        built_pipeline.plot_row(row=0, split="bogus")
+
+
+def test_show_random_rows_runs_without_raising(built_pipeline):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    built_pipeline.show(n=2)  # must not raise
+
+
+def test_show_filters_by_modality(built_pipeline, capsys):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    built_pipeline.show(n=2, modality="image")
+    out = capsys.readouterr().out
+    assert "--- row" in out
+
+
+def test_show_reports_when_modality_absent(built_pipeline, capsys):
+    built_pipeline.show(n=2, modality="video")  # not in built_pipeline's fixtures
+    out = capsys.readouterr().out
+    assert "no rows with modality" in out
+
+
+def test_show_invalid_split_raises(built_pipeline):
+    with pytest.raises(ValueError, match="split"):
+        built_pipeline.show(n=2, split="bogus")
+
+
+def test_inspect_batch_df_matches_inspect_batch(built_pipeline):
+    reports = built_pipeline.inspect_batch(n=1)
+    df = built_pipeline.inspect_batch_df(n=1)
+    assert len(df) == len(reports)
+    assert list(df["row"]) == [r["row"] for r in reports]
+    assert "pad_frac" in df.columns
+
+
 def test_locate_nan_source_returns_none_before_any_skip(built_pipeline):
     assert built_pipeline.locate_nan_source() is None
 
@@ -1096,6 +1317,67 @@ def test_train_logs_periodic_eval_loss(tmp_path, model_config):
     assert pipe.eval_log_rows[-1]["step"] == pipe.global_step
 
 
+# --------------------------------------------------------- fractional-epoch eval cadence
+def test_eval_every_epochs_default_runs_seven_times_over_full_curriculum(tmp_path, model_config):
+    """Default cadence: eval at step 0, then every 0.5 epoch. mae+transition+diffusion=3
+    epochs by default -> 6 periodic evals + 1 at start = 7."""
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 8
+    eval_texts = [{"modality": "text", "text": "a different held-out sentence"}] * 4
+    data_config = DataConfig(text_examples=texts, max_len=32, batch_size=2)  # 4 steps/epoch
+    eval_data_config = DataConfig(text_examples=eval_texts, max_len=32, batch_size=2)
+    train_config = TrainConfig(save_every=1000, eval_batches=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+    steps_per_epoch = len(pipe.loader)  # dataset chunking may yield more steps than raw examples
+
+    pipe.train(resume=False)
+
+    eval_every_steps = round(0.5 * steps_per_epoch)
+    assert len(pipe.eval_log_rows) == 7
+    assert [row["step"] for row in pipe.eval_log_rows] == [i * eval_every_steps for i in range(7)]
+
+
+def test_eval_at_start_runs_before_the_first_training_step(tmp_path, model_config, text_examples):
+    eval_data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, save_every=1000, eval_every_epochs=None, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+
+    pipe.train(resume=False)
+
+    assert pipe.eval_log_rows[0]["step"] == 0
+
+
+def test_eval_at_start_false_skips_the_initial_eval(tmp_path, model_config, text_examples):
+    eval_data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1, save_every=1000, eval_every_epochs=None, eval_at_start=False, run_dir=str(tmp_path / "run")
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+
+    pipe.train(resume=False)
+
+    assert pipe.eval_log_rows == []  # no start eval, and no periodic cadence configured
+
+
+def test_eval_every_steps_overrides_eval_every_epochs(tmp_path, model_config, text_examples):
+    """An explicit eval_every (steps) must win over the eval_every_epochs default."""
+    eval_data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1, save_every=1000, eval_every=1, eval_at_start=False, run_dir=str(tmp_path / "run")
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config, eval_data_config=eval_data_config)
+    pipe.build()
+
+    pipe.train(resume=False)
+
+    assert [row["step"] for row in pipe.eval_log_rows] == list(range(1, pipe.global_step + 1))
+
+
 def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config):
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
@@ -1124,8 +1406,14 @@ def test_overfit_test_default_walks_all_three_active_stages(tmp_path, model_conf
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
     train_config = TrainConfig(
-        mae_epochs=1, transition_epochs=1, diffusion_epochs=1, run_dir=str(tmp_path / "run"),
-        mask_mae_p_max=0.3, mask_mae_reweight=False, mask_p_max=1.0, mask_reweight=True,
+        mae_epochs=1,
+        transition_epochs=1,
+        diffusion_epochs=1,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_mae_reweight=False,
+        mask_p_max=1.0,
+        mask_reweight=True,
     )
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
@@ -1151,8 +1439,12 @@ def test_overfit_test_default_skips_stages_with_zero_epochs(tmp_path, model_conf
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
     train_config = TrainConfig(
-        mae_epochs=1, transition_epochs=0, diffusion_epochs=0, run_dir=str(tmp_path / "run"),
-        mask_mae_p_max=0.3, mask_mae_reweight=False,
+        mae_epochs=1,
+        transition_epochs=0,
+        diffusion_epochs=0,
+        run_dir=str(tmp_path / "run"),
+        mask_mae_p_max=0.3,
+        mask_mae_reweight=False,
     )
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
@@ -1225,3 +1517,11 @@ def test_train_does_not_step_optimizer_on_nonfinite_loss(built_pipeline, monkeyp
     after = built_pipeline.model.state_dict()
     for key, val in before.items():
         assert torch.equal(val, after[key]), f"param {key} changed despite every batch being non-finite"
+
+
+def test_preview_tokenized_runs_without_raising(built_pipeline, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setattr(plt, "show", lambda: None)
+    built_pipeline.preview_tokenized(n=3, split="train")
+    built_pipeline.preview_tokenized(n=2, modality="control", split="train")

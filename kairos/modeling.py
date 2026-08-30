@@ -53,7 +53,7 @@ class KairosConfig(PretrainedConfig):
         self.sliding_window_size = self.window_size = window_size
         self.vocab_size = vocab_size
 
-        self.num_modalities = kwargs.get("num_modalities", 8)
+        self.num_modalities = kwargs.get("num_modalities", 9)
         self.text_modality_id = kwargs.get("text_modality_id", 0)
         self.num_scales = kwargs.get("num_scales", 4)
         self.codec_mode = kwargs.get("codec_mode", "conv")
@@ -62,13 +62,11 @@ class KairosConfig(PretrainedConfig):
         self.predict_octet_family = kwargs.get("predict_octet_family", True)
         self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
-        # each default scale list is clipped to actually-existing scale indices (< num_scales)
+        # id 0 (text) stays finest; higher ids default to coarser scales, never scale 0 alone
         def _clip(scales):
-            return [s for s in scales if s < self.num_scales] or [0]
+            return sorted({s for s in scales if 0 <= s < self.num_scales}) or [self.num_scales - 1]
 
-        default_scales = {0: _clip([0, 1]), 1: _clip([1, 2]), 2: _clip([2, 3])}
-        for m in range(self.num_modalities):
-            default_scales.setdefault(m, [0])
+        default_scales = {m: _clip([m, m + 1]) for m in range(self.num_modalities)}
         self.modality_scales = kwargs.get("modality_scales", default_scales)
 
         self.stride = stride
@@ -445,12 +443,8 @@ class PyramidalCodec(nn.Module):
 
     def _init_patch(self, d_model):
         """Linear(patch*d_model, d_model) per scale; decode reuses the same weight, transposed."""
-        self.encode_lin = nn.ModuleList(
-            nn.Linear(patch * d_model, d_model) for patch in self.patch_sizes
-        )
-        self.decode_b = nn.ParameterList(
-            nn.Parameter(torch.zeros(patch * d_model)) for patch in self.patch_sizes
-        )
+        self.encode_lin = nn.ModuleList(nn.Linear(patch * d_model, d_model) for patch in self.patch_sizes)
+        self.decode_b = nn.ParameterList(nn.Parameter(torch.zeros(patch * d_model)) for patch in self.patch_sizes)
 
     def _make_bottleneck_mixer(self, d_model):
         """Rank-r channel mixer: full mixing at O(2rd) not O(d^2); GELU keeps a real bottleneck."""
@@ -462,7 +456,8 @@ class PyramidalCodec(nn.Module):
         )
 
     def _init_conv(self, d_model):
-        """Depthwise conv encoder + bottleneck mixer; decoder mirrors this."""
+        """Depthwise conv encoder/decoder; one shared pre-mixer feeds context to every scale."""
+        self.pre_mixer = self._make_bottleneck_mixer(d_model)
         self.encoders = nn.ModuleList()
         self.mixers = nn.ModuleList()
         self.decoders = nn.ModuleList()
@@ -501,12 +496,12 @@ class PyramidalCodec(nn.Module):
 
     def _encode_conv(self, x, length):
         scales = []
+        h_pre = self.pre_mixer(x.transpose(1, 2))  # (B,D,L) cross-channel context, computed once
         for patch, encoder, mixer in zip(self.patch_sizes, self.encoders, self.mixers):
-            padded = self._pad_to_multiple(x, patch)
-            h = padded.transpose(1, 2)        # (B,D,L)
-            h = encoder(h)                     # (B,D,G)
-            h = mixer(h)                       # (B,D,G)
-            scales.append(h.transpose(1, 2))   # (B,G,D)
+            h = self._pad_to_multiple(h_pre.transpose(1, 2), patch).transpose(1, 2)  # (B,D,L')
+            h = encoder(h)  # (B,D,G)
+            h = mixer(h)  # (B,D,G)
+            scales.append(h.transpose(1, 2))  # (B,G,D)
         return CodecOutput(scales=scales, length=length)
 
     def decode(self, encoded):
@@ -531,10 +526,10 @@ class PyramidalCodec(nn.Module):
 
     def _decode_conv(self, encoded, length):
         reconstructed = []
-        for scale, decoder, mixer, patch in zip(encoded.scales, self.decoders, self.decode_mixers, self.patch_sizes):
-            h = scale.transpose(1, 2)   # (B,D,G)
-            h = decoder(h)              # (B,D,G*patch) — depthwise, expands the length dim only
-            h = mixer(h)                # (B,D,L) — bottleneck mixer, O(2*r*d) not O(d^2)
+        for scale, decoder, mixer in zip(encoded.scales, self.decoders, self.decode_mixers):
+            h = scale.transpose(1, 2)  # (B,D,G)
+            h = decoder(h)  # (B,D,G*patch) — depthwise, expands the length dim only
+            h = mixer(h)  # (B,D,L) — bottleneck mixer, O(2*r*d) not O(d^2)
             reconstructed.append(h.transpose(1, 2)[:, :length])  # (B,L,D)
         h = torch.cat(reconstructed, dim=-1)
         h = self.norm(h)
@@ -566,9 +561,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         if num_octet_families is None:
             num_octet_families = config.num_octet_families
         n_octet = num_octet_families if config.predict_octet_family else 0
-        self.embedding = KairosEmbedding(
-            vocab_size=vocab_size, d_model=config.hidden_size, num_octet_families=n_octet
-        )
+        self.embedding = KairosEmbedding(vocab_size=vocab_size, d_model=config.hidden_size, num_octet_families=n_octet)
         share = getattr(config, "share_backbones", False)
         if share:
             shared = KairosDiffusionBackbone(config=config, use_moe=use_moe)

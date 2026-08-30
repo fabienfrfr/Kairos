@@ -34,7 +34,7 @@ def _():
 
 @app.cell
 def _():
-    # --force-reinstall required since pip skips reinstalling an unchanged version
+    # --force-reinstall required since pip skips reinstalling an unchanged version.
     # !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
     return
 
@@ -42,7 +42,6 @@ def _():
 @app.cell
 def _():
     import os
-    import random
     from pathlib import Path
 
     # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
@@ -55,6 +54,12 @@ def _():
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
     from kairos.utils import make_progress_callback
+    from kairos.dataset import (
+        diagnose_raw_control_balance,
+        modality_counts,
+        split_examples,
+        preview_multimodal_examples,
+    )
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
@@ -68,9 +73,12 @@ def _():
         Modality,
         Path,
         TrainConfig,
+        diagnose_raw_control_balance,
         make_progress_callback,
+        modality_counts,
         pd,
-        random,
+        preview_multimodal_examples,
+        split_examples,
         tokenizer,
         torch,
     )
@@ -146,10 +154,11 @@ def _(TEXT_PCT, TEXT_SOURCE):
 
 
 @app.cell
-def _(multimodal_examples, pd, text_examples):
+def _(modality_counts, multimodal_examples, text_examples):
     _all_ex = list(text_examples) + list(multimodal_examples)
     print(f"total examples: {len(_all_ex)}")
-    print(pd.Series([ex["modality"] for ex in _all_ex]).value_counts())
+    for _modality, _count in modality_counts(_all_ex).items():
+        print(f"  {_modality:<16} {_count}")
     return
 
 
@@ -160,76 +169,29 @@ def _():
 
 
 @app.cell
-def _(SHOW_PREVIEW, multimodal_examples):
+def _(SHOW_PREVIEW, diagnose_raw_control_balance, multimodal_examples):
+    # source-data sanity check, before tokenization: raw control state/action counts must match.
     if SHOW_PREVIEW and multimodal_examples:
-        import json as _json
+        _raw_report = diagnose_raw_control_balance(multimodal_examples)
+        print(_raw_report)
+        if _raw_report.n_control_examples and _raw_report.mismatched_examples:
+            print("\n^ mismatch found in the SOURCE data itself, before tokenization")
+    return
 
-        import matplotlib.pyplot as plt
-        import numpy as np
 
-        from kairos.dataset import unpack_multimodal_data
-
-        _by_modality: dict[str, list] = {}
-        for _ex in multimodal_examples:
-            _by_modality.setdefault(_ex["modality"], []).append(_ex)
-
-        for _mod, _rows in _by_modality.items():
-            print(f"--- {_mod} ({len(_rows)} examples) ---")
-            _sample = np.random.default_rng(0).choice(len(_rows), size=min(3, len(_rows)), replace=False)
-            for _i in _sample:
-                _row = _rows[_i]
-                _arrays = unpack_multimodal_data(_row["data"])
-                _caption = (_row.get("caption") or "")[:80]
-                _meta = _json.loads(_row["meta"]) if _row.get("meta") else {}
-                print(f"  caption: {_caption!r}  meta: {_meta}")
-
-                if _mod == "image_caption":
-                    plt.figure(figsize=(2, 2))
-                    plt.imshow(_arrays["image"])
-                    plt.axis("off")
-                    plt.show()
-                elif _mod == "audio_caption":
-                    plt.figure(figsize=(3, 1))
-                    plt.plot(_arrays["audio"], linewidth=0.5)
-                    plt.axis("off")
-                    plt.show()
-                elif _mod == "video_caption":
-                    _video = _arrays["video"]
-                    _n = min(4, _video.shape[0])
-                    _fig, _axes = plt.subplots(1, _n, figsize=(_n * 1.2, 1.2))
-                    for _j, _ax in enumerate(_axes if _n > 1 else [_axes]):
-                        _ax.imshow(_video[_j])
-                        _ax.axis("off")
-                    plt.show()
-                elif _mod == "lidar":
-                    _points = np.asarray(_arrays["points"], dtype=np.float32)
-                    _fig = plt.figure(figsize=(2.5, 2.5))
-                    _ax = _fig.add_subplot(projection="3d") if _points.shape[1] >= 3 else _fig.add_subplot()
-                    if _points.shape[1] >= 3:
-                        _ax.scatter(_points[:, 0], _points[:, 1], _points[:, 2], s=1)
-                    else:
-                        _ax.scatter(_points[:, 0], _points[:, 1], s=1)
-                    plt.show()
-                elif _mod == "control":
-                    plt.figure(figsize=(3, 1.2))
-                    plt.plot(_arrays["state"], label="state")
-                    plt.plot(_arrays["action"], label="action")
-                    plt.legend(fontsize=6)
-                    plt.show()
+@app.cell
+def _(SHOW_PREVIEW, multimodal_examples, preview_multimodal_examples):
+    if SHOW_PREVIEW and multimodal_examples:
+        preview_multimodal_examples(multimodal_examples, n=3)
     else:
         print("preview skipped")
     return
 
 
 @app.cell
-def _(EVAL_PCT, multimodal_examples, random, text_examples):
+def _(EVAL_PCT, multimodal_examples, split_examples, text_examples):
     _all_ex = list(text_examples) + list(multimodal_examples)
-    _rng = random.Random(0)
-    _shuffled = _all_ex.copy()
-    _rng.shuffle(_shuffled)
-    _n_eval = int(len(_shuffled) * EVAL_PCT / 100)
-    eval_examples = _shuffled[:_n_eval]
-    train_examples = _shuffled[_n_eval:]
+    train_examples, eval_examples = split_examples(_all_ex, eval_pct=EVAL_PCT, seed=0)
     print(f"train: {len(train_examples)} ({100 - EVAL_PCT}%)  eval: {len(eval_examples)} ({EVAL_PCT}%)")
     return eval_examples, train_examples
 
@@ -270,11 +232,10 @@ def _():
 
 @app.cell
 def _(Modality):
-    # scale 0: finest temporal res (text,
+    # scale 0: finest temporal res (text, control); scale 3: coarsest (meta)
     modality_scales = {
         int(Modality.TEXT): [0, 1],
-        int(Modality.STATE): [0],
-        int(Modality.ACTION): [0],
+        int(Modality.CONTROL): [0],  # paired or observation-only (<OBS>); fuses old STATE/ACTION/imu
         int(Modality.IMAGE): [1, 2],
         int(Modality.LIDAR): [1],
         int(Modality.AUDIO): [2],
@@ -282,6 +243,20 @@ def _(Modality):
         int(Modality.META): [3],
     }
     return (modality_scales,)
+
+
+@app.cell
+def _():
+    # per-modality encode_* scale_factor override; None uses the tokenizer's class default
+    modality_scale_factors = {
+        "audio_caption": None,  # None -> KairosTokenizer.PCM_SCALE_FACTOR default (4)
+        "control": None,
+        "imu": None,
+        "image_caption": None,  # None -> KairosTokenizer.IMAGE_SCALE_FACTOR default (1, no-op)
+        "video_caption": None,
+        "lidar": None,  # None -> KairosTokenizer.LIDAR_SCALE_FACTOR default (1, no-op)
+    }
+    return (modality_scale_factors,)
 
 
 @app.cell
@@ -311,7 +286,7 @@ def _(
         n_layers=CFG_N_LAYERS,
         stride=CFG_STRIDE,
         vocab_size=len(tokenizer),
-        num_modalities=8,
+        num_modalities=9,
         num_scales=CFG_NUM_SCALES,
         modality_scales=modality_scales,
         intermediate_size=CFG_INTERMEDIATE,
@@ -326,7 +301,9 @@ def _(
         share_backbones=CFG_SHARE_BACKBONES,
         codec_mode=CFG_CODEC_MODE,
     )
-    print(f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE}")
+    print(
+        f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE}"
+    )
     return (model_config,)
 
 
@@ -340,15 +317,14 @@ def _():
     TRAIN_SAVE_EVERY = 200
     TRAIN_MASK_EPS = 1e-3  # floor of masked-diffusion rate p; lower -> harder to overfit fast
 
-    # ---- single-pipeline MAE -> transition -> diffusion curriculum: one train() call runs all
-    # three stages; set an *_EPOCHS to 0 to skip. TrainConfig defaults to (1, 1, 1) if unset.
-    TRAIN_MAE_EPOCHS = 5  # was 1, too few steps past random-init loss (codec bottleneck fixed)
+    # single-pipeline MAE -> transition -> diffusion curriculum; set an *_EPOCHS to 0 to skip.
+    TRAIN_MAE_EPOCHS = 1
     TRAIN_MAE_P_MAX = 0.3  # MAE stage ceiling on p: fixed-ish low corruption, stable to optimize
     TRAIN_MAE_REWEIGHT = False  # plain CE in MAE stage: no 1/p variance blowup
 
-    TRAIN_TRANSITION_EPOCHS = 2  # ramps masking rate + reweighting from MAE to diffusion values
+    TRAIN_TRANSITION_EPOCHS = 1  # ramps masking rate + reweighting from MAE to diffusion values
 
-    TRAIN_DIFFUSION_EPOCHS = 5  # was 3, same reasoning as TRAIN_MAE_EPOCHS
+    TRAIN_DIFFUSION_EPOCHS = 1
     TRAIN_MASK_P_MAX = 1.0  # diffusion stage ceiling on p: full diffusion, up to 100% noised
     TRAIN_MASK_REWEIGHT = True  # diffusion stage: divide CE by p (standard ELBO weighting)
 
@@ -416,6 +392,7 @@ def _(
     TRAIN_TRANSITION_EPOCHS,
     TrainConfig,
     eval_examples,
+    modality_scale_factors,
     train_examples,
 ):
     data_config = DataConfig(
@@ -425,6 +402,7 @@ def _(
         stride=TRAIN_STRIDE,
         batch_size=TRAIN_BATCH,
         pack=TRAIN_PACK,
+        modality_scale_factors=modality_scale_factors,
     )
     eval_data_config = DataConfig(
         text_examples=[],
@@ -434,6 +412,7 @@ def _(
         batch_size=TRAIN_BATCH,
         shuffle=False,
         drop_last=False,
+        modality_scale_factors=modality_scale_factors,
     )
     # single TrainConfig for the whole MAE -> transition -> diffusion curriculum (one pipeline)
     train_config = TrainConfig(
@@ -509,24 +488,29 @@ def _(RUN_BENCHMARK, pipe):
 
 
 @app.cell
-def _(pd, pipe):
+def _(RUN_BENCHMARK, pipe):
+    # per-module wall-clock time (self-time, excludes children); shows where compute actually goes
+    if RUN_BENCHMARK:
+        print(pipe.profile(n_steps=3))
+    return
+
+
+@app.cell
+def _(RUN_BENCHMARK, pipe):
+    # per-modality raw-vs-tokenized breakdown: where dataset rows/steps actually come from
+    if RUN_BENCHMARK:
+        print(pipe.data_report(split="train"))
+        if pipe.eval_data_config is not None:
+            print()
+            print(pipe.data_report(split="eval"))
+    return
+
+
+@app.cell
+def _(pipe):
     # visualize the tokenized input as fed to the model, post-collation
     _reports = pipe.inspect_batch(n=1)
-    _table = pd.DataFrame(
-        [
-            {
-                "row": r["row"],
-                "modality_counts": r["modality_counts"],
-                "token_id_range": r["token_id_range"],
-                "top_token_ids": r["top_token_ids"],  # [(id, count), ...] - most
-                "max_repeat_run": r["max_repeat_run"],  # longest run of one id
-                "out_of_bounds_tokens": len(r["out_of_bounds"]["token_ids"]),
-                "out_of_bounds_modality": len(r["out_of_bounds"]["modality_ids"]),
-                "pad_frac": round(r["pad_frac"], 3) if r["pad_frac"] is not None else None,
-            }
-            for r in _reports
-        ]
-    )
+    _table = pipe.inspect_batch_df(n=1)
     n_oob = _table["out_of_bounds_tokens"].sum() + _table["out_of_bounds_modality"].sum()
     if n_oob:
         print(f"WARNING: {n_oob} out-of-bounds ids found in this batch - inspect before training")
@@ -538,6 +522,31 @@ def _(pd, pipe):
     # raw numeric view of the first
     print("\nrow 0 input_ids  :", _reports[0]["input_ids"])
     print("row 0 modality_ids:", _reports[0]["modality_ids"])
+    return
+
+
+@app.cell
+def _(RUN_BENCHMARK, pipe):
+    # localizes a STATE/ACTION token imbalance to specific rows (not just an aggregate %)
+    report = None
+    if RUN_BENCHMARK:
+        report = pipe.control_alternation_report(split="train")
+        print(report)
+        if pipe.eval_data_config is not None:
+            print()
+            print(pipe.control_alternation_report(split="eval"))
+    return (report,)
+
+
+@app.cell
+def _(RUN_BENCHMARK, pipe, report):
+    # visually reconstruct real tokenized rows; preview_tokenized: one row per modality present.
+    if RUN_BENCHMARK and report is not None and report.mismatched_rows:
+        pipe.plot_row(row=report.mismatched_rows[0]["row"], split="train")
+        pipe.preview_tokenized(split="train")
+    elif RUN_BENCHMARK:
+        pipe.show(n=3, split="train")  # a few random rows, any modality
+        pipe.preview_tokenized(split="train")  # one row per modality, CONTROL state/action overlaid
     return
 
 
@@ -558,11 +567,15 @@ def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, 
                 overfit_logs = pipe.overfit_test(
                     n_examples=OVERFIT_EXAMPLES,
                     steps=OVERFIT_STEPS,
-                    progress_callback=lambda step, total, loss_val: _bar.update(increment=1, subtitle=f"loss={loss_val:.4f}"),
+                    progress_callback=lambda step, total, loss_val: _bar.update(
+                        increment=1, subtitle=f"loss={loss_val:.4f}"
+                    ),
                 )
         else:
             overfit_logs = pipe.overfit_test(
-                n_examples=OVERFIT_EXAMPLES, steps=OVERFIT_STEPS, progress_callback=make_progress_callback(desc="overfit_test")
+                n_examples=OVERFIT_EXAMPLES,
+                steps=OVERFIT_STEPS,
+                progress_callback=make_progress_callback(desc="overfit_test"),
             )
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
@@ -574,7 +587,6 @@ def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, 
 def _():
     FORCE_RESTART = True  # True = restart from scratch, False = resume, landing in the right stage
     return (FORCE_RESTART,)
-
 
 
 @app.cell

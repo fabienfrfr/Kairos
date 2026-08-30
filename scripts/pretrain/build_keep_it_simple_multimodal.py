@@ -29,6 +29,9 @@ N_PER_SOURCE = {
 }
 IMAGE_SIZE = 32
 AUDIO_SECONDS = 1.0
+# safety cap only (real control clips are ~0.06s = a single state/action transition);
+# guards against one corrupted/outlier row blowing up the document size.
+CONTROL_MAX_SECONDS = 2.0
 AUDIO_SAMPLE_RATE = 8000
 VIDEO_FRAMES = 6
 VIDEO_SIZE = 16
@@ -475,8 +478,6 @@ def build_control():
     ds = load_dataset("ffurfaro/PixelBytes-OptimalControl", split="train", streaming=True)
     ds = ds.cast_column("audio", Audio(decode=False))
 
-    out_samples = int(AUDIO_SECONDS * AUDIO_SAMPLE_RATE)
-
     def process(row):
         audio = row.get("audio")
         if audio is None or not audio.get("bytes"):
@@ -487,8 +488,14 @@ def build_control():
             return None
         if arr.shape[0] != 2 or arr.shape[1] < 2:
             return None
-        state, state_peak = _peak_normalize(_time_stretch_to_fixed_length(arr[1], out_samples))
-        action, action_peak = _peak_normalize(_time_stretch_to_fixed_length(arr[0], out_samples))
+        max_samples = int(CONTROL_MAX_SECONDS * AUDIO_SAMPLE_RATE)
+        if arr.shape[1] > max_samples:  # only ever hits corrupted/outlier rows
+            arr = arr[:, :max_samples]
+        # clips are ~0.06s: one atomic (state, action) transition, not a trajectory to chunk
+        # into ticks - keep the natural length as-is (both channels share one decode, so
+        # they're already equal length) instead of stretching/padding to an arbitrary duration.
+        state, state_peak = _peak_normalize(arr[1])
+        action, action_peak = _peak_normalize(arr[0])
         # stereo layout: channel 0 = action, channel 1 = state
         return make_row(
             "control",

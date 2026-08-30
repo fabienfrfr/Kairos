@@ -264,6 +264,81 @@ def test_trainer_mask_p_max_and_reweight_default_to_full_diffusion(dense_model):
     assert trainer.mask_reweight is True
 
 
+# ----------------------------------------------------------------- self-conditioning
+def test_compute_masked_diffusion_losses_self_conditioning_prob_zero_never_calls_model_twice(dense_model, monkeypatch):
+    """self_conditioning_prob=0.0 (old, pre-fix behavior) must never trigger the warm-up pass."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=1.0, dtype=torch.float)
+
+    calls = []
+    real_forward = dense_model.forward
+
+    def counting_forward(*args, **kwargs):
+        calls.append(kwargs.get("self_conditioning_logits"))
+        return real_forward(*args, **kwargs)
+
+    monkeypatch.setattr(dense_model, "forward", counting_forward)
+    compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, self_conditioning_prob=0.0)
+
+    assert len(calls) == 1
+    assert calls[0] is None
+
+
+def test_compute_masked_diffusion_losses_self_conditioning_prob_one_always_feeds_warmup_estimate(
+    dense_model, monkeypatch
+):
+    """self_conditioning_prob=1.0 must run a no-grad warm-up pass, then feed its detached logits
+    back in on the real, gradient-tracked pass - matching generate()'s inference-time usage."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=1.0, dtype=torch.float)
+
+    calls = []
+    real_forward = dense_model.forward
+
+    def counting_forward(*args, **kwargs):
+        calls.append(kwargs.get("self_conditioning_logits"))
+        return real_forward(*args, **kwargs)
+
+    monkeypatch.setattr(dense_model, "forward", counting_forward)
+    compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, self_conditioning_prob=1.0)
+
+    assert len(calls) == 2
+    assert calls[0] is None  # warm-up pass: no self-conditioning input yet
+    self_cond = calls[1]
+    assert self_cond is not None
+    assert self_cond.shape == (*x0.shape, dense_model.lm_head.vocab_size)
+    assert self_cond.requires_grad is False  # detached, or grads leak through the warm-up pass
+    assert not torch.equal(self_cond[noise_mask], torch.zeros_like(self_cond[noise_mask]))  # filled
+    assert torch.equal(self_cond[~noise_mask], torch.zeros_like(self_cond[~noise_mask]))  # untouched
+
+
+def test_compute_masked_diffusion_losses_self_conditioning_does_not_break_backward(dense_model):
+    """The real (second) forward pass must still be fully differentiable end-to-end."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=1.0, dtype=torch.float)
+
+    per_token_loss, *_ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, self_conditioning_prob=1.0)
+    per_token_loss.mean().backward()
+
+    grad_norms = [p.grad.norm().item() for p in dense_model.parameters() if p.grad is not None]
+    assert grad_norms and all(g == g for g in grad_norms)  # non-empty, no NaNs
+
+
+def test_trainer_self_conditioning_prob_defaults_to_nonzero(dense_model):
+    """Regression guard: if this drifts to 0.0, generate()'s self-conditioning input becomes OOD."""
+    trainer = KairosDiffusionTrainer(model=dense_model)
+    assert trainer.self_conditioning_prob > 0.0
+
+
 # ----------------------------------------------------------- MAE/transition/diffusion curriculum
 def test_anneal_mask_schedule_zero_steps_returns_end_immediately():
     """anneal_steps<=0 must reproduce the original hard-switch behaviour exactly."""
@@ -288,8 +363,13 @@ def test_anneal_mask_schedule_handles_decreasing_ramp():
 
 def test_stage_mask_schedule_flat_during_mae_phase():
     p_max, reweight = stage_mask_schedule(
-        global_step=0, mae_steps=100, transition_steps=50, mae_p_max=0.3, mae_reweight=False,
-        target_p_max=1.0, target_reweight=True,
+        global_step=0,
+        mae_steps=100,
+        transition_steps=50,
+        mae_p_max=0.3,
+        mae_reweight=False,
+        target_p_max=1.0,
+        target_reweight=True,
     )
     assert p_max == 0.3
     assert reweight == 0.0

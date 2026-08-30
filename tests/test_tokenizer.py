@@ -37,10 +37,15 @@ def sample_lidar():
     return pts
 
 
+@pytest.fixture
+def rng():
+    return np.random.default_rng(0)
+
+
 # ========================= Vocab / backward compatibility =========================
-def test_vocab_size_is_291(tokenizer):
-    """Regression: 259 base bytes/specials + 30 modality/channel/structural tags == 289 (+SEP+MASK=291)."""
-    assert len(tokenizer) == 291
+def test_vocab_size_is_290(tokenizer):
+    """259 base + 31 modality/channel/structural tags (CONTROL fused, +OBS -STATE -ACTION)."""
+    assert len(tokenizer) == 290
 
 
 def test_no_native_bos(tokenizer):
@@ -91,17 +96,27 @@ def test_signal_roundtrip_precision_beats_8bit(tokenizer):
     # 16-bit place-value quantization must resolve a step far finer than the old 8-bit scheme
     rng = np.random.default_rng(0)
     values = rng.uniform(-1, 1, 200).astype(np.float32)
-    markers = KairosTokenizer.encode_signal(values, family="ACT")
+    markers = KairosTokenizer.encode_signal(values, family="ACT", scale_factor=1)
     ids, _ = tokenizer._resolve_markers(markers)
     recon = tokenizer.decode_signal(ids)
     assert np.max(np.abs(recon - values)) < (2 / 255)  # much tighter than the old 8-bit step
 
 
+def test_encode_signal_ticks_matches_flattened_encode_signal(tokenizer):
+    rng = np.random.default_rng(0)
+    values = rng.uniform(-1, 1, 30_000).astype(np.float32)
+    ticks = KairosTokenizer.encode_signal_ticks(values, family="STA", tick_samples=8000, scale_factor=1)
+    flat = KairosTokenizer.encode_signal(values, family="STA", tick_samples=8000, scale_factor=1)
+    assert len(ticks) > 1  # multiple ticks given a signal longer than tick_samples
+    joined = [m for tick in ticks for m in tick]
+    assert joined == flat  # concatenating ticks must reproduce the flat encoding exactly
+
+
 def test_signal_and_audio_share_the_small_value_vocab_but_not_family(tokenizer):
     # values are shared (that's the point - small vocab); family is what disambiguates them
     values = np.zeros(4, dtype=np.float32)
-    signal_ids, signal_families = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values, family="ACT"))
-    audio_ids, audio_families = tokenizer._resolve_markers(KairosTokenizer.encode_audio(values))
+    _, signal_families = tokenizer._resolve_markers(KairosTokenizer.encode_signal(values, family="ACT"))
+    _, audio_families = tokenizer._resolve_markers(KairosTokenizer.encode_audio(values))
     byte_signal_families = [f for f in signal_families if f != 0]
     byte_audio_families = [f for f in audio_families if f != 0]
     assert set(byte_signal_families).isdisjoint(byte_audio_families)
@@ -139,6 +154,16 @@ def test_image_roundtrip(tokenizer, sample_image):
     decoded = tokenizer.decode_multimodal(out["input_ids"])
     recon = tokenizer.decode_image(decoded[0].data)
     assert np.array_equal(recon, sample_image)
+
+
+def test_image_scale_factor_downsamples_hw(tokenizer, sample_image):
+    """scale_factor=2 block-means H,W down (with edge padding for odd dims), C untouched."""
+    markers = KairosTokenizer.encode_image(sample_image, scale_factor=2)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon = tokenizer.decode_image(decoded[0].data)
+    h, w, c = sample_image.shape
+    assert recon.shape == (-(-h // 2), -(-w // 2), c)
 
 
 def test_image_endline_every_row(tokenizer, sample_image):
@@ -203,22 +228,39 @@ def test_video_rejects_inconsistent_frame_shapes(tokenizer):
 
 
 # ========================= AUDIO: periodic <TICK>, duration from tick =========================
-def test_audio_roundtrip_and_duration(tokenizer, sample_audio):
+def test_audio_decimated_by_pcm_scale_factor(tokenizer, sample_audio):
+    """encode_audio block-means every PCM_SCALE_FACTOR raw samples into 1 by default."""
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
     decoded = tokenizer.decode_multimodal(out["input_ids"])
-    recon, duration = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
-    assert len(recon) == len(sample_audio)
-    assert duration == pytest.approx(len(sample_audio) / KairosTokenizer.AUDIO_SAMPLE_RATE)
+    recon, _ = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
+    factor = KairosTokenizer.PCM_SCALE_FACTOR
+    expected = sample_audio.reshape(-1, factor).mean(axis=1).astype(np.float32)
+    assert len(recon) == len(expected) == len(sample_audio) // factor
     max_step = 2 / (256**2 - 1)  # 16-bit place-value quantization over [-1, 1]
-    assert np.max(np.abs(recon - sample_audio)) < max_step + 1e-6
+    assert np.max(np.abs(recon - expected)) < max_step + 1e-6
+
+
+def test_audio_scale_factor_one_disables_decimation(tokenizer):
+    """scale_factor=1 is a no-op: bit-exact roundtrip, same as before decimation was added."""
+    rng = np.random.default_rng(1)
+    short_audio = rng.uniform(-1, 1, 512).astype(np.float32)
+    markers = KairosTokenizer.encode_audio(short_audio, tick_samples=16_000, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon, duration = tokenizer.decode_audio(decoded[0].data, tick_samples=16_000)
+    assert len(recon) == len(short_audio)
+    assert duration == pytest.approx(len(short_audio) / KairosTokenizer.AUDIO_SAMPLE_RATE)
+    max_step = 2 / (256**2 - 1)
+    assert np.max(np.abs(recon - short_audio)) < max_step + 1e-6
 
 
 def test_audio_tick_count(tokenizer, sample_audio):
     markers = KairosTokenizer.encode_audio(sample_audio, tick_samples=16_000)
     ids, _ = tokenizer._resolve_markers(markers)
     num_ticks = sum(1 for tid in ids if tid == tokenizer._tick_id)
-    assert num_ticks == -(-len(sample_audio) // 16_000)  # ceil division
+    decimated_len = len(sample_audio) // KairosTokenizer.PCM_SCALE_FACTOR
+    assert num_ticks == -(-decimated_len // 16_000)  # ceil division
 
 
 # ======================= LIDAR: <PTSEP>, fixed quantization bounds ========================
@@ -232,6 +274,14 @@ def test_lidar_roundtrip_within_fixed_range_precision(tokenizer, sample_lidar):
     xyz_lo, xyz_hi = KairosTokenizer.LIDAR_XYZ_RANGE
     max_step = (xyz_hi - xyz_lo) / (256**2 - 1)  # 16-bit place-value quantization
     assert np.max(np.abs(recon[:, :3] - sample_lidar[:, :3])) <= max_step + 1e-3
+
+
+def test_lidar_scale_factor_keeps_every_nth_point(tokenizer, sample_lidar):
+    markers = KairosTokenizer.encode_lidar(sample_lidar, scale_factor=3)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.LIDAR, markers)])
+    decoded = tokenizer.decode_multimodal(out["input_ids"])
+    recon = tokenizer.decode_lidar(decoded[0].data)
+    assert recon.shape[0] == len(sample_lidar[::3])
 
 
 def test_lidar_rejects_wrong_shape():
@@ -322,7 +372,7 @@ def test_audio_decode_keeps_trailing_samples_without_final_tick_marker(tokenizer
     ids, _ = tokenizer._resolve_markers(markers)
     ids_no_trailing_marker = ids[:-1]  # drop the last <TICK>
     waveform, _ = tokenizer.decode_audio(ids_no_trailing_marker)
-    assert waveform.shape[0] == sample_audio.shape[0]
+    assert waveform.shape[0] == len(sample_audio) // KairosTokenizer.PCM_SCALE_FACTOR
 
 
 def test_decode_lidar_rejects_payload_not_multiple_of_eight(tokenizer):
@@ -365,7 +415,8 @@ def test_octet_family_ids_distinguish_rgb_and_place_value(tokenizer):
     aud_markers = KairosTokenizer.encode_audio(np.zeros(2, dtype=np.float32), tick_samples=2)
     _, aud_families = tokenizer._resolve_markers(aud_markers)
     r, g, b = img_families[0], img_families[1], img_families[2]
-    aud_hi, aud_lo = [f for f in aud_families if f][0], [f for f in aud_families if f][1]
+    aud_hi = next(f for f in aud_families if f)
+    aud_lo = [f for f in aud_families if f][1]
     assert len({r, g, b, aud_hi, aud_lo}) == 5
 
 
@@ -379,3 +430,118 @@ def test_encode_multimodal_returns_octet_family_ids_same_shape_as_input_ids(toke
     out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
     assert out["octet_family_ids"].shape == out["input_ids"].shape
     assert out["octet_family_ids"].max().item() > 0  # image bytes got a real (nonzero) family
+
+
+# ========================= reconstruct_segments =========================
+def test_reconstruct_segments_roundtrips_image(tokenizer, sample_image):
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert len(result) == 1
+    assert result[0]["modality"] == "IMAGE"
+    assert "error" not in result[0]
+    assert np.array_equal(result[0]["decoded"], sample_image)
+
+
+def test_reconstruct_segments_roundtrips_audio(tokenizer, sample_audio):
+    markers = KairosTokenizer.encode_audio(sample_audio, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.AUDIO, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "AUDIO"
+    assert "duration_s" in result[0]
+    assert result[0]["decoded"].shape[0] == sample_audio.shape[0]
+
+
+def test_reconstruct_segments_roundtrips_video(tokenizer, sample_video):
+    """Regression: decode_video returned a raw (frames, duration) tuple instead of unpacking it."""
+    markers = KairosTokenizer.encode_video(sample_video)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.VIDEO, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "VIDEO"
+    assert "error" not in result[0]
+    assert "duration_s" in result[0]
+    assert np.array_equal(result[0]["decoded"], sample_video)
+
+
+def test_encode_decode_control_roundtrips(tokenizer, rng):
+    state = rng.uniform(-1, 1, 50).astype(np.float32)
+    action = rng.uniform(-1, 1, 50).astype(np.float32)
+    markers = KairosTokenizer.encode_control(state, action, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.CONTROL, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "CONTROL"
+    rec_state, rec_action = result[0]["decoded"]["state"], result[0]["decoded"]["action"]
+    assert len(rec_state) == len(rec_action) == 50
+    assert np.allclose(rec_state, state, atol=2 / 65535)
+    assert np.allclose(rec_action, action, atol=2 / 65535)
+
+
+def test_encode_control_truncates_to_shorter_side(rng):
+    state = rng.uniform(-1, 1, 30).astype(np.float32)
+    action = rng.uniform(-1, 1, 20).astype(np.float32)
+    markers = KairosTokenizer.encode_control(state, action, scale_factor=1)
+    n_bytes_payload = sum(len(item[1]) for item in markers if item[0] == "bytes")
+    assert n_bytes_payload == 20 * 2 * 2  # 20 samples (shorter side) x 2 sides x n_bytes=2
+
+
+def test_decode_control_rejects_payload_not_multiple_of_step(tokenizer):
+    broken = MultimodalSegment(Modality.CONTROL, [("bytes", b"\x00\x01\x02", ("ACT0", "ACT1", "STA0", "STA1"))])
+    out = tokenizer.encode_multimodal([broken])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["decoded"] is None
+    assert "error" in result[0]
+
+
+def test_encode_decode_control_observation_only_roundtrips(tokenizer, rng):
+    """encode_control(state, action=None) - the imu case - round-trips; action stays None."""
+    state = rng.uniform(-1, 1, 480).astype(np.float32)
+    markers = KairosTokenizer.encode_control(state, action=None, scale_factor=1)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.CONTROL, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "CONTROL"
+    rec_state, rec_action = result[0]["decoded"]["state"], result[0]["decoded"]["action"]
+    assert rec_action is None
+    assert len(rec_state) == 480
+    assert np.allclose(rec_state, state, atol=2 / 65535)
+
+
+def test_encode_control_observation_and_paired_never_confused_in_same_row(tokenizer, rng):
+    """The <OBS> marker distinguishes state-only from paired CONTROL segments side by side."""
+    obs = KairosTokenizer.encode_control(rng.uniform(-1, 1, 20).astype(np.float32), action=None, scale_factor=1)
+    paired = KairosTokenizer.encode_control(
+        rng.uniform(-1, 1, 15).astype(np.float32), rng.uniform(-1, 1, 15).astype(np.float32), scale_factor=1
+    )
+    out = tokenizer.encode_multimodal(
+        [MultimodalSegment(Modality.CONTROL, obs), MultimodalSegment(Modality.CONTROL, paired)]
+    )
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["decoded"]["action"] is None
+    assert len(result[0]["decoded"]["state"]) == 20
+    assert result[1]["decoded"]["action"] is not None
+    assert len(result[1]["decoded"]["state"]) == len(result[1]["decoded"]["action"]) == 15
+
+
+def test_reconstruct_segments_decodes_text_as_str(tokenizer):
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.TEXT, b"hello world")])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    assert result[0]["modality"] == "TEXT"
+    assert result[0]["decoded"] == "hello world"
+
+
+def test_reconstruct_segments_reports_error_instead_of_raising_on_truncated_segment(tokenizer, sample_image):
+    """A mid-byte-plane truncation must surface as an error, not crash the whole diagnostic."""
+    markers = KairosTokenizer.encode_image(sample_image)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.IMAGE, markers)])
+    truncated = out["input_ids"][:-5]  # cut off before the closing tag / mid-payload
+    result = tokenizer.reconstruct_segments(truncated)
+    assert result  # decode_multimodal still finds the (now unterminated) segment
+    assert result[0]["decoded"] is None
+    assert "error" in result[0]
+
+
+def test_reconstruct_segments_n_tokens_matches_segment_length(tokenizer, sample_lidar):
+    markers = KairosTokenizer.encode_lidar(sample_lidar)
+    out = tokenizer.encode_multimodal([MultimodalSegment(Modality.LIDAR, markers)])
+    result = tokenizer.reconstruct_segments(out["input_ids"])
+    decoded_ids = tokenizer.decode_multimodal(out["input_ids"])
+    assert result[0]["n_tokens"] == len(decoded_ids[0].data)

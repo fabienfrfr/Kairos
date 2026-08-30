@@ -127,8 +127,7 @@ class DetailedMemoryReport:
             f"Gradient bytes (measured):     {self.grad_bytes / 1e6:.1f} MB",
             f"Optimizer state (measured):    {self.optimizer_state_bytes / 1e6:.1f} MB",
             f"Activation bytes (1 fwd pass): {self.activation_bytes_forward / 1e6:.1f} MB",
-            f"  largest single activation:   {self.largest_activation[0]} "
-            f"({self.largest_activation[1] / 1e6:.1f} MB)",
+            f"  largest single activation:   {self.largest_activation[0]} ({self.largest_activation[1] / 1e6:.1f} MB)",
             "",
             "Process RSS (real OS memory, /proc/self/status VmRSS):",
             f"  before step:                 {self.rss_before_mb:.1f} MB",
@@ -148,7 +147,9 @@ class DetailedMemoryReport:
             if row["n_unique_module_instances"] < row["n_module_slots"]:
                 tag = f"  [SHARED: {row['n_module_slots']} slots -> {row['n_unique_module_instances']} unique instance(s)]"
             lines.append(f"  {row['name']:<16} {row['unique_bytes'] / 1e6:8.1f} MB{tag}")
-        accounted = self.unique_param_bytes + self.grad_bytes + self.optimizer_state_bytes + self.activation_bytes_forward
+        accounted = (
+            self.unique_param_bytes + self.grad_bytes + self.optimizer_state_bytes + self.activation_bytes_forward
+        )
         unaccounted = (self.rss_after_optimizer_step_mb - self.rss_before_mb) * 1e6 - accounted
         lines += [
             "",
@@ -243,6 +244,129 @@ def detailed_memory_report(model, optimizer, loss_fn, device, autocast_ctx=None,
         rss_after_optimizer_step_mb=rss_after_optimizer_step,
         device=str(device),
     )
+
+
+@dataclass
+class ModuleTimeReport:
+    """Wall-clock time per module: fwd+bwd self-time (excludes children), avg over n_steps."""
+
+    rows: list[dict]  # {name, module_type, fwd_ms, bwd_ms, self_ms, calls}
+    step_ms: float
+    device: str
+
+    def __str__(self) -> str:
+        tracked = sum(r["self_ms"] for r in self.rows)
+        untracked = max(0.0, self.step_ms - tracked)
+        lines = [
+            "Kairos per-module time report (measured, self-time excludes children)",
+            "------------------------------------------------------------------------",
+            f"Device:            {self.device}",
+            f"Total step time:   {self.step_ms:.1f} ms",
+            f"Tracked (fwd+bwd of all hooked modules): {tracked:.1f} ms",
+            f"Untracked (optimizer.step/zero_grad/hook overhead/glue): {untracked:.1f} ms",
+            "",
+            f"{'module':<42} {'type':<22} {'fwd ms':>9} {'bwd ms':>9} {'total ms':>9} {'%':>6}  calls",
+        ]
+        ordered = sorted(self.rows, key=lambda r: -r["self_ms"])
+        for row in ordered:
+            pct = 100 * row["self_ms"] / self.step_ms if self.step_ms else 0.0
+            lines.append(
+                f"  {row['name']:<40} {row['module_type']:<22} {row['fwd_ms']:9.2f} {row['bwd_ms']:9.2f} "
+                f"{row['self_ms']:9.2f} {pct:5.1f}%  x{row['calls']}"
+            )
+        return "\n".join(lines)
+
+
+def profile_module_time(model, forward_fn, device, n_steps: int = 3) -> ModuleTimeReport:
+    """Hooks every submodule; times forward and backward self-duration (exclusive of children)."""
+    is_cuda = torch.device(device).type == "cuda"
+    stats: dict[str, dict] = {}
+    fwd_stack: list[list] = []  # each frame: [name, start_time, child_time_accum]
+    bwd_stack: list[list] = []
+    handles = []
+
+    def _sync():
+        if is_cuda:
+            torch.cuda.synchronize()
+
+    def _row(name, module_type):
+        return stats.setdefault(name, {"module_type": module_type, "fwd_ms": 0.0, "bwd_ms": 0.0, "calls": 0})
+
+    def _fwd_pre(name):
+        def _hook(module, inputs):
+            _sync()
+            fwd_stack.append([name, time.perf_counter(), 0.0])
+
+        return _hook
+
+    def _fwd_post(name, module_type):
+        def _hook(module, inputs, output):
+            _sync()
+            _, start, child_time = fwd_stack.pop()
+            total = time.perf_counter() - start
+            if fwd_stack:
+                fwd_stack[-1][2] += total
+            row = _row(name, module_type)
+            row["fwd_ms"] += max(0.0, total - child_time) * 1000
+            row["calls"] += 1
+
+        return _hook
+
+    def _bwd_pre(name):
+        def _hook(module, grad_output):
+            _sync()
+            bwd_stack.append([name, time.perf_counter(), 0.0])
+
+        return _hook
+
+    def _bwd_post(name, module_type):
+        def _hook(module, grad_input, grad_output):
+            _sync()
+            _, start, child_time = bwd_stack.pop()
+            total = time.perf_counter() - start
+            if bwd_stack:
+                bwd_stack[-1][2] += total
+            row = _row(name, module_type)
+            row["bwd_ms"] += max(0.0, total - child_time) * 1000
+
+        return _hook
+
+    for name, module in model.named_modules():
+        if not name:  # skip the root module itself
+            continue
+        handles.append(module.register_forward_pre_hook(_fwd_pre(name)))
+        handles.append(module.register_forward_hook(_fwd_post(name, type(module).__name__)))
+        handles.append(module.register_full_backward_pre_hook(_bwd_pre(name)))
+        handles.append(module.register_full_backward_hook(_bwd_post(name, type(module).__name__)))
+
+    try:
+        forward_fn()  # untimed warmup: absorbs lazy init/allocator warmup noise
+        stats.clear()
+        _sync()
+        t0 = time.perf_counter()
+        for _ in range(n_steps):
+            forward_fn()
+        _sync()
+        step_ms = (time.perf_counter() - t0) * 1000 / n_steps
+    finally:
+        for h in handles:
+            h.remove()
+
+    rows = []
+    for name, row in stats.items():
+        fwd_ms = row["fwd_ms"] / n_steps
+        bwd_ms = row["bwd_ms"] / n_steps
+        rows.append(
+            {
+                "name": name,
+                "module_type": row["module_type"],
+                "fwd_ms": fwd_ms,
+                "bwd_ms": bwd_ms,
+                "self_ms": fwd_ms + bwd_ms,
+                "calls": row["calls"],
+            }
+        )
+    return ModuleTimeReport(rows=rows, step_ms=step_ms, device=str(device))
 
 
 def format_duration(seconds: float | None) -> str:

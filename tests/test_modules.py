@@ -116,6 +116,13 @@ def test_kairos_config_modality_scales_default_clips_to_num_scales():
         assert all(s < 2 for s in scales)
 
 
+def test_kairos_config_default_modality_scales_never_finest_only_beyond_id_1():
+    # a forgotten/unconfigured heavy modality (id >= 3) must not silently land on scale 0 alone
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=4, num_modalities=8)
+    for m in range(3, 8):
+        assert cfg.modality_scales[m] != [0]
+
+
 def test_n_routed_experts_stays_synced_with_num_local_experts():
     via_old_name = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, n_routed_experts=16)
     assert via_old_name.num_local_experts == 16
@@ -431,7 +438,7 @@ def test_kairos_model_forward_logits_mask_restricts_lm_head_to_selected_position
 
 
 def test_kairos_model_forward_logits_mask_matches_full_forward_at_those_positions():
-    # restricting to logits_mask must be a pure optimization: same numbers as a full forward, just fewer of them
+    # restricting to logits_mask must be a pure optimization: same numbers, just fewer of them
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=2, vocab_size=100, num_modalities=2)
     model = KairosDiffusionFM(cfg)
     model.eval()
@@ -850,11 +857,21 @@ def test_model_diffusion_stability_with_cache(config):
 
 def test_share_backbones_reduces_param_count():
     cfg_sep = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=False,
     )
     cfg_share = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=True,
     )
     model_sep = KairosDiffusionFM(cfg_sep, vocab_size=100)
@@ -869,7 +886,12 @@ def test_share_backbones_reduces_param_count():
 
 def test_share_backbones_forward_output_shape():
     cfg = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=True,
     )
     model = KairosDiffusionFM(cfg, vocab_size=100)
@@ -881,7 +903,12 @@ def test_share_backbones_forward_output_shape():
 
 def test_share_backbones_backward():
     cfg = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=3, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=3,
+        num_modalities=2,
         share_backbones=True,
     )
     model = KairosDiffusionFM(cfg, vocab_size=100)
@@ -894,7 +921,12 @@ def test_share_backbones_backward():
 
 def test_share_backbones_all_scales_use_same_module():
     cfg = KairosConfig(
-        d_model=32, n_heads=4, n_layers=2, vocab_size=100, num_scales=4, num_modalities=2,
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        vocab_size=100,
+        num_scales=4,
+        num_modalities=2,
         share_backbones=True,
     )
     model = KairosDiffusionFM(cfg, vocab_size=100)

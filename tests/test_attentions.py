@@ -758,7 +758,9 @@ def test_warns_on_cuda_without_fast_kernels():
     from kairos.attentions import _warn_if_missing_fast_kernels
 
     with pytest.warns(UserWarning, match="fast-attn"):
-        _warn_if_missing_fast_kernels(cuda_available=True, delta_backend="torch_fallback", conv_backend="torch_fallback")
+        _warn_if_missing_fast_kernels(
+            cuda_available=True, delta_backend="torch_fallback", conv_backend="torch_fallback"
+        )
 
 
 def test_warns_lists_only_the_actually_missing_package():
