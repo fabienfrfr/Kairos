@@ -82,7 +82,7 @@ dev = [
     "mwparserfromhell>=0.7.2",
     "pytest>=8.4.2",
     "pytest-cov>=7.1.0",
-    "ruff>=0.15.20",
+    "ruff>=0.16.5",
 ]
 # scripts/ (dataset builders): `uv sync --group scripts` to install
 scripts = [
