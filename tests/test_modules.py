@@ -592,7 +592,7 @@ def test_model_overfits_a_tiny_batch_without_collapsing_to_noise(config):
 
     model.eval()
     with torch.no_grad():
-        noise_mask, p = make_diffusion_mask(x0, prompt_len, eps=trainer.mask_eps, p_max=trainer.mask_p_max)
+        noise_mask, _ = make_diffusion_mask(x0, prompt_len, eps=trainer.mask_eps, p_max=trainer.mask_p_max)
         logits = model(decoder_input_ids=x0, modality_ids=torch.zeros_like(x0)).logits
         preds = logits[noise_mask].argmax(dim=-1)
         accuracy = (preds == x0[noise_mask]).float().mean().item()

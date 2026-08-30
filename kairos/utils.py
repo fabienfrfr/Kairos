@@ -131,12 +131,18 @@ class DetailedMemoryReport:
             "",
             "Process RSS (real OS memory, /proc/self/status VmRSS):",
             f"  before step:                 {self.rss_before_mb:.1f} MB",
-            f"  after forward:                {self.rss_after_forward_mb:.1f} MB "
-            f"(+{self.rss_after_forward_mb - self.rss_before_mb:.1f} MB)",
-            f"  after backward:               {self.rss_after_backward_mb:.1f} MB "
-            f"(+{self.rss_after_backward_mb - self.rss_after_forward_mb:.1f} MB)",
-            f"  after optimizer.step():       {self.rss_after_optimizer_step_mb:.1f} MB "
-            f"(+{self.rss_after_optimizer_step_mb - self.rss_after_backward_mb:.1f} MB)",
+            (
+                f"  after forward:                {self.rss_after_forward_mb:.1f} MB "
+                f"(+{self.rss_after_forward_mb - self.rss_before_mb:.1f} MB)"
+            ),
+            (
+                f"  after backward:               {self.rss_after_backward_mb:.1f} MB "
+                f"(+{self.rss_after_backward_mb - self.rss_after_forward_mb:.1f} MB)"
+            ),
+            (
+                f"  after optimizer.step():       {self.rss_after_optimizer_step_mb:.1f} MB "
+                f"(+{self.rss_after_optimizer_step_mb - self.rss_after_backward_mb:.1f} MB)"
+            ),
             "",
             "Per top-level module (unique bytes, shared modules counted once):",
         ]

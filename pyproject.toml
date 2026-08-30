@@ -100,3 +100,5 @@ quote-style = "double"
 
 [tool.ruff.lint.per-file-ignores]
 "notebook/*.py" = ["PLR1711", "B018", "I001"]
+# setuptools-scm regenerates this version file on every build; don't lint auto-generated code
+"kairos/_version.py" = ["RUF022"]

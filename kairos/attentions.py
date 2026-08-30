@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-
 from transformers.models.qwen3_next.modeling_qwen3_next import (
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
@@ -274,7 +273,7 @@ class KairosAttention(nn.Module):
 
     def _flex_mask_bucketed_padded(self, bq, attention_mask, device):
         # per-row pad_mask (gather_active); rebuilt per step (content varies), block fixed.
-        B, kv_len = attention_mask.shape
+        _, kv_len = attention_mask.shape
         padded = F.pad(attention_mask.bool(), (0, bq - kv_len), value=False)
         return build_flex_mask_bucketed(self.window, padded, padded.clone(), device=device)
 

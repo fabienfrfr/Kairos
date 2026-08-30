@@ -539,6 +539,7 @@ def test_kairos_attn_backend_eager_override(tmp_path):
         capture_output=True,
         text=True,
         env={**os.environ, "PYTHONPATH": repo_root},
+        check=False,
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "eager"
