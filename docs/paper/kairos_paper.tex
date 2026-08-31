@@ -1,0 +1,686 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta,positioning,fit}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\sloppy
+
+\title{Kairos: A Compute-Efficient Hybrid MoE Diffusion Architecture\\
+for Multimodal Edge Foundation Models\\
+\large A Proof-of-Concept Report}
+
+\author{Fabien Furfaro}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Sparse Mixture-of-Experts (MoE) routing is usually sold as an
+almost-free lunch: keep the total parameter count high, activate only
+a small fraction per token, and pay only for what you use. We show
+this promise quietly breaks down during \emph{training} on
+memory-bandwidth-limited hardware. Kairos is a proof-of-concept
+multimodal model combining bidirectional gated DeltaNet linear
+attention with bidirectional sliding-window attention through shared
+projections (LiZAttention2, TPTT-inspired), a block-wise
+Attention-Residual aggregator, a sparse MoE feed-forward layer, and a
+masked-diffusion training objective over a shared byte-level latent
+space spanning text, image, audio, video, lidar and robot-control
+modalities. The current, runnable configuration is a $\sim$14M-parameter
+sanity-check network (4 layers, $d_{\text{model}}=64$, 7 experts,
+top-1 routing) used to validate the pipeline end-to-end via
+overfitting and per-modality loss checks; a separate,
+not-yet-trained 200M-total/25M-active design point is used only to
+size the target compute budget. Using a roofline model, we show that
+this target design point sits deep in the memory-bound regime
+($\mathcal{I}_{\text{train}}=1.5$ FLOP/byte against ridge points of
+156--295 FLOP/byte on A100/H100-class hardware), and that its MoE
+backward pass is bandwidth-gated by the \emph{total} parameter count
+rather than the \emph{active} one -- a distinction absent from
+FLOP-centric treatments of MoE efficiency. We give the exact,
+code-derived algorithms for the hybrid attention block, the
+Block-AttnRes aggregator, and the masked-diffusion curriculum, and we
+specify -- ahead of running them -- the tables the codebase's own
+instrumentation (\texttt{summary}, \texttt{memory\_report},
+\texttt{profile}, \texttt{overfit\_test},
+\texttt{check\_per\_modality\_loss}) is built to produce. No full
+training run has been performed; this report is a design and
+compute-budget document, not a benchmark paper.
+\end{abstract}
+
+\section{Introduction}
+
+\subsection{Background}
+
+Small, edge-deployable language models
+(MobileLLM~\citep{liu2024mobilellm}, SmolLM2~\citep{allal2025smollm2},
+Gemma-3~\citep{gemma3}) are now routinely over-trained well past the
+Chinchilla-optimal token-to-parameter
+ratio~\citep{hoffmann2022chinchilla}, on the premise that inference
+cost dominates total cost of ownership. That premise says nothing
+about training cost when the training hardware is \emph{itself}
+constrained -- the situation this report is concerned with. Three
+architectural levers target training-time efficiency in largely
+separate literatures: (i) sub-quadratic sequence mixing -- local
+windowed attention~\citep{beltagy2020longformer,jiang2023mistral} and
+linear state-compressing mixers derived from state-space models
+(Mamba~\citep{gu2023mamba}) and the delta
+rule~\citep{yang2024deltanet,yang2024gateddeltanet}; (ii) sparse
+capacity scaling via MoE
+routing~\citep{shazeer2017outrageously,fedus2021switch,
+dai2024deepseekmoe,deepseekv3}; (iii) non-autoregressive diffusion
+training~\citep{austin2021d3pm,lou2023sedd,sahoo2024mdlm,nie2025llada},
+which generalizes masked language modeling~\citep{devlin2018bert} into
+a full generative objective.
+
+\subsection{Problem statement}
+
+Each lever reports efficiency in its own currency -- asymptotic
+sequence-length complexity, FLOPs-per-token, or generation
+parallelism -- rarely all three, and rarely against the
+memory-bandwidth limits of the edge-class GPUs that motivate combining
+them. FLOP-centric MoE accounting implicitly assumes a
+bandwidth-favorable forward pass implies a bandwidth-favorable
+\emph{training step}; Section~\ref{sec:compute} shows this fails once
+the backward pass is accounted for, because gradients flow through
+every expert reachable across a batch, not the subset any one token
+selected. \textbf{Research question:} for a hybrid
+linear-attention/MoE/diffusion model targeting edge-class training
+hardware, what governs achievable throughput -- FLOPs or bandwidth --
+and which parameter count, active or total, is the correct lever to
+reduce?
+
+\subsection{Contributions}
+
+\begin{enumerate}
+  \item The Kairos architecture, specified directly from its
+        implementation: LiZAttention2 (Algorithm~\ref{alg:liz}),
+        Block-AttnRes (Algorithm~\ref{alg:attnres}), sparse MoE
+        (\S\ref{sec:moe}), and the masked-diffusion curriculum
+        (Algorithm~\ref{alg:diffusion}).
+  \item An explicit split between the \emph{running} proof-of-concept
+        configuration ($\sim$14M parameters, used for pipeline
+        sanity checks) and the \emph{target} design point
+        (200M total / 25M active, used only for compute-budget sizing)
+        -- Table~\ref{tab:configs}.
+  \item A roofline-based compute analysis of the target design point
+        (\S\ref{sec:compute}) showing it is memory-bound and that its
+        MoE backward pass scales with total, not active, parameters.
+  \item Result tables the codebase's instrumentation is built to fill
+        (\S\ref{sec:results}), reported here as structure, not
+        numbers, since no full run has been executed.
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{Efficient attention.} The delta
+rule~\citep{yang2024deltanet,yang2024gateddeltanet} improves on plain
+linear attention with an error-correcting state update; Kairos runs it
+\emph{bidirectionally} (forward pass plus a time-reversed pass,
+concatenated) rather than causally, matching the bidirectional context
+a masked-diffusion objective requires. Sliding-window
+attention~\citep{beltagy2020longformer,jiang2023mistral} is likewise
+run bidirectionally here, with rotary
+position embeddings~\citep{su2021roformer} and grouped-query
+attention~\citep{ainslie2023gqa}. Coupling a delta-rule branch and a
+window-attention branch through shared Q/K/V/O projections follows the
+TPTT construction~\citep{furfaro2025tptt}.
+
+\paragraph{Sparse MoE.} MoE
+architectures~\citep{shazeer2017outrageously,fedus2021switch,
+dai2024deepseekmoe,deepseekv3} decouple capacity from per-token
+compute. Kairos's MoE layer subclasses Qwen2's dense
+MLP~\citep{qwen2techreport} for the non-routed path and
+DeepSeek-V3's routed-expert layer~\citep{deepseekv3} directly, rather
+than reimplementing either. The training-time memory-bandwidth cost of
+the router's backward pass on bandwidth-starved hardware -- central to
+\S\ref{sec:compute} -- is not, to our knowledge, separately quantified
+in this literature.
+
+\paragraph{Diffusion-style language modeling.} Kairos follows the
+MDLM~\citep{sahoo2024mdlm} masking/reweighting formulation but adds a
+three-stage MAE~$\to$~transition~$\to$~diffusion curriculum
+(Algorithm~\ref{alg:diffusion}), motivated by optimization instability
+observed when sampling the full masking distribution from a random
+initialization; the cited diffusion-LM literature typically does not
+stage this.
+
+\paragraph{Scaling laws.} Chinchilla~\citep{hoffmann2022chinchilla} is
+fitted on 70M--16B \emph{dense} models; extrapolating to a
+4M-active-parameter MoE model is out of range. Joint MoE scaling
+laws~\citep{ludziejewski2025moe} instead parameterize loss in active
+parameters, tokens, and expert count, and report that the marginal
+value of tokens grows with expert count -- relevant to
+\S\ref{sec:compute}'s token budget. A separate line analyzes the
+FLOPs-vs-sparsity trade-off directly~\citep{abnar2025parameters}; we
+build on it to isolate the total-vs-active distinction specifically in
+the backward pass.
+
+\section{Architecture}
+
+\subsection{Two configurations, not one}
+
+The codebase runs at two distinct scales that this report is careful
+not to conflate. The \textbf{PoC configuration} is the default in the
+project's marimo notebook (\texttt{notebook/kairos\_pretraining.py}):
+a $\sim$14--15M-parameter network used to sanity-check the pipeline via
+memorization (\texttt{overfit\_test}) and per-modality loss checks. Its
+7-expert, top-1 MoE is deliberately small -- the notebook notes that
+top-1 routing converges slowly on tiny overfit runs, so the expert
+count is kept low to make the sanity check tractable at all. The
+\textbf{target configuration} is the 200M-total / 25M-active design
+point used in \S\ref{sec:compute} purely to size a future training
+run; it has not been instantiated or trained. Table~\ref{tab:configs}
+gives both.
+
+\begin{table}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrr}
+\toprule
+Parameter & PoC (running) & Target (design point, untrained) \\
+\midrule
+$d_{\text{model}}$ & 64 & -- \\
+Attention heads (head dim) & 4 (16) & -- \\
+Backbone layers & 4 & -- \\
+Codec scales / stride & 4 / 3 & -- \\
+AttnRes block size & 4 & -- \\
+Routed experts $E$ / active $k$ & 7 / 1 & 32 / 4 \\
+Shared experts & 1 & -- \\
+FFN intermediate size & 544 & -- \\
+Backbone sharing across scales & yes ($\sim$75\% param saving) & -- \\
+Codec mode & \texttt{patch} (dense per-scale) & -- \\
+Cross-session memory bank & enabled & -- \\
+$N_{\text{total}}$ & $\sim$14--15M & 200M \\
+$N_{\text{act}}$ & not yet logged (\S\ref{sec:results}) & 25M (4M for \S\ref{sec:compute}) \\
+Target training tokens $D$ & 16 examples $\times$ 200 steps (overfit) & 30B \\
+\bottomrule
+\end{tabular}%
+}
+\caption{The two configurations this report distinguishes. Dashes mean
+the target design point has not been fixed at that granularity -- only
+the parameter/token budget that drives \S\ref{sec:compute} has been
+specified. $N_{\text{act}}$ for the PoC config is computed by the same
+routine used at target scale (Eq.~\ref{eq:active}) but has not yet been
+logged from an instantiated model; it is listed as a pending
+measurement, not estimated here, to avoid quoting an unverified number.}
+\label{tab:configs}
+\end{table}
+
+Figure~\ref{fig:architecture} shows the shared data flow; both
+configurations instantiate the same modules, differing only in the
+sizes in Table~\ref{tab:configs}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=0.8cm, text width=5.2cm, font=\scriptsize},
+  smallbox/.style={draw, rounded corners=2pt, align=center, minimum height=0.7cm, text width=3.6cm, font=\scriptsize},
+  arr/.style={-{Stealth[length=2mm]}, thick},
+  node distance=6mm
+]
+\node[box, fill=blue!8] (input) {Input tokens\\\scriptsize (text/image/audio/video/lidar/control)};
+\node[box, fill=blue!15, below=of input] (embed) {KairosEmbedding\\\scriptsize token + modality/family embed};
+\node[box, fill=purple!8, below=of embed] (codec) {PyramidalCodec\\\scriptsize multi-scale encode, stride $s$};
+
+\node[smallbox, fill=white, below left=8mm and -8mm of codec] (swa) {KairosAttention\\\scriptsize bidirectional SWA, RoPE, GQA};
+\node[smallbox, fill=white, below right=8mm and -8mm of codec] (delta) {KairosGatedDeltaNet\\\scriptsize forward + flipped pass, concat};
+\node[box, fill=blue!10, below=15mm of codec] (liz) {LiZAttention2\\\scriptsize shared Q/K/V/O, concat, norm, merge};
+\node[box, fill=yellow!12, below=of liz] (moe) {KairosMoE (DeepSeek-V3-style)\\\scriptsize top-$k$ routed + shared experts};
+\node[box, fill=green!8, below=of moe] (attnres) {KairosAttnRes\\\scriptsize block-windowed weighted sum, $\times n_{\text{layers}}$};
+\node[box, fill=purple!8, below=of attnres] (fusion) {Fusion\\\scriptsize concat scales $\to$ Linear};
+\node[box, fill=blue!15, below=of fusion] (head) {OutputHead (tied)\\\scriptsize token + octet-family logits};
+
+\draw[arr] (input) -- (embed);
+\draw[arr] (embed) -- (codec);
+\draw[arr] (codec) -- (swa);
+\draw[arr] (codec) -- (delta);
+\draw[arr] (swa) -- (liz);
+\draw[arr] (delta) -- (liz);
+\draw[arr] (liz) -- (moe);
+\draw[arr] (moe) -- (attnres);
+\draw[arr] (attnres) -- (fusion);
+\draw[arr] (fusion) -- (head);
+\end{tikzpicture}
+\caption{Kairos data flow (\texttt{DiffusionBlock} $\times$
+\texttt{n\_layers}, wrapped by \texttt{KairosDiffusionBackbone}). Both
+attention branches see the same input and are bidirectional; the
+Block-AttnRes aggregator determines what each layer actually reads.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{LiZAttention2: shared-basis bidirectional hybrid attention}
+
+Each layer runs a bidirectional sliding-window branch
+(\texttt{KairosAttention}, window mask $|q-k|\le w$ in both
+directions) and a bidirectional gated-DeltaNet branch
+(\texttt{KairosGatedDeltaNet}, run once forward and once on the
+time-reversed sequence, then flipped back and concatenated) over the
+\emph{same} input. The DeltaNet branch's Q/K/V/output projections are
+deleted and replaced by references to the SWA branch's, so both
+mixers read the same linear projections of $x$; only their mixing
+rule differs.
+
+\begin{algorithm}[h]
+\caption{LiZAttention2 forward (one layer)}
+\label{alg:liz}
+\begin{algorithmic}[1]
+\Require hidden states $x \in \mathbb{R}^{B\times L\times d}$, RoPE table, attention mask
+\State $q,k,v \gets \text{swa.q\_proj}(x),\ \text{swa.k\_proj}(x),\ \text{swa.v\_proj}(x)$ \Comment{shared with DeltaNet}
+\State $\text{swa\_out} \gets \text{BidirWindowAttn}(q,k,v,\text{window }w,\text{RoPE})$
+\State $\text{delta\_out}_f \gets \text{GatedDeltaRule}(q,k,v)$
+\State $\text{delta\_out}_b \gets \text{flip}\big(\text{GatedDeltaRule}(\text{flip}(q,k,v))\big)$
+\State $\text{delta\_out} \gets \text{swa.out\_proj}(\text{delta\_out}_f + \text{delta\_out}_b \text{ combination})$
+\State $\text{out} \gets \text{concat}(\text{swa\_out},\ \text{delta\_out})$ \Comment{$2d$-wide}
+\State $\text{out} \gets \text{RMSNorm}(\text{out})$
+\State \Return $\text{Linear}_{2d\to d}(\text{out})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Block-AttnRes aggregation}
+
+Rather than a plain residual $x_{i+1}=x_i+f_i(x_i)$, each layer's
+\emph{input} is a learned, softmax-weighted mix of the embedding,
+finalized block-sums of earlier layers, and a running partial sum of
+the current block (Algorithm~\ref{alg:attnres}); the layer's own
+attention/FFN sublayers still use ordinary residual connections around
+$h$. With \texttt{attnres\_block\_size}~$=1$ this degenerates to a
+DenseNet-style sum over all prior individual layer outputs; with block
+size~$=$~\texttt{n\_layers} it degenerates to a single running sum
+(closer to a plain residual stream). The PoC configuration uses block
+size~$4$ over $4$ layers, i.e.\ one block covering the whole network.
+
+\begin{algorithm}[h]
+\caption{Block-AttnRes backbone forward}
+\label{alg:attnres}
+\begin{algorithmic}[1]
+\Require embedding $x_0$, layers $f_1,\dots,f_L$, block size $S$, learned $w\in\mathbb{R}^d$ per aggregator
+\State $\text{completed} \gets [\,]$; $\text{partial} \gets \text{None}$; $\text{count} \gets 0$
+\For{$i = 1,\dots,L$}
+  \State $\text{sources} \gets [x_0] \cup \text{completed} \cup (\{\text{partial}\}\text{ if partial}\ne\text{None})$
+  \State $V \gets \text{stack}(\text{sources})$;\quad $K \gets \text{RMSNorm}(V)$
+  \State $\text{logits} \gets w^{\top}K$ (over the stacked/source dimension)
+  \State $h \gets \sum_{\text{sources}} \text{softmax}(\text{logits}) \cdot V$
+  \State $x_i \gets f_i(h)$ \Comment{ordinary residual attention + FFN inside $f_i$}
+  \State $\text{partial} \gets x_i$ if partial is None else $\text{partial} + x_i$;\quad $\text{count} \mathrel{+}= 1$
+  \If{$\text{count} = S$}
+    \State $\text{completed}.\text{append}(\text{partial})$;\quad $\text{partial}\gets\text{None}$;\quad $\text{count}\gets0$
+  \EndIf
+\EndFor
+\State \Return $\text{RMSNorm}(x_L)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Sparse Mixture-of-Experts}
+\label{sec:moe}
+
+\texttt{KairosMoE} subclasses DeepSeek-V3's routed-expert
+layer~\citep{deepseekv3} directly (only the expert-weight
+initialization is patched, since the upstream implementation leaves
+expert weights uninitialized); \texttt{KairosFFN}, used when MoE is
+disabled, subclasses Qwen2's dense MLP~\citep{qwen2techreport}. Each
+token is routed to $k$ of $E$ routed experts plus $1$ or more always-on
+shared experts. The PoC configuration ($E=7$, $k=1$) is deliberately
+under-sparse relative to the target ($E=32$, $k=4$): the notebook
+records that top-1 routing on a wide expert bank converges too slowly
+to be useful as a fast sanity check.
+
+The active-parameter count used throughout this report is computed
+directly, not estimated after the fact:
+\begin{equation}
+N_{\text{act}} = N_{\text{total}} - N_{\text{expert}} +
+N_{\text{expert}}\cdot\frac{k}{E},
+\label{eq:active}
+\end{equation}
+where $N_{\text{expert}}$ sums only parameters under modules whose name
+contains \texttt{".experts."} -- shared experts, the router gate, the
+attention/DeltaNet path, and the codec are treated as fully dense
+(every token activates them), matching how \texttt{count\_active\_}
+\texttt{parameters()} walks the module tree in the codebase.
+
+\subsection{Masked-diffusion training objective}
+
+Given a clean sequence $x_0$, each row samples $p\sim U(\epsilon,
+p_{\max})$ and a Bernoulli$(p)$ mask over non-prompt, non-pad
+positions; masked positions are replaced with random tokens (and,
+where present, random octet-family ids) to form $x_t$. The model
+predicts $x_0$ at masked positions from $x_t$; the loss is
+cross-entropy, optionally reweighted by a continuous blend factor
+$\alpha\in[0,1]$ between plain CE ($\alpha=0$) and full $1/p$
+reweighting ($\alpha=1$), following the MDLM
+formulation~\citep{sahoo2024mdlm}. Self-conditioning (probability
+$0.5$ in the current config) occasionally feeds a detached, no-grad
+warm-up prediction back in as extra context, matching how
+\texttt{generate()} uses it at inference time.
+
+\begin{algorithm}[h]
+\caption{Masked-diffusion training step (\texttt{compute\_loss})}
+\label{alg:diffusion}
+\begin{algorithmic}[1]
+\Require batch $x_0$, prompt lengths, pad mask, stage schedule $(p_{\max}^{(t)},\alpha^{(t)})$ at step $t$
+\State $p \gets (p_{\max}^{(t)}-\epsilon)\cdot U(0,1)^{B} + \epsilon$ \Comment{one $p$ per row}
+\State $\text{mask} \gets \text{Bernoulli}(p)$ restricted to non-prompt, non-pad positions
+\State $x_t \gets x_0$ with $x_t[\text{mask}] \gets$ random tokens
+\State $\text{logits} \gets \text{model}(x_t,\ \text{logits\_mask}=\text{mask})$ \Comment{project only masked positions}
+\State $\ell \gets \text{CE}(\text{logits}, x_0[\text{mask}])$; \quad
+  $\ell \gets \ell \cdot \big(1+\alpha^{(t)}(1/p-1)\big)$ if $\alpha^{(t)}>0$
+\State \Return $\text{mean}(\ell)$ \Comment{$+$ octet-family CE if family ids present}
+\end{algorithmic}
+\end{algorithm}
+
+The stage schedule $(p_{\max}^{(t)},\alpha^{(t)})$ is a pure function
+of the global step (\texttt{stage\_mask\_schedule}): flat at
+$(p_{\max}^{\text{MAE}}=0.3,\ \alpha=0)$ for the MAE stage, linearly
+ramped to $(p_{\max}=1.0,\ \alpha=1)$ over the transition stage, then
+flat at the diffusion target -- chosen so that resuming from a
+checkpoint depends only on the persisted step count, not on which
+pipeline call produced it.
+
+\section{Compute Budget Analysis (Target Design Point)}
+\label{sec:compute}
+
+This section applies only to the 200M/25M \textbf{target} design point
+of Table~\ref{tab:configs}; it is a sizing exercise for a training run
+that has not been executed, not a measurement of the running PoC.
+
+\subsection{Total training FLOPs}
+
+For a dense transformer, $C\approx6ND$~\citep{kaplan2020scaling}; for
+MoE, compute scales with active, not total,
+parameters~\citep{ludziejewski2025moe}:
+\[
+C_{\text{Kairos}} = 6\times4\text{M}\times30\text{B} = 7.2\times10^{17}
+\text{ FLOPs},
+\]
+roughly $720\times$ cheaper in raw FLOPs than an estimated dense
+Gemma-3~270M~\citep{gemma3} run ($\sim5\times10^{20}$ FLOPs). This
+comparison alone overstates the win, as the roofline analysis below
+shows.
+
+\subsection{Roofline model}
+
+Achievable throughput is $\min(\pi,\ \mathcal{I}\cdot b_s)$, with ridge
+point $\mathcal{I}^\ast=\pi/b_s$~\citep{williams2009roofline}
+(Table~\ref{tab:ridge}, Figure~\ref{fig:roofline}). Kairos's training
+step has $\mathcal{I}_{\text{train}}=6N_{\text{act}}/4N_{\text{act}}=
+1.5$ FLOP/byte -- independent of model size, deep in the memory-bound
+region on every GPU class considered.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+GPU & $\pi$ (TFLOPS) & $b_s$ (TB/s) & Ridge point $\mathcal{I}^\ast$ (FLOP/byte) \\
+\midrule
+A100 & 312 & 2.0 & 156 \\
+H100 SXM5 & 989 & 3.35 & 295 \\
+\bottomrule
+\end{tabular}
+\caption{Peak compute, HBM bandwidth, ridge points.}
+\label{tab:ridge}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+  width=0.85\textwidth, height=6.5cm,
+  xlabel={Arithmetic intensity $\mathcal{I}$ (FLOP/byte)},
+  ylabel={Attainable throughput (TFLOP/s)},
+  xmin=0.1, xmax=2000, ymin=1, ymax=2000,
+  legend style={at={(0.02,0.98)}, anchor=north west, font=\tiny, fill=white, fill opacity=0.85, draw opacity=1, text opacity=1},
+  grid=both, grid style={gray!20}
+]
+\addplot[domain=0.1:156, samples=100, thick, blue] {2.0*x};
+\addplot[domain=156:2000, samples=2, thick, blue, dashed] {312};
+\addplot[domain=0.1:295, samples=100, thick, red] {3.35*x};
+\addplot[domain=295:2000, samples=2, thick, red, dashed] {989};
+\addplot[only marks, mark=*, mark size=2.5pt, color=black] coordinates {(1.5, 2.25)};
+\node[anchor=west, font=\scriptsize] at (axis cs:1.5,2.25) {\ Kairos train, $\mathcal{I}=1.5$};
+\legend{A100 (bandwidth-bound), A100 (peak), H100 (bandwidth-bound), H100 (peak)}
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{Kairos's training arithmetic intensity vs.\ A100/H100 ridge
+points -- deep in the memory-bound regime on both.}
+\label{fig:roofline}
+\end{figure}
+
+\subsection{The MoE bandwidth bottleneck}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Pass & Bytes/token & Driving factor \\
+\midrule
+Forward & $4N_{\text{act}}=16$MB & only active experts + attention read \\
+\textbf{Backward} & $4N_{\text{total}}=800$MB & gradients flow through \emph{all} experts via router \\
+Adam & $8N_{\text{total}}/B$ & amortized; negligible for $B\gtrsim32$ \\
+\bottomrule
+\end{tabular}
+\caption{Bytes moved per token by pass, target design point.}
+\label{tab:bandwidth}
+\end{table}
+
+The backward pass reads $N_{\text{total}}$, not $N_{\text{act}}$,
+because the router's gradient depends on every expert's contribution
+to the batch loss~\citep{abnar2025parameters}. As batch size grows,
+\[
+B_{\text{eff}} = 4N_{\text{total}} + \frac{8N_{\text{total}}}{B}
+\xrightarrow{B\to\infty} 4N_{\text{total}}.
+\]
+The backward-pass bandwidth cost of a MoE model is governed by its
+\emph{total}, not active, parameter count -- capping the achievable
+training-time speedup from sparsity even though it is fully realized
+at inference time.
+
+\subsection{Throughput and wall-clock estimates}
+
+\begin{table}[h]
+\centering
+\resizebox{0.9\textwidth}{!}{%
+\begin{tabular}{lrrrr}
+\toprule
+GPU & $b_s$ (GB/s) & tok/s (theory) & tok/s (MFU 25\%) & Days for 30B tokens \\
+\midrule
+T4 & 300 & 375 & $\sim$94 & $\sim$3\,700 \\
+RTX 5060Ti & 600 & 750 & $\sim$187 & $\sim$1\,850 \\
+A100 40G & 2\,000 & 2\,500 & $\sim$625 & $\sim$555 \\
+H100 SXM5 & 3\,350 & 4\,188 & $\sim$1\,047 & $\sim$332 \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Theoretical-upper-bound throughput at $N_{\text{total}}=200$M.
+Not measured: no run has reached this scale. \S\ref{sec:results}
+specifies the benchmark that would replace this table with real
+numbers.}
+\label{tab:throughput}
+\end{table}
+
+None of the four classes reach a practical wall-clock budget at the
+current $N_{\text{total}}$; T4/RTX~5060Ti -- the stated low-compute
+target -- are orders of magnitude over any reasonable budget. The
+fastest lever is reducing $N_{\text{total}}$ (e.g.\ to $\sim$50M) at
+fixed $N_{\text{act}}$, a $4\times$ cut in backward-pass bytes, before
+any kernel-level work.
+
+\subsection{Scaling-law context}
+
+Chinchilla~\citep{hoffmann2022chinchilla}'s fit is out of range for a
+4M-active-parameter model; joint MoE scaling
+laws~\citep{ludziejewski2025moe} instead predict the marginal value of
+tokens \emph{grows} with expert count, softening the concern.
+Table~\ref{tab:precedents} places the target token ratio
+($D/N_{\text{act}}=7{,}500\times$) against small dense-model
+precedents -- none of which use sparse routing, so they bound
+plausibility of coherent output at this active-parameter scale but say
+nothing about the bandwidth bottleneck above.
+
+\begin{table}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrl}
+\toprule
+Model & $N_{\text{total}}$ & $N_{\text{act}}$ & Tokens & $D/N$ & Notes \\
+\midrule
+Pythia-14M~\citep{biderman2023pythia} & 14M & 14M & $\sim$300B & $\sim$21{,}000$\times$ & dense, 6L$\times$d128 \\
+Pythia-31M~\citep{biderman2023pythia} & 31M & 31M & $\sim$300B & $\sim$9{,}700$\times$ & dense, 6L$\times$d256 \\
+TinyStories-1M~\citep{eldan2023tinystories} & $\sim$1M & $\sim$1M & $\sim$3B & $\sim$3{,}000$\times$ & domain-scoped \\
+TinyStories-33M~\citep{eldan2023tinystories} & $\sim$33M & $\sim$33M & $\sim$3B & $\sim$90$\times$ & domain-scoped \\
+\midrule
+Kairos PoC (running) & $\sim$14--15M & TBD & overfit-scale & n/a & MoE, sanity check only \\
+Kairos target (design) & 200M & 4M & 30B & 7{,}500$\times$ & MoE, multimodal, untrained \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Small-model precedents next to both Kairos configurations.}
+\label{tab:precedents}
+\end{table}
+
+\section{Anticipated Results}
+\label{sec:results}
+
+No training run backs this report. What follows is the exact
+structure the codebase's own instrumentation is built to fill --
+specified here so the eventual results have a pre-committed table to
+land in, rather than being chosen post hoc.
+
+\subsection{Pipeline sanity check (\texttt{overfit\_test})}
+
+\texttt{overfit\_test} trains the PoC network on 16 held-in examples
+for 200 steps through the compressed MAE~$\to$~transition~$\to$~diffusion
+curriculum and reports first/last/tail-mean loss. A working pipeline
+should show near-monotonic decrease within the MAE stage, a visible
+bump when reweighting switches on during the transition, and
+convergence toward a low tail loss during diffusion; a pipeline bug
+typically shows as a plateau at the random-guess cross-entropy
+($\ln|\mathcal{V}|$) or a non-finite loss (caught and logged by the
+circuit breaker in \texttt{KairosDiffusionTrainer}).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrl}
+\toprule
+Stage & Steps & First loss & Tail-mean loss & Status \\
+\midrule
+MAE ($p_{\max}=0.3$, $\alpha=0$) & TBD & TBD & TBD & TBD \\
+Transition (ramp) & TBD & TBD & TBD & TBD \\
+Diffusion ($p_{\max}=1.0$, $\alpha=1$) & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}
+\caption{Overfit sanity-check table, to be filled from
+\texttt{pipe.overfit\_test(n\_examples=16, steps=200)}.}
+\label{tab:overfit}
+\end{table}
+
+\subsection{Per-modality loss (\texttt{check\_per\_modality\_loss})}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrl}
+\toprule
+Modality & Mean masked CE loss & \# batches \\
+\midrule
+Text & TBD & TBD \\
+Image & TBD & TBD \\
+Audio & TBD & TBD \\
+Video & TBD & TBD \\
+Lidar & TBD & TBD \\
+Control (state/action) & TBD & TBD \\
+\bottomrule
+\end{tabular}
+\caption{Per-modality loss breakdown, to be filled from
+\texttt{pipe.check\_per\_modality\_loss()}. A large, isolated gap on
+one modality would flag a codec-scale or tokenizer mismatch for that
+stream rather than a global optimization problem.}
+\label{tab:permod}
+\end{table}
+
+\subsection{Instrumented compute report (\texttt{summary}, \texttt{memory\_report}, \texttt{profile})}
+
+The pipeline already measures, rather than estimates, step time and
+memory: \texttt{summary(benchmark=True)} runs $n$ real forward +
+backward + optimizer steps and reports mean step time and derived
+tokens/s; \texttt{memory\_report()} reports unique parameter bytes,
+optimizer-state bytes, and process RSS before/after a step;
+\texttt{profile()} reports per-module wall time. Table~\ref{tab:bench}
+is the structure these calls fill; Table~\ref{tab:throughput}'s
+theoretical figures are what this table would need to approach for the
+target design point to be trainable in practice.
+
+\begin{table}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrl}
+\toprule
+Config & Measured tok/s & Peak mem (GB) & Step time (ms) & Hardware \\
+\midrule
+PoC ($\sim$14--15M) & TBD & TBD & TBD & TBD \\
+Target (200M, projected) & TBD & TBD & TBD & not yet instantiated \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Real, instrumented benchmark table, to be filled from
+\texttt{pipe.summary(benchmark=True)} and \texttt{pipe.memory\_report()}
+once the PoC has run on target hardware.}
+\label{tab:bench}
+\end{table}
+
+\section{Discussion}
+
+For the target design point, bandwidth -- not FLOPs -- governs
+achievable training throughput, and $N_{\text{total}}$, not
+$N_{\text{act}}$, is the lever that sets it, because $N_{\text{total}}$
+drives the backward pass's byte traffic. MoE efficiency claims
+reported on data-center hardware, where bandwidth is generous relative
+to $N_{\text{total}}$, do not transfer cleanly to bandwidth-starved
+edge hardware for this reason. Separately, the PoC's under-sparse
+routing ($E=7$, $k=1$, versus a $E=32$, $k=4$ target) is itself a
+data point for \S\ref{sec:compute}: it was chosen specifically because
+wider top-1 routing failed to converge fast enough for a sanity check,
+which is a qualitative, code-level echo of the router-optimization
+difficulty discussed in the MoE literature, not yet a quantitative one.
+
+\subsection{Limitations}
+
+This is a design and compute-budget report, not a benchmark paper: the
+PoC has not been run to produce Tables~\ref{tab:overfit}--\ref{tab:bench},
+and Table~\ref{tab:throughput}'s figures are theoretical upper bounds
+for an untrained, uninstantiated target configuration. The Chinchilla
+extrapolation is out of its fitted range. The roofline model ignores
+kernel launch overhead, activation recomputation, and multi-GPU
+communication, all of which would lower real throughput further.
+Readers are encouraged to check any figure or citation here against
+its primary source; this analysis is a planning tool for the project,
+not a peer-reviewed benchmark.
+
+\section{Conclusion}
+
+Kairos is currently a $\sim$14--15M-parameter proof of concept
+exercising a hybrid bidirectional DeltaNet/SWA, MoE, masked-diffusion
+architecture end-to-end, with a separate 200M/25M design point used
+only to size a future run. The code-derived algorithms
+(\ref{alg:liz}--\ref{alg:diffusion}) and the roofline analysis together
+give a falsifiable next step ahead of that run: reduce
+$N_{\text{total}}$ at fixed $N_{\text{act}}$, then fill
+Tables~\ref{tab:overfit}--\ref{tab:bench} with real, instrumented
+numbers from the PoC before committing to the target scale.
+
+\bibliographystyle{plainnat}
+\bibliography{kairos_references}
+
+\end{document}
