@@ -37,8 +37,7 @@ def _():
 
 @app.cell
 def _():
-    # --force-reinstall required since pip skips reinstalling an unchanged version.
-    # !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
+    # !pip install -q git+https://github.com/fabienfrfr/Kairos@dev
     return
 
 
@@ -47,6 +46,7 @@ def _(os):
     from pathlib import Path
 
     # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
+    # Multi-GPU (T4x2): flex isn't thread-safe under DataParallel; launch via torchrun (DDP).
     os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
 
     import torch

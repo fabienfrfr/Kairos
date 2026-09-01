@@ -35,6 +35,15 @@ def _can_fuse_flex():
     return cap >= _FLEX_MIN_COMPUTE_CAPABILITY
 
 
+def _n_visible_gpus() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        return torch.cuda.device_count()
+    except Exception:  # noqa: BLE001 - device probing can fail on some setups
+        return 0
+
+
 if _ATTN_BACKEND == "flex":
     # explicit opt-in; fail loudly if flex_attention cannot be imported
     if not _FLEX_IMPORT_OK:
@@ -44,7 +53,8 @@ elif _ATTN_BACKEND == "eager":
     # windowed bidirectional SWA is O(L*W) with the eager unfold path
     ATTN_IMPL = "eager"
 else:  # "auto" (default): flex on a fused-capable GPU, eager otherwise
-    ATTN_IMPL = "flex" if _FLEX_IMPORT_OK and _can_fuse_flex() else "eager"
+    # flex is torch.compile'd: unsafe under DataParallel worker threads; DDP gets 1 GPU/rank.
+    ATTN_IMPL = "flex" if _FLEX_IMPORT_OK and _can_fuse_flex() and _n_visible_gpus() <= 1 else "eager"
 
 try:
     from fla.ops.gated_delta_rule import (
