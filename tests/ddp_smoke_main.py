@@ -22,7 +22,7 @@ tc = TrainConfig(
     save_every=3,
     eval_batches=2,
 )
-cfg = KairosConfig(d_model=16, n_heads=2, n_layers=1, num_modalities=8, attnres_block_size=2)
+cfg = KairosConfig(d_model=16, n_heads=2, n_layers=1, num_modalities=8, attnres_block_size=2, use_memory_gate=True)
 
 pipe = KairosMultimodalPipeline(cfg, dc, tc, eval_data_config=edc)
 pipe.build()

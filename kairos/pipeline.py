@@ -8,7 +8,10 @@ import itertools
 import json
 import math
 import os
+import pickle
 import random
+import subprocess
+import sys
 import time
 import warnings
 from collections import defaultdict
@@ -142,6 +145,42 @@ def init_distributed() -> bool:
         dist.init_process_group(backend=backend, timeout=datetime.timedelta(minutes=30))
         return True
     return False
+
+
+def launch_ddp(
+    model_config,
+    data_config,
+    eval_data_config,
+    train_config,
+    n_proc=None,
+    wait: bool = True,
+    resume: bool = True,
+):
+    """Spawns DDP training of a fresh pipeline via torchrun; one GPU per rank (flex + memory gate work)."""
+    # Configs are pickled to run_dir/ddp_job; pass fresh copies (post-build DataConfig is emptied).
+    run_dir = Path(train_config.run_dir)
+    job_dir = run_dir / "ddp_job"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    with (job_dir / "configs.pkl").open("wb") as f:
+        pickle.dump((model_config, data_config, eval_data_config, train_config), f)
+    n_proc = n_proc or (torch.cuda.device_count() or 1)
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={n_proc}",
+        "--rdzv-backend=c10d",
+        str(Path(__file__).parent / "_entry_ddp.py"),
+        str(job_dir),
+        str(int(resume)),
+    ]
+    log_path = run_dir / "train_ddp.log"
+    with log_path.open("ab") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+        if wait and proc.wait() != 0:
+            raise RuntimeError(f"DDP training failed (see {log_path})")
+    return proc
 
 
 class KairosMultimodalPipeline:
@@ -690,6 +729,7 @@ class KairosMultimodalPipeline:
     ) -> list[dict]:
         """Trains on a tiny subset to check memorization; walks the active curriculum stages."""
         self._require_built()
+        self._ensure_not_data_parallel(self.model_forward)
         if not self.is_main_process:
             return []
         from torch.utils.data import Subset
@@ -801,11 +841,22 @@ class KairosMultimodalPipeline:
         if self.model is None:
             raise RuntimeError("call .build() before .train()/.evaluate()/.check_per_modality_loss()")
 
+    @staticmethod
+    def _ensure_not_data_parallel(model_forward) -> None:
+        """Rejects single-process multi-GPU training: DP can't drive compile'd flex or memory-gate caches."""
+        if isinstance(model_forward, torch.nn.DataParallel):
+            raise TypeError(
+                "DataParallel cannot train: torch.compile'd flex and the SSM memory gate need one GPU "
+                "per process. Launch DDP instead: kairos.launch_ddp(model_config, data_config, "
+                "eval_data_config, train_config, n_proc=<n_gpus>) or `torchrun --standalone --nproc_per_node=N`."
+            )
+
     def train(
         self, progress_callback=None, resume: bool = True, memory_bank: KairosMultiCache | None = None
     ) -> list[dict]:
         """Runs the training loop; resumes from local last.pt or the hub if unavailable."""
         self._require_built()
+        self._ensure_not_data_parallel(self.model_forward)
         tc = self.train_config
         self.model.train()
 
