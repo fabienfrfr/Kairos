@@ -54,7 +54,7 @@ def _(os):
 
     from kairos.modeling import KairosConfig
     from kairos.tokenizer import KairosTokenizer, Modality
-    from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig, launch_ddp
+    from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
     from kairos.utils import make_progress_callback
     from kairos.dataset import (
         diagnose_raw_control_balance,
@@ -80,7 +80,6 @@ def _(os):
         Path,
         TrainConfig,
         diagnose_raw_control_balance,
-        launch_ddp,
         make_progress_callback,
         modality_counts,
         pd,
@@ -459,16 +458,6 @@ def _(
 ):
     from kairos.utils import count_active_parameters
 
-    # fresh config copies for the DDP job: build() below empties data_config in place
-    import copy
-
-    _ddp_configs = (
-        copy.deepcopy(model_config),
-        copy.deepcopy(data_config),
-        copy.deepcopy(eval_data_config),
-        copy.deepcopy(train_config),
-    )
-
     pipe = KairosMultimodalPipeline(
         model_config, data_config, train_config, eval_data_config=eval_data_config, tokenizer=tokenizer
     )
@@ -482,7 +471,7 @@ def _(
     )
     print(f"total params: {total_params / 1e6:.2f}M  active params/tok: {active_params / 1e6:.2f}M")
     print(f"device: {pipe.device}  samples: {len(pipe.dataset)}")
-    return (pipe, _ddp_configs)
+    return (pipe,)
 
 
 @app.cell
@@ -587,12 +576,9 @@ def _(
     make_progress_callback,
     mo,
     pipe,
-    torch,
 ):
     # walks whichever of the MAE / transition / diffusion stages are configured, proportionally
-    if OVERFIT_RUN and torch.cuda.device_count() > 1:
-        print("overfit_test is single-GPU-only; skipping on this multi-GPU box")  # run via launch_ddp instead
-    elif OVERFIT_RUN:
+    if OVERFIT_RUN:
         if mo.running_in_notebook():
             with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
                 overfit_logs = pipe.overfit_test(
@@ -621,39 +607,34 @@ def _():
 
 
 @app.cell
-def _(FORCE_RESTART, _ddp_configs, launch_ddp, make_progress_callback, mo, pipe, torch):
+def _(FORCE_RESTART, make_progress_callback, mo, pipe):
     _resumed = not FORCE_RESTART and (pipe.ckpt_dir / "last.pt").exists()
     if _resumed:
         print(f"found last.pt in {pipe.ckpt_dir} - resuming")
     elif FORCE_RESTART:
         print("FORCE_RESTART is True - ignoring any existing checkpoint")
 
-    if torch.cuda.device_count() > 1:
-        # multi-GPU -> DDP via torchrun: each rank drives its own GPU, so flex stays compiled
-        # and the SSM memory gate works; progress lands in checkpoints/.../train_ddp.log.
-        _job = launch_ddp(*_ddp_configs, n_proc=torch.cuda.device_count(), resume=not FORCE_RESTART)
-        print(f"DDP training done - log: {pipe.train_config.run_dir}/train_ddp.log")
-        logs = []
+    # on multi-GPU, pipe.train itself spawns a torchrun job (flex + memory gate per rank)
+    # and replays its steps into the progress_callback; results come back into this pipe.
+    _total_steps = pipe.train_config.epochs * len(pipe.loader)
+
+    if mo.running_in_notebook():
+        with mo.status.progress_bar(total=_total_steps, title="training") as _bar:
+            _state = {"last_step": 0}
+
+            def _on_step(step, total, loss_val):
+                _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
+                _state["last_step"] = step
+
+            logs = pipe.train(progress_callback=_on_step, resume=not FORCE_RESTART)
     else:
-        _total_steps = pipe.train_config.epochs * len(pipe.loader)
+        logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
 
-        if mo.running_in_notebook():
-            with mo.status.progress_bar(total=_total_steps, title="training") as _bar:
-                _state = {"last_step": 0}
-
-                def _on_step(step, total, loss_val):
-                    _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                    _state["last_step"] = step
-
-                logs = pipe.train(progress_callback=_on_step, resume=not FORCE_RESTART)
-        else:
-            logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
-
-        print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
-        print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
-        if pipe.eval_log_rows:
-            print(f"eval points: {len(pipe.eval_log_rows)}  best eval loss: {pipe.best_eval_loss:.4f}")
-        print(f"checkpoints: {pipe.ckpt_dir}")
+    print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
+    print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
+    if pipe.eval_log_rows:
+        print(f"eval points: {len(pipe.eval_log_rows)}  best eval loss: {pipe.best_eval_loss:.4f}")
+    print(f"checkpoints: {pipe.ckpt_dir}")
     return (logs,)
 
 

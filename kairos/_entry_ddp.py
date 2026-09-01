@@ -30,6 +30,17 @@ def main() -> None:
     main = pipe.is_main_process
     if main:
         print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}", flush=True)
+        results = {
+            "log_rows": pipe.log_rows,
+            "eval_log_rows": pipe.eval_log_rows,
+            "nan_log": getattr(pipe, "nan_log", []),
+            "best_loss": pipe.best_loss,
+            "best_eval_loss": pipe.best_eval_loss,
+            "skipped_nonfinite_steps": pipe.skipped_nonfinite_steps,
+            "global_step": pipe.global_step,
+        }
+        with (job_dir / "results.pkl").open("wb") as f:
+            pickle.dump(results, f)
 
 
 if __name__ == "__main__":

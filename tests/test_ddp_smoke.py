@@ -49,3 +49,29 @@ def test_launch_ddp_spawns_torchrun_job(tmp_path):
     log = Path(train_config.run_dir) / "train_ddp.log"
     assert log.exists()
     assert "training complete - steps:" in log.read_text()
+
+
+def test_pipe_train_forces_ddp_launch_and_rehydrates(tmp_path):
+    """pipe.train(ddp_launch=True) spawns the job, replays progress_callback, and pulls results back."""
+    from kairos.modeling import KairosConfig
+    from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+
+    texts = [{"modality": "text", "text": f"sentence {i} padded to a few dozen tokens."} for i in range(8)]
+    cfg = KairosConfig(d_model=16, n_heads=2, n_layers=1, num_modalities=8, use_memory_gate=True)
+    tc = TrainConfig(epochs=1, mae_epochs=0, transition_epochs=0, run_dir=str(tmp_path / "run"), eval_at_start=False)
+    pipe = KairosMultimodalPipeline(
+        cfg,
+        DataConfig(text_examples=texts, max_len=64, batch_size=2, num_workers=0),
+        tc,
+    )
+    pipe.build()
+    assert not pipe.distributed
+
+    steps = []
+    logs = pipe.train(resume=False, ddp_launch=True, n_proc=2, progress_callback=lambda s, t, l: steps.append((s, t, l)))
+    assert steps, "progress_callback was never replayed from the DDP log"
+    assert {s for s, _, _ in steps} == {1, 2}
+    assert pipe.global_step == 2
+    assert len(logs) == 2
+    assert pipe.best_loss < float("inf")
+    assert (tmp_path / "run" / "ddp_job" / "results.pkl").exists()

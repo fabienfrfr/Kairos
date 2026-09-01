@@ -198,6 +198,14 @@ class KairosMultimodalPipeline:
         self.train_config = train_config
         self.tokenizer = tokenizer or KairosTokenizer()
 
+        # build() empties data_config in place, so snapshot pre-build configs for a DDP-launched job.
+        self._ddp_snapshot = (
+            copy.deepcopy(model_config),
+            copy.deepcopy(data_config),
+            copy.deepcopy(eval_data_config),
+            copy.deepcopy(train_config),
+        )
+
         # distributed (DDP) state; init_distributed()/build() fill these from torchrun env.
         self.distributed = False
         self.world_size = 1
@@ -852,10 +860,20 @@ class KairosMultimodalPipeline:
             )
 
     def train(
-        self, progress_callback=None, resume: bool = True, memory_bank: KairosMultiCache | None = None
+        self,
+        progress_callback=None,
+        resume: bool = True,
+        memory_bank: KairosMultiCache | None = None,
+        ddp_launch: bool | None = None,
+        n_proc: int | None = None,
     ) -> list[dict]:
         """Runs the training loop; resumes from local last.pt or the hub if unavailable."""
         self._require_built()
+        # single process, several GPUs -> spawn a torchrun job (one GPU per rank) so flex and the
+        # SSM memory gate work; the job replays steps into progress_callback and its results come back.
+        auto_launch = ddp_launch is None and not self.distributed and torch.cuda.device_count() > 1
+        if auto_launch or ddp_launch:
+            return self._train_via_ddp(progress_callback=progress_callback, resume=resume, n_proc=n_proc)
         self._ensure_not_data_parallel(self.model_forward)
         tc = self.train_config
         self.model.train()
@@ -1023,6 +1041,48 @@ class KairosMultimodalPipeline:
                 self.writer.close()
 
         return self.log_rows
+
+    def _train_via_ddp(self, progress_callback=None, resume: bool = True, n_proc: int | None = None) -> list[dict]:
+        """Spawns a torchrun DDP job from the pre-build config snapshot, then rehydrates this pipe."""
+        tc = self.train_config
+        log_path = Path(tc.run_dir) / "train_ddp.log"
+        log_path.unlink(missing_ok=True)  # fresh log so step replay below never sees stale lines
+        proc = launch_ddp(*self._ddp_snapshot, n_proc=n_proc, resume=resume, wait=False)
+        index = 0
+        while proc.poll() is None:
+            index = self._replay_ddp_log(log_path, index, progress_callback)
+            time.sleep(0.25)
+        index = self._replay_ddp_log(log_path, index, progress_callback)
+        if proc.returncode != 0:
+            raise RuntimeError(f"DDP training failed (see {log_path})")
+        self._load_ddp_results(Path(tc.run_dir))
+        return self.log_rows
+
+    @staticmethod
+    def _replay_ddp_log(log_path: Path, index: int, progress_callback) -> int:
+        """Feeds progress_callback with step lines freshly written by the torchrun rank-0 process."""
+        if progress_callback is None or not log_path.exists():
+            return index
+        lines = log_path.read_text().splitlines()
+        for line in lines[index:]:
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "step":
+                step_total = parts[1].split("/", 1)
+                if len(step_total) == 2:
+                    try:
+                        progress_callback(int(step_total[0]), int(step_total[1]), float(parts[3]))
+                    except ValueError:
+                        pass
+            index += 1
+        return index
+
+    def _load_ddp_results(self, run_dir: Path) -> None:
+        res_path = run_dir / "ddp_job" / "results.pkl"
+        if not res_path.exists():
+            raise RuntimeError(f"DDP job finished but no {res_path} was written")
+        with res_path.open("rb") as f:
+            for key, value in pickle.load(f).items():
+                setattr(self, key, value)
 
     def locate_nan_source(self) -> dict | None:
         """Re-runs the last non-finite batch with hooks to find which module first."""
