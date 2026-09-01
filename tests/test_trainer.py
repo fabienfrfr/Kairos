@@ -257,6 +257,21 @@ def test_compute_masked_diffusion_losses_reweight_false_is_plain_ce(dense_model)
     assert plain.max() < 50  # sane CE range for a small vocab, no 1/p blowup
 
 
+def test_compute_masked_diffusion_losses_with_data_parallel_wrapper(dense_model):
+    """Regression for wrapped (DataParallel/multi-GPU) models; .module resolution."""
+    torch.manual_seed(0)
+    wrapped = torch.nn.DataParallel(dense_model)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=5, dtype=torch.float)
+
+    per_token_loss, _, _, _ = compute_masked_diffusion_losses(wrapped, x0, noise_mask, p, reweight=False)
+
+    assert per_token_loss.shape == (6,)
+    assert torch.isfinite(per_token_loss).all()
+
+
 def test_trainer_mask_p_max_and_reweight_default_to_full_diffusion(dense_model):
     """Defaults must reproduce the pre-curriculum behavior exactly."""
     trainer = KairosDiffusionTrainer(model=dense_model)

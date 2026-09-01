@@ -34,12 +34,13 @@ def compute_masked_diffusion_losses(
 ):
     """Noises ``x0`` on ``noise_mask``. With self_conditioning_prob>0, warms up with a no-grad
     pass and feeds its detached logits back in, matching generate()'s inference-time usage."""
+    inner = model.module if hasattr(model, "module") else model
     xt = x0.clone()
-    noise = torch.randint_like(x0, model.lm_head.vocab_size)
+    noise = torch.randint_like(x0, inner.lm_head.vocab_size)
     xt[noise_mask] = noise[noise_mask]
 
     xt_family, octet_targets = None, None
-    family_embed = model.embedding.family_embed
+    family_embed = inner.embedding.family_embed
     if family_ids is not None and family_embed is not None:
         xt_family = family_ids.clone()
         noise_family = torch.randint_like(family_ids, family_embed.num_embeddings)
@@ -55,7 +56,7 @@ def compute_masked_diffusion_losses(
                 family_ids=xt_family,
                 logits_mask=noise_mask,
             )
-        vocab_size = model.lm_head.vocab_size
+        vocab_size = inner.lm_head.vocab_size
         self_cond = torch.zeros(*x0.shape, vocab_size, device=x0.device, dtype=warm_out.logits.dtype)
         self_cond[noise_mask] = warm_out.logits.detach()
 
