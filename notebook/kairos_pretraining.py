@@ -597,7 +597,7 @@ def _(
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
         overfit_logs = []
-    return (overfit_logs,)
+    return
 
 
 @app.cell
