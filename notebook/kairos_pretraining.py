@@ -7,13 +7,16 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import os
-
     from huggingface_hub import login
 
-    # set via Kaggle > Secrets > Add secret (key: HF_TOKEN), or paste the token here
-    HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
+    try:
+        from kaggle_secrets import UserSecretsClient
+        HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
+    except Exception:
+        HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
+
     login(token=HF_TOKEN, add_to_git_credential=False)
-    return
+    return (os,)
 
 
 @app.cell
@@ -40,8 +43,7 @@ def _():
 
 
 @app.cell
-def _():
-    import os
+def _(os):
     from pathlib import Path
 
     # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
