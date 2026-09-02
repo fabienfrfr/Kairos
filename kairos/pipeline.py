@@ -481,9 +481,17 @@ class KairosMultimodalPipeline:
             num_experts_per_tok=self.model_config.num_experts_per_tok if self.model_config.use_moe else None,
             num_local_experts=self.model_config.num_local_experts if self.model_config.use_moe else None,
         )
+        # train() auto-launches DDP here too, splitting steps_per_epoch across ranks
+        n_gpus = torch.cuda.device_count() if not self.distributed and torch.cuda.device_count() > 1 else 1
+        ts.n_gpus = n_gpus
+        if n_gpus > 1:
+            ts.steps_per_epoch = math.ceil(ts.steps_per_epoch / n_gpus)
+            ts.total_steps = ts.epochs * ts.steps_per_epoch
         if avg_step_time is not None:
             ts.avg_step_time_sec = avg_step_time
             ts.estimated_total_time_sec = avg_step_time * ts.total_steps
+            if n_gpus > 1:
+                ts.estimated_total_time_sec *= 1.1  # rough DDP all-reduce overhead margin
         if mem_report is not None:
             ts.param_memory_mb = mem_report.unique_param_bytes / 1e6
             ts.optimizer_memory_mb = mem_report.optimizer_state_bytes / 1e6

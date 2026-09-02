@@ -465,8 +465,8 @@ class TrainingSummary:
     total_steps: int
     avg_step_time_sec: float | None = None
     estimated_total_time_sec: float | None = None
-    measured_memory: bool = False  # True when the memory fields below come from a real
-    # forward+backward+step (detailed_memory_report), not from the param-count formulas.
+    measured_memory: bool = False
+    n_gpus: int = 1  # DDP world size assumed for steps_per_epoch/estimated_total_time_sec
 
     def __str__(self) -> str:
         mem_label = "Measured" if self.measured_memory else "Est."
@@ -479,7 +479,7 @@ class TrainingSummary:
             f"{mem_label} model memory:".ljust(21) + f"{self.param_memory_mb:.1f} MB",
             f"{mem_label} optimizer mem:".ljust(21) + f"{self.optimizer_memory_mb:.1f} MB",
             f"{mem_label} total memory:".ljust(21) + f"{self.total_memory_mb:.1f} MB",
-            f"Steps/epoch:         {self.steps_per_epoch}",
+            f"Steps/epoch:         {self.steps_per_epoch}" + (f" (x{self.n_gpus} GPU, DDP)" if self.n_gpus > 1 else ""),
             f"Epochs:              {self.epochs}",
             f"Total steps:         {self.total_steps}",
         ]

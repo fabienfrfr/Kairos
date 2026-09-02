@@ -44,6 +44,10 @@ def _n_visible_gpus() -> int:
         return 0
 
 
+def _is_ddp_launch() -> bool:
+    return "WORLD_SIZE" in os.environ
+
+
 if _ATTN_BACKEND == "flex":
     # explicit opt-in; fail loudly if flex_attention cannot be imported
     if not _FLEX_IMPORT_OK:
@@ -52,9 +56,9 @@ if _ATTN_BACKEND == "flex":
 elif _ATTN_BACKEND == "eager":
     # windowed bidirectional SWA is O(L*W) with the eager unfold path
     ATTN_IMPL = "eager"
-else:  # "auto" (default): flex on a fused-capable GPU, eager otherwise
-    # flex is torch.compile'd: unsafe under DataParallel worker threads; DDP gets 1 GPU/rank.
-    ATTN_IMPL = "flex" if _FLEX_IMPORT_OK and _can_fuse_flex() and _n_visible_gpus() <= 1 else "eager"
+else:  # "auto" (default): flex on a fused-capable GPU, eager under unsafe DataParallel only
+    _flex_safe = _n_visible_gpus() <= 1 or _is_ddp_launch()
+    ATTN_IMPL = "flex" if _FLEX_IMPORT_OK and _can_fuse_flex() and _flex_safe else "eager"
 
 try:
     from fla.ops.gated_delta_rule import (
