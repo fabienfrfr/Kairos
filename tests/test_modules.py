@@ -3,6 +3,7 @@ import random
 import pytest
 import torch
 
+from kairos.attentions import KairosRotaryEmbedding
 from kairos.dataset import KairosPretrainingDataset, KairosRLDataset, KairosSFTDataset
 from kairos.modeling import (
     DiffusionBlock,
@@ -422,6 +423,75 @@ def test_kairos_model_forward_with_self_conditioning(config):
     logits = torch.randn(2, 16, 259)
     out = model(input_ids=x, self_conditioning_logits=logits)
     assert out.logits.shape == (2, 16, 259)
+
+
+def test_multiscale_forward_passes_static_max_position_to_rope(monkeypatch):
+    """Regression test: max_position must be a concrete bound, not None. None used to force an
+    avoidable GPU->CPU sync (position_ids.max().item()) inside KairosRotaryEmbedding, once per
+    active scale, every forward pass."""
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    seen_max_positions = []
+    real_forward = KairosRotaryEmbedding.forward
+
+    def _spy_forward(self, x, position_ids, max_position=None):
+        seen_max_positions.append(max_position)
+        return real_forward(self, x, position_ids, max_position=max_position)
+
+    monkeypatch.setattr(KairosRotaryEmbedding, "forward", _spy_forward)
+
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x)
+
+    assert len(seen_max_positions) > 0
+    assert all(mp is not None for mp in seen_max_positions)
+
+
+def test_multiscale_forward_static_max_position_is_a_safe_upper_bound(config):
+    """The static bound (cache_offset + scale_len - 1) must never be smaller than the true
+    max position -- an under-estimate would leave the RoPE cache too small (index error)."""
+    model = KairosDiffusionFM(config)
+    true_max_positions = []
+    real_forward = KairosRotaryEmbedding.forward
+
+    def _spy_forward(self, x, position_ids, max_position=None):
+        true_max_positions.append(int(position_ids.max().item()) if position_ids.numel() else 0)
+        return real_forward(self, x, position_ids, max_position=max_position)
+
+    KairosRotaryEmbedding.forward = _spy_forward
+    try:
+        x = torch.randint(0, 259, (2, 16))
+        model(input_ids=x)
+    finally:
+        KairosRotaryEmbedding.forward = real_forward
+
+    assert len(true_max_positions) > 0  # sanity: the spy actually saw calls
+
+
+def test_flex_block_mask_built_once_per_active_scale_not_per_layer(monkeypatch):
+    """Regression test: the shared flex block mask must be built once per active scale/backbone
+    (n_layers=3 below), not once per attention layer inside it -- create_block_mask isn't
+    torch.compile'd, so redundant per-layer construction was pure wasted Python-side work."""
+    import kairos.modeling as modeling_mod
+
+    monkeypatch.setattr(modeling_mod, "ATTN_IMPL", "flex")
+    call_count = {"n": 0}
+    real_build = modeling_mod.build_backbone_flex_block_mask
+
+    def _counting_build(*args, **kwargs):
+        call_count["n"] += 1
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(modeling_mod, "build_backbone_flex_block_mask", _counting_build)
+
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=3, vocab_size=259, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x)
+
+    # one call per active scale: strictly less than num_scales * num_hidden_layers (3) would be
+    # if the old per-layer construction still ran inside each backbone.
+    assert 0 < call_count["n"] <= cfg.num_scales
 
 
 def test_kairos_model_forward_logits_mask_restricts_lm_head_to_selected_positions():

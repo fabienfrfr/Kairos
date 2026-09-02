@@ -16,6 +16,8 @@ from kairos.attentions import (
     KairosGatedDeltaNet,
     KairosLiZAttention2,
     KairosRotaryEmbedding,
+    _is_ddp_launch,
+    _resolve_attn_impl,
     _supports_cu_seqlens,
 )
 from kairos.modeling import KairosCache
@@ -545,6 +547,49 @@ def test_kairos_attn_backend_eager_override(tmp_path):
     assert out.stdout.strip() == "eager"
 
 
+def test_is_ddp_launch_detects_world_size_env(monkeypatch):
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    assert _is_ddp_launch() is False
+
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    assert _is_ddp_launch() is True
+
+
+def test_auto_backend_picks_eager_on_multi_gpu_outside_ddp():
+    # torchrun-less multi-GPU (e.g. plain DataParallel) is unsafe for compiled flex
+    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True, n_visible_gpus=4, is_ddp=False)
+    assert got == "eager"
+
+
+def test_auto_backend_keeps_flex_under_ddp_despite_multiple_visible_gpus():
+    """Regression test: torchrun leaves every rank able to see all N GPUs on the node (only
+    set_device restricts the active one), so n_visible_gpus > 1 for every rank. Before
+    _is_ddp_launch(), auto-mode wrongly fell back to eager on the whole DDP run even though
+    each rank only ever drives its own single GPU."""
+    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True, n_visible_gpus=4, is_ddp=True)
+    assert got == "flex"
+
+
+def test_auto_backend_keeps_flex_on_single_gpu():
+    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True, n_visible_gpus=1, is_ddp=False)
+    assert got == "flex"
+
+
+def test_auto_backend_falls_back_when_flex_import_failed():
+    got = _resolve_attn_impl("auto", flex_import_ok=False, can_fuse=True, n_visible_gpus=1, is_ddp=False)
+    assert got == "eager"
+
+
+def test_explicit_flex_backend_raises_when_import_failed():
+    with pytest.raises(ImportError):
+        _resolve_attn_impl("flex", flex_import_ok=False, can_fuse=True, n_visible_gpus=1, is_ddp=False)
+
+
+def test_explicit_eager_backend_ignores_gpu_count():
+    got = _resolve_attn_impl("eager", flex_import_ok=True, can_fuse=True, n_visible_gpus=1, is_ddp=False)
+    assert got == "eager"
+
+
 def test_round_up_flex_block():
     from kairos.attentions import _FLEX_BLOCK_SIZE, _round_up
 
@@ -577,6 +622,99 @@ def test_build_flex_mask_bucketed_semantics():
     for q in range(q_len, bq):
         row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
         assert row[0] is True and not any(row[1:]), q
+
+
+def test_build_backbone_flex_block_mask_no_padding_matches_bucketed_semantics():
+    """The shared, once-per-backbone mask must have the exact same windowed semantics as the
+    per-layer _flex_mask_bucketed it replaces (no-padding branch)."""
+    from kairos.attentions import build_backbone_flex_block_mask
+
+    window, bq, q_len, batch_size = 2, 8, 5, 2
+    m = build_backbone_flex_block_mask(window, q_len, batch_size, attention_mask=None, device="cpu")
+    mask_mod = m.mask_mod
+    for q in range(q_len):
+        row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
+        lo, hi = max(0, q - window), min(q_len, q + window + 1)
+        assert row == [lo <= k < hi for k in range(bq)], q
+    for q in range(q_len, bq):
+        row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
+        assert row[0] is True and not any(row[1:]), q
+
+
+def test_build_backbone_flex_block_mask_padded_matches_per_row_padding():
+    """Padding branch: must respect each row's real length, same as _flex_mask_bucketed_padded."""
+    from kairos.attentions import build_backbone_flex_block_mask
+
+    window, q_len = 2, 5
+    pad = torch.ones(2, q_len, dtype=torch.bool)
+    pad[1, 3:] = False  # row 1 has real length 3
+    m = build_backbone_flex_block_mask(window, q_len, batch_size=2, attention_mask=pad, device="cpu")
+    mask_mod = m.mask_mod
+    for b, length in ((0, 5), (1, 3)):
+        for q in range(length):
+            row = [bool(mask_mod(b, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+            lo, hi = max(0, q - window), min(length, q + window + 1)
+            assert row == [lo <= k < hi for k in range(8)], (b, q)
+
+
+def test_build_backbone_flex_block_mask_ignores_fully_valid_attention_mask():
+    """An all-True attention_mask means 'no real padding': must take the cheaper no-padding
+    branch (matches the has_padding=False fast path used per-layer before this refactor)."""
+    from kairos.attentions import build_backbone_flex_block_mask
+
+    window, q_len = 2, 5
+    all_valid = torch.ones(2, q_len, dtype=torch.bool)
+    m_with_full_mask = build_backbone_flex_block_mask(window, q_len, 2, all_valid, device="cpu")
+    m_without_mask = build_backbone_flex_block_mask(window, q_len, 2, None, device="cpu")
+    for q in range(8):
+        row_a = [bool(m_with_full_mask.mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+        row_b = [bool(m_without_mask.mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+        assert row_a == row_b, q
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or ATTN_IMPL != "flex",
+    reason="flex_attention requires a CUDA device",
+)
+class TestSharedFlexBlockMask:
+    """Passing a pre-built block mask must not change attention output, and must skip the
+    layer's own per-instance mask construction/cache entirely."""
+
+    def _attn(self):
+        cfg = DummySWAConfig()
+        attn = KairosAttention(cfg, layer_idx=0)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        return attn, rope
+
+    def test_pre_built_mask_matches_default_construction(self):
+        from kairos.attentions import build_backbone_flex_block_mask
+
+        attn, rope = self._attn()
+        L = 114
+        x = torch.randn(2, L, 32, device="cuda")
+        pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+        cos_sin = rope(x, pos)
+
+        out_default = attn(x, cos_sin)
+
+        shared_mask = build_backbone_flex_block_mask(attn.window, L, 2, None, device="cuda")
+        out_shared = attn(x, cos_sin, attn_block_mask=shared_mask)
+
+        assert torch.allclose(out_default, out_shared, atol=1e-5)
+
+    def test_pre_built_mask_skips_internal_cache(self):
+        from kairos.attentions import build_backbone_flex_block_mask
+
+        attn, rope = self._attn()
+        L = 114
+        x = torch.randn(2, L, 32, device="cuda")
+        pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+        cos_sin = rope(x, pos)
+        shared_mask = build_backbone_flex_block_mask(attn.window, L, 2, None, device="cuda")
+
+        attn(x, cos_sin, attn_block_mask=shared_mask)
+
+        assert attn._flex_mask_cache == {}  # internal build was skipped entirely
 
 
 def test_flex_mask_bucketed_padded_per_row(monkeypatch):

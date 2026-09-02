@@ -38,6 +38,8 @@ def _():
 @app.cell
 def _():
     # !pip install -q git+https://github.com/fabienfrfr/Kairos@dev
+    # OR with fast-attn (flash-linear-attention + causal-conv1d: fused DeltaNet/conv1d kernels)
+    # !pip install -q "kairos-fm[fast-attn] @ git+https://github.com/fabienfrfr/Kairos@dev"
     return
 
 

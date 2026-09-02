@@ -48,17 +48,19 @@ def _is_ddp_launch() -> bool:
     return "WORLD_SIZE" in os.environ
 
 
-if _ATTN_BACKEND == "flex":
-    # explicit opt-in; fail loudly if flex_attention cannot be imported
-    if not _FLEX_IMPORT_OK:
-        raise ImportError("KAIROS_ATTN_BACKEND=flex requested but flex_attention is unavailable")
-    ATTN_IMPL = "flex"
-elif _ATTN_BACKEND == "eager":
-    # windowed bidirectional SWA is O(L*W) with the eager unfold path
-    ATTN_IMPL = "eager"
-else:  # "auto" (default): flex on a fused-capable GPU, eager under unsafe DataParallel only
-    _flex_safe = _n_visible_gpus() <= 1 or _is_ddp_launch()
-    ATTN_IMPL = "flex" if _FLEX_IMPORT_OK and _can_fuse_flex() and _flex_safe else "eager"
+def _resolve_attn_impl(backend: str, flex_import_ok: bool, can_fuse: bool, n_visible_gpus: int, is_ddp: bool) -> str:
+    if backend == "flex":
+        if not flex_import_ok:
+            raise ImportError("KAIROS_ATTN_BACKEND=flex requested but flex_attention is unavailable")
+        return "flex"
+    if backend == "eager":
+        return "eager"
+    # "auto": flex on a fused-capable GPU; only unsafe under un-set-device'd multi-GPU DataParallel
+    flex_safe = n_visible_gpus <= 1 or is_ddp
+    return "flex" if flex_import_ok and can_fuse and flex_safe else "eager"
+
+
+ATTN_IMPL = _resolve_attn_impl(_ATTN_BACKEND, _FLEX_IMPORT_OK, _can_fuse_flex(), _n_visible_gpus(), _is_ddp_launch())
 
 try:
     from fla.ops.gated_delta_rule import (
@@ -242,6 +244,21 @@ def build_flex_mask_bucketed(window, q_mask, kv_mask, device=None):
     return create_block_mask(bidir_window_bucketed, B=B, H=None, Q_LEN=bq, KV_LEN=bq, device=device)
 
 
+def build_backbone_flex_block_mask(window, q_len, batch_size, attention_mask, device=None):
+    """Block mask for one backbone's forward pass (window/shape/padding are identical for every
+    attention layer inside it at a given step): build once here, share across all layers instead
+    of each layer independently rebuilding an identical BlockMask (create_block_mask isn't
+    torch.compile'd, so this Python-side construction previously ran once per layer per step)."""
+    bq = _round_up(q_len, _FLEX_BLOCK_SIZE)
+    has_padding = attention_mask is not None and not bool(attention_mask.all())
+    if has_padding:
+        padded = F.pad(attention_mask.bool(), (0, bq - q_len), value=False)
+        return build_flex_mask_bucketed(window, padded, padded.clone(), device=device)
+    q_mask = torch.ones(batch_size, bq, dtype=torch.bool, device=device)
+    q_mask[:, q_len:] = False
+    return build_flex_mask_bucketed(window, q_mask, q_mask.clone(), device=device)
+
+
 # Kairos Attention (SWA bidirectional)
 class KairosAttention(nn.Module):
     def __init__(self, config, layer_idx=None):
@@ -291,7 +308,7 @@ class KairosAttention(nn.Module):
         padded = F.pad(attention_mask.bool(), (0, bq - kv_len), value=False)
         return build_flex_mask_bucketed(self.window, padded, padded.clone(), device=device)
 
-    def _flex_train(self, q, k, v, q_len, attention_mask):
+    def _flex_train(self, q, k, v, q_len, attention_mask, attn_block_mask=None):
         # round up to flex block so mask shape (and compiled kernel) is stable per length.
         bq = _round_up(q_len, _FLEX_BLOCK_SIZE)
         if bq > q_len:
@@ -299,11 +316,15 @@ class KairosAttention(nn.Module):
             q = F.pad(q, (0, 0, 0, 0, 0, pad_n))
             k = F.pad(k, (0, 0, 0, 0, 0, pad_n))
             v = F.pad(v, (0, 0, 0, 0, 0, pad_n))
-        has_padding = attention_mask is not None and not bool(attention_mask.all())
-        if has_padding:
-            block_mask = self._flex_mask_bucketed_padded(bq, attention_mask, q.device)
+        if attn_block_mask is not None:
+            # pre-built once by the caller (shared across every layer in the backbone this step)
+            block_mask = attn_block_mask
         else:
-            block_mask = self._flex_mask_bucketed(bq, q_len, q.size(0), q.device)
+            has_padding = attention_mask is not None and not bool(attention_mask.all())
+            if has_padding:
+                block_mask = self._flex_mask_bucketed_padded(bq, attention_mask, q.device)
+            else:
+                block_mask = self._flex_mask_bucketed(bq, q_len, q.size(0), q.device)
         out = flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -329,7 +350,15 @@ class KairosAttention(nn.Module):
         )
         return out.transpose(1, 2)
 
-    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        cache_params=None,
+        attention_mask=None,
+        position_ids=None,
+        attn_block_mask=None,
+    ):
         B, L, _ = x.shape
         if cache_params is not None and self.layer_idx is not None:
             offset = cache_params.get_total_seen(self.layer_idx)
@@ -356,7 +385,7 @@ class KairosAttention(nn.Module):
         if ATTN_IMPL == "flex":
             q_len, kv_len = q.size(1), k.size(1)
             if q_len == kv_len and q_len > 0:
-                out = self._flex_train(q, k, v, q_len, attention_mask)
+                out = self._flex_train(q, k, v, q_len, attention_mask, attn_block_mask=attn_block_mask)
             else:
                 out = self._flex_cached(q, k, v, attention_mask)
         else:
@@ -577,13 +606,22 @@ class KairosLiZAttention2(nn.Module):
         self.norm = KairosNorm(2 * self.hidden_size)
         self.out_proj = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
 
-    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        cache_params=None,
+        attention_mask=None,
+        position_ids=None,
+        attn_block_mask=None,
+    ):
         swa_out = self.swa(
             x,
             position_embeddings=position_embeddings,
             cache_params=cache_params,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            attn_block_mask=attn_block_mask,
         )
         delta_out = self.delta(x, cache_params=cache_params, attention_mask=attention_mask)
         out = torch.cat([swa_out, delta_out], dim=-1)

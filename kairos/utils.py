@@ -467,6 +467,9 @@ class TrainingSummary:
     estimated_total_time_sec: float | None = None
     measured_memory: bool = False
     n_gpus: int = 1  # DDP world size assumed for steps_per_epoch/estimated_total_time_sec
+    attn_impl: str | None = None
+    delta_rule_backend: str | None = None
+    causal_conv1d_backend: str | None = None
 
     def __str__(self) -> str:
         mem_label = "Measured" if self.measured_memory else "Est."
@@ -488,7 +491,19 @@ class TrainingSummary:
             lines.append(f"Est. total time:     {format_duration(self.estimated_total_time_sec)}")
         else:
             lines.append("Avg step time:       n/a")
+        if self.attn_impl is not None:
+            lines.append("")
+            lines.append("Compute backends")
+            lines.append("-----------------")
+            lines.append(f"Attention:           {self.attn_impl}")
+            lines.append(_backend_line("DeltaNet:", self.delta_rule_backend, slow_value="torch_fallback"))
+            lines.append(_backend_line("Causal conv1d:", self.causal_conv1d_backend, slow_value="torch_fallback"))
         return "\n".join(lines)
+
+
+def _backend_line(label: str, backend: str | None, slow_value: str) -> str:
+    warning = "  <- pip install -e '.[fast-attn]' for the fused kernel" if backend == slow_value else ""
+    return f"{label.ljust(21)}{backend}{warning}"
 
 
 def training_summary(

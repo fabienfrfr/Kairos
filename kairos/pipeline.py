@@ -15,6 +15,7 @@ import sys
 import time
 import warnings
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
 from .attentions import ATTN_IMPL as _ATTN_IMPL
+from .attentions import CAUSAL_CONV1D_BACKEND as _CAUSAL_CONV1D_BACKEND
+from .attentions import DELTA_RULE_BACKEND as _DELTA_RULE_BACKEND
 from .dataset import (
     KairosPretrainingDataset,
     diagnose_built_dataset,
@@ -104,6 +107,8 @@ class TrainConfig:
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes checkpoints
     hub_private: bool = False
     hub_subfolder: str | None = None  # push under repo_id/<subfolder>
+    compile_model: bool = True  # torch.compile(model_forward); skipped under DataParallel (thread-unsafe)
+    amp_dtype: str | None = None  # None=auto (bf16 whenever supported); "bf16"/"fp16" forces it
 
     def __post_init__(self):
         if self.epochs is not None:
@@ -119,6 +124,8 @@ class TrainConfig:
                 "TrainConfig needs at least one epoch: mae_epochs + transition_epochs + "
                 f"diffusion_epochs must be > 0, got {self.epochs}"
             )
+        if self.amp_dtype is not None and self.amp_dtype not in ("bf16", "fp16"):
+            raise ValueError(f"TrainConfig.amp_dtype must be None, 'bf16', or 'fp16', got {self.amp_dtype!r}")
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
@@ -136,6 +143,16 @@ def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
             current_id, current_len = v, 1
     longest[current_id] = max(longest.get(current_id, 0), current_len)
     return longest
+
+
+def _resolve_amp_dtype(amp_dtype_override: str | None, bf16_supported: bool) -> torch.dtype:
+    """Picks the CUDA autocast dtype: explicit override wins; otherwise bf16 whenever the
+    GPU/driver supports it (no scaler needed), fp16 only as the fallback."""
+    if amp_dtype_override == "bf16":
+        return torch.bfloat16
+    if amp_dtype_override == "fp16":
+        return torch.float16
+    return torch.bfloat16 if bf16_supported else torch.float16
 
 
 def init_distributed() -> bool:
@@ -211,6 +228,7 @@ class KairosMultimodalPipeline:
         self.world_size = 1
         self.rank = 0
         self.local_rank = 0
+        self.compiled = False  # build() sets this once torch.compile is (or isn't) applied
 
         self.device = train_config.device or ("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.startswith("cuda") and not torch.cuda.is_available():
@@ -225,10 +243,11 @@ class KairosMultimodalPipeline:
         self.hf_trainer: KairosDiffusionTrainer | None = None
         self.writer: SummaryWriter | None = None
 
-        # AMP: fp16 on pre-Ampere (T4), bf16 on Ampere+; GradScaler only for fp16.
+        # AMP: bf16 whenever the GPU/driver supports it (is_bf16_supported, not a hand-rolled SM
+        # check), fp16+GradScaler only as the fallback on hardware without native bf16.
         if torch.cuda.is_available():
             self.amp_device_type = "cuda"
-            self.amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability() >= (8, 0) else torch.float16
+            self.amp_dtype = _resolve_amp_dtype(train_config.amp_dtype, torch.cuda.is_bf16_supported())
         elif torch.backends.mps.is_available():
             self.amp_device_type = "mps"
             self.amp_dtype = torch.float16
@@ -249,6 +268,10 @@ class KairosMultimodalPipeline:
         self.nan_log: list[dict] = []
         self._last_nonfinite_batch: dict | None = None
 
+        # background disk writes for the frequent resumable checkpoint; see _save()/_flush_checkpoint_writes()
+        self._ckpt_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_ckpt_futures: list[Future] = []
+
     @property
     def is_main_process(self) -> bool:
         """True on rank 0 (or single process): logging / checkpoint / hub work is gated on this."""
@@ -268,9 +291,9 @@ class KairosMultimodalPipeline:
             return self.data_config.num_workers
         if self.data_config.batch_size <= 1:
             return 0
-        # cap at available CPUs; a flat "4" can stall/hang on a 1-2 core machine.
+        # cap at available CPUs; a flat "8" can stall/hang on a 1-2 core machine.
         cpu_count = os.cpu_count() or 1
-        return max(0, min(4, cpu_count - 1))
+        return max(0, min(8, cpu_count - 1))
 
     # ------------------------------------------------------------------ build
     def _build_dataset(self, data_config: DataConfig | None = None) -> KairosPretrainingDataset:
@@ -319,6 +342,11 @@ class KairosMultimodalPipeline:
         dc, tc = self.data_config, self.train_config
 
         self.distributed = init_distributed()
+        if torch.cuda.is_available():
+            # TF32 matmul: free precision/perf trade on Ampere+ for the fp32 ops autocast leaves untouched.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
         if self.distributed:
             self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
             self.rank = int(os.environ.get("RANK", "0"))
@@ -366,10 +394,15 @@ class KairosMultimodalPipeline:
             self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
         ).to(self.device)
         # state_dict/generate keep using self.model; self.model_forward is the parallel wrapper.
+        # torch.compile targets CUDA kernel-launch overhead; on CPU it mostly adds compile-time
+        # cost (and needs a C/Triton toolchain that test/sandbox environments often lack).
+        should_compile = tc.compile_model and torch.cuda.is_available()
+        self.compiled = should_compile
         if self.distributed:
             # Conditional forward (unused params) -> DDP needs find_unused_parameters.
+            forward_module = torch.compile(self.model) if should_compile else self.model
             self.model_forward = DDP(
-                self.model,
+                forward_module,
                 device_ids=[self.local_rank] if torch.cuda.is_available() else None,
                 find_unused_parameters=True,
             )
@@ -383,10 +416,11 @@ class KairosMultimodalPipeline:
                         "<script>` so each rank drives its own GPU, or set KAIROS_ATTN_BACKEND=eager for a "
                         "DataParallel run."
                     )
+                # DataParallel threads share a compiled graph across GPUs -> unsafe, same as flex above.
                 self.model_forward = torch.nn.DataParallel(self.model)
             else:
-                self.model_forward = self.model
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
+                self.model_forward = torch.compile(self.model) if should_compile else self.model
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr, fused=torch.cuda.is_available())
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
 
@@ -484,6 +518,9 @@ class KairosMultimodalPipeline:
         # train() auto-launches DDP here too, splitting steps_per_epoch across ranks
         n_gpus = torch.cuda.device_count() if not self.distributed and torch.cuda.device_count() > 1 else 1
         ts.n_gpus = n_gpus
+        ts.attn_impl = _ATTN_IMPL
+        ts.delta_rule_backend = _DELTA_RULE_BACKEND
+        ts.causal_conv1d_backend = _CAUSAL_CONV1D_BACKEND
         if n_gpus > 1:
             ts.steps_per_epoch = math.ceil(ts.steps_per_epoch / n_gpus)
             ts.total_steps = ts.epochs * ts.steps_per_epoch
@@ -1018,11 +1055,12 @@ class KairosMultimodalPipeline:
 
                     if self.is_main_process:
                         if self.global_step % tc.last_ckpt_every == 0:
-                            self._save(last_ckpt, loss_val, epoch)  # overwritten, resumable
+                            self._save(last_ckpt, loss_val, epoch, wait=False)  # overwritten, resumable
                         if self.global_step % tc.save_every == 0:
                             step_ckpt = self.ckpt_dir / f"step_{self.global_step:06d}.pt"
                             self._save(step_ckpt, loss_val, epoch)
                             if tc.hub_repo_id and tc.hub_push_every_ckpt:
+                                self._flush_checkpoint_writes()  # last_ckpt may still be in-flight (async save)
                                 self._push_checkpoint_to_hub(step_ckpt)
                                 self._push_checkpoint_to_hub(last_ckpt)
 
@@ -1038,11 +1076,13 @@ class KairosMultimodalPipeline:
                             self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
 
             if self.is_main_process:
+                self._flush_checkpoint_writes()  # last_ckpt's last async write must land before unlink
                 last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume
             # final eval on the converged weights (skip if the last step already evaluated)
             if eval_every_steps > 0 and self.global_step % eval_every_steps != 0:
                 self.evaluate()  # all ranks join the all_reduce inside
         finally:
+            self._flush_checkpoint_writes()
             self.skipped_nonfinite_steps = skipped_nonfinite
             if self.writer is not None:
                 self.writer.flush()
@@ -1198,20 +1238,30 @@ class KairosMultimodalPipeline:
             "eval_data_config": edc,
         }
 
-    def _save(self, path: Path, loss_val: float, epoch: int = 1):
-        torch.save(
-            {
-                "step": self.global_step,
-                "epoch": epoch,
-                "model_state": self.model.state_dict(),
-                "optimizer_state": self.optimizer.state_dict(),
-                "scheduler_state": self.scheduler.state_dict(),
-                "loss": loss_val,
-                "config": self.model_config.to_dict(),
-                "train_config": asdict(self.train_config),
-            },
-            path,
-        )
+    def _flush_checkpoint_writes(self) -> None:
+        """Waits for pending async checkpoint writes; re-raises the first failure (disk full,
+        permissions, ...) instead of letting it vanish silently on a background thread."""
+        while self._pending_ckpt_futures:
+            self._pending_ckpt_futures.pop(0).result()
+
+    def _save(self, path: Path, loss_val: float, epoch: int = 1, wait: bool = True):
+        """Clones model/optimizer/scheduler state (fast) then writes to disk off the main thread,
+        so frequent checkpoints (last_ckpt_every) don't stall the training loop on I/O. wait=True
+        (default) blocks until the write completes, matching the old synchronous behaviour --
+        needed right before a hub push or unlink reads/touches the same path."""
+        payload = {
+            "step": self.global_step,
+            "epoch": epoch,
+            "model_state": copy.deepcopy(self.model.state_dict()),
+            "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),
+            "scheduler_state": copy.deepcopy(self.scheduler.state_dict()),
+            "loss": loss_val,
+            "config": self.model_config.to_dict(),
+            "train_config": asdict(self.train_config),
+        }
+        self._pending_ckpt_futures.append(self._ckpt_executor.submit(torch.save, payload, path))
+        if wait:
+            self._flush_checkpoint_writes()
 
     def load_checkpoint(self, path: str):
         """Loads a local .pt checkpoint into the built model/optimizer/scheduler."""

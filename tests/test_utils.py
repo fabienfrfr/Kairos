@@ -140,6 +140,55 @@ def test_training_summary_with_benchmark():
     assert summary.estimated_total_time_sec == pytest.approx(summary.avg_step_time_sec * summary.total_steps)
 
 
+def test_training_summary_str_omits_backend_section_when_unset():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(4))
+    summary = training_summary(model, loader, epochs=1, step_fn=None)
+    assert "Compute backends" not in str(summary)
+
+
+def test_training_summary_str_shows_fused_backend_without_warning():
+    summary = TrainingSummary(
+        total_params=10,
+        trainable_params=10,
+        active_params=10,
+        param_memory_mb=0.0,
+        optimizer_memory_mb=0.0,
+        total_memory_mb=0.0,
+        steps_per_epoch=1,
+        epochs=1,
+        total_steps=1,
+        attn_impl="flex",
+        delta_rule_backend="fla",
+        causal_conv1d_backend="causal_conv1d",
+    )
+    text = str(summary)
+    assert "Compute backends" in text
+    assert "Attention:           flex" in text
+    assert "DeltaNet:            fla" in text
+    assert "pip install" not in text
+
+
+def test_training_summary_str_warns_on_slow_deltanet_fallback():
+    summary = TrainingSummary(
+        total_params=10,
+        trainable_params=10,
+        active_params=10,
+        param_memory_mb=0.0,
+        optimizer_memory_mb=0.0,
+        total_memory_mb=0.0,
+        steps_per_epoch=1,
+        epochs=1,
+        total_steps=1,
+        attn_impl="flex",
+        delta_rule_backend="torch_fallback",
+        causal_conv1d_backend="torch_fallback",
+    )
+    text = str(summary)
+    assert "DeltaNet:            torch_fallback  <- pip install -e '.[fast-attn]'" in text
+    assert "Causal conv1d:       torch_fallback  <- pip install -e '.[fast-attn]'" in text
+
+
 def test_training_summary_str_contains_key_fields():
     model = nn.Linear(4, 2)
     loader = _TinyLoader(range(4))
