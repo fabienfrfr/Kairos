@@ -4,9 +4,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from kairos.attentions import (
     ATTN_IMPL,
@@ -220,6 +222,103 @@ def test_deltanet_bidir_effect():
     out_b = model.process(x_rev)
     out_b = torch.flip(out_b, dims=[1])
     assert not torch.allclose(out_f, out_b, atol=1e-3)
+
+
+class _CuSeqlensSpy:
+    """Stand-in for chunk_gated_delta_rule: records the exact args it received and returns a
+    shape-correct zero output, so process() can run to completion without a real fla/CUDA kernel."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, q, k, v, g, beta, **kwargs):
+        self.calls.append({"q_shape": tuple(q.shape), "cu_seqlens": kwargs["cu_seqlens"].clone()})
+        return v.new_zeros(v.shape), None
+
+
+def test_deltanet_varlen_pads_total_tokens_to_fixed_block_during_training():
+    """Regression test: Triton autotunes per input shape, and the real (unpadded) token count
+    varies every training step -- without padding, the kernel re-autotunes (several CPU-bound
+    seconds, observed directly via TRITON_PRINT_AUTOTUNING=1) on nearly every call."""
+    from kairos.attentions import _FLEX_BLOCK_SIZE
+
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False  # row 0 has real length 12 -> total valid tokens = 12 + 16 = 28
+
+    model.process(x, cache_params=None, attention_mask=mask)
+
+    assert len(spy.calls) == 1
+    padded_total = spy.calls[0]["q_shape"][1]
+    assert padded_total % _FLEX_BLOCK_SIZE == 0
+    assert padded_total >= 28  # never smaller than the real content
+
+
+def test_deltanet_varlen_cu_seqlens_gets_a_phantom_trailing_segment():
+    """The padding rows must form their own segment (never mixed into a real one's state)."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask)
+
+    cu_seqlens = spy.calls[0]["cu_seqlens"]
+    real_lengths = mask.sum(dim=1)
+    expected_real_boundaries = F.pad(real_lengths.cumsum(0), (1, 0)).to(torch.int32)
+    assert torch.equal(cu_seqlens[: len(expected_real_boundaries)], expected_real_boundaries)
+    assert len(cu_seqlens) == len(expected_real_boundaries) + 1  # + 1 phantom segment
+    assert cu_seqlens[-1] == spy.calls[0]["q_shape"][1]  # phantom segment ends at the padded total
+
+
+def test_deltanet_varlen_output_shape_unaffected_by_internal_padding():
+    """The padding is purely internal: process()'s output shape must still match the input,
+    regardless of the bucketed size used for the kernel call."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    model.chunk_gated_delta_rule = _CuSeqlensSpy()
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    out = model.process(x, cache_params=None, attention_mask=mask)
+
+    assert out.shape == (2, 16, model.n_heads, 2 * model.head_dim)
+
+
+def test_deltanet_varlen_skips_padding_when_cache_params_present():
+    """Regression test: the padding/phantom-segment trick is only safe when there's no cache to
+    round-trip -- it must be a no-op for generation/incremental decoding (untouched, unverified
+    without real hardware), matching the exact pre-fix cu_seqlens construction."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+    fake_cache = MagicMock()
+    fake_cache.conv_caches = [None]
+    fake_cache.ssm_caches = [None]
+
+    model.process(x, cache_params=fake_cache, attention_mask=mask)
+
+    cu_seqlens = spy.calls[0]["cu_seqlens"]
+    real_lengths = mask.sum(dim=1)
+    expected = F.pad(real_lengths.cumsum(0), (1, 0)).to(torch.int32)
+    assert torch.equal(cu_seqlens, expected)  # no phantom segment appended
+    assert spy.calls[0]["q_shape"][1] == int(real_lengths.sum())  # not padded to a block boundary
 
 
 def test_deltanet_backward():

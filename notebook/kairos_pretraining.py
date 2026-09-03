@@ -39,7 +39,8 @@ def _():
 def _():
     # !pip install -q git+https://github.com/fabienfrfr/Kairos@dev
     # OR with fast-attn (flash-linear-attention + causal-conv1d: fused DeltaNet/conv1d kernels)
-    # !pip install -q "kairos-fm[fast-attn] @ git+https://github.com/fabienfrfr/Kairos@dev"
+    # !pip install -q --no-build-isolation causal-conv1d flash-linear-attention
+    # !pip install -q "kairos-fm @ git+https://github.com/fabienfrfr/Kairos@dev"
     return
 
 

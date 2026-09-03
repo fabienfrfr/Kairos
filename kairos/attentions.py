@@ -528,6 +528,23 @@ class KairosGatedDeltaNet(nn.Module):
             v_p = v[bi, li].unsqueeze(0)
             g_p = g[bi, li].unsqueeze(0)
             beta_p = beta[bi, li].unsqueeze(0)
+            total = q_p.shape[1]
+            if cache_params is None:
+                # Triton autotunes per input shape; the real (unpadded) token count varies every
+                # training step, so without this the kernel re-autotunes (several CPU-bound
+                # seconds) on nearly every call. Pad to a fixed block boundary with the extra rows
+                # forming their own phantom trailing segment in cu_seqlens: never mixed with a
+                # real segment's state, never scattered back below. Only safe with no cache to
+                # round-trip (training) -- left untouched for generation/incremental decoding.
+                bt = _round_up(total, _FLEX_BLOCK_SIZE)
+                pad_n = bt - total
+                if pad_n > 0:
+                    q_p = F.pad(q_p, (0, 0, 0, 0, 0, pad_n))
+                    k_p = F.pad(k_p, (0, 0, 0, 0, 0, pad_n))
+                    v_p = F.pad(v_p, (0, 0, 0, 0, 0, pad_n))
+                    g_p = F.pad(g_p, (0, 0, 0, pad_n))
+                    beta_p = F.pad(beta_p, (0, 0, 0, pad_n))
+                    cu_seqlens = F.pad(cu_seqlens, (0, 1), value=bt)
             o_p, ssm_cache = self.chunk_gated_delta_rule(
                 q_p,
                 k_p,
@@ -541,7 +558,7 @@ class KairosGatedDeltaNet(nn.Module):
                 cu_seqlens=cu_seqlens,
             )
             o = v.new_zeros(v.shape)
-            o[bi, li] = o_p.squeeze(0)
+            o[bi, li] = o_p.squeeze(0)[:total]
         else:
             if has_padding:
                 m = attention_mask.to(beta.dtype).unsqueeze(-1)
