@@ -995,13 +995,77 @@ def test_summary_does_not_scale_steps_when_already_distributed(built_pipeline, m
     assert summary.steps_per_epoch == len(built_pipeline.loader)
 
 
-def test_summary_estimated_time_reflects_multi_gpu_step_scaling(built_pipeline, monkeypatch):
+def test_summary_benchmark_routes_through_ddp_when_multi_gpu_visible(built_pipeline, monkeypatch):
+    """summary(benchmark=True) must launch a real DDP job for an accurate multi-GPU benchmark
+    (mirrors train()'s auto-launch), not guess locally with a fudge-factor estimate."""
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    fake_summary = TrainingSummary(
+        total_params=1,
+        trainable_params=1,
+        active_params=1,
+        param_memory_mb=0.0,
+        optimizer_memory_mb=0.0,
+        total_memory_mb=0.0,
+        steps_per_epoch=1,
+        epochs=1,
+        total_steps=1,
+    )
+    calls = []
+
+    def _fake_run_via_ddp(action, **kwargs):
+        calls.append((action, kwargs))
+        return {"summary": fake_summary}
+
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", _fake_run_via_ddp)
+
+    result = built_pipeline.summary(benchmark=True, n_bench_steps=3)
+
+    assert result is fake_summary
+    expected_kwargs = {"benchmark": True, "n_bench_steps": 3}
+    assert calls == [("summary", {"resume": False, "action_kwargs": expected_kwargs})]
+
+
+def test_summary_benchmark_false_does_not_launch_ddp_even_with_multi_gpu(built_pipeline, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not be called")))
+
+    summary = built_pipeline.summary(benchmark=False)
+
+    assert summary.n_gpus == 4
+
+
+def test_summary_benchmark_does_not_relaunch_ddp_when_already_distributed(built_pipeline, monkeypatch):
+    """A rank inside an already-launched DDP job must never spawn another torchrun subprocess."""
+    monkeypatch.setattr(built_pipeline, "distributed", True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not relaunch")))
 
     summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
 
-    expected = summary.avg_step_time_sec * summary.total_steps * 1.1
-    assert summary.estimated_total_time_sec == pytest.approx(expected)
+    assert summary.avg_step_time_sec is not None
+
+
+def test_build_never_constructs_data_parallel(built_pipeline):
+    # regression: DataParallel is fully removed -- model_forward must never be that type
+    assert not isinstance(built_pipeline.model_forward, torch.nn.DataParallel)
+
+
+def test_build_warns_and_uses_single_gpu_when_multiple_visible_without_torchrun(
+    tmp_path, model_config, text_examples, monkeypatch
+):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    with pytest.warns(UserWarning, match="Multiple GPUs visible"):
+        pipe.build()
+
+    assert not isinstance(pipe.model_forward, torch.nn.DataParallel)
+
+
+def test_build_does_not_warn_with_a_single_gpu(tmp_path, model_config, text_examples, recwarn):
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+    pipe.build()
+    assert not any("Multiple GPUs visible" in str(w.message) for w in recwarn)
 
 
 def test_summary_benchmark_handles_exhausted_loader_gracefully(built_pipeline, monkeypatch):
@@ -1220,7 +1284,7 @@ def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text
 
 def test_train_calls_compute_loss_with_model_forward_not_bare_model(built_pipeline, monkeypatch):
     """Regression: train() used to call compute_loss(self.model, ...) directly, skipping
-    self.model_forward (DataParallel-wrapped when n_gpus > 1), unlike every other method."""
+    self.model_forward (DDP-wrapped under torchrun), unlike every other method."""
 
     # distinct proxy identity, so we can prove train() calls model_forward and not self.model
     class _Proxy(torch.nn.Module):

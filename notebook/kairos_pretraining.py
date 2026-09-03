@@ -48,8 +48,7 @@ def _():
 def _(os):
     from pathlib import Path
 
-    # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
-    # Multi-GPU (T4x2): flex isn't thread-safe under DataParallel; launch via torchrun (DDP).
+    # auto: fused flex_attention on SM>=7.0 GPUs (T4); multi-GPU (T4x2) needs torchrun for DDP.
     os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
 
     import torch

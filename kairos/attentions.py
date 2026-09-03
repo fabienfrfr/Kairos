@@ -91,8 +91,7 @@ except ImportError:
         )
 
 
-# DeltaNet runs on every layer alongside SWA (see KairosLiZAttention2); without fla/causal-conv1d
-# it silently falls back to slow pure-PyTorch kernels - warn loudly on CUDA
+# without fla/causal-conv1d, DeltaNet silently falls back to slow pure-PyTorch kernels.
 def _warn_if_missing_fast_kernels(cuda_available: bool, delta_backend: str, conv_backend: str) -> None:
     """Pure function (no CUDA/import side effects), directly unit-testable without reloading."""
     if not cuda_available or (delta_backend == "fla" and conv_backend == "causal_conv1d"):
@@ -245,10 +244,7 @@ def build_flex_mask_bucketed(window, q_mask, kv_mask, device=None):
 
 
 def build_backbone_flex_block_mask(window, q_len, batch_size, attention_mask, device=None):
-    """Block mask for one backbone's forward pass (window/shape/padding are identical for every
-    attention layer inside it at a given step): build once here, share across all layers instead
-    of each layer independently rebuilding an identical BlockMask (create_block_mask isn't
-    torch.compile'd, so this Python-side construction previously ran once per layer per step)."""
+    """Block mask shared by every attention layer in one backbone's forward pass, built once here."""
     bq = _round_up(q_len, _FLEX_BLOCK_SIZE)
     has_padding = attention_mask is not None and not bool(attention_mask.all())
     if has_padding:
@@ -530,12 +526,7 @@ class KairosGatedDeltaNet(nn.Module):
             beta_p = beta[bi, li].unsqueeze(0)
             total = q_p.shape[1]
             if cache_params is None:
-                # Triton autotunes per input shape; the real (unpadded) token count varies every
-                # training step, so without this the kernel re-autotunes (several CPU-bound
-                # seconds) on nearly every call. Pad to a fixed block boundary with the extra rows
-                # forming their own phantom trailing segment in cu_seqlens: never mixed with a
-                # real segment's state, never scattered back below. Only safe with no cache to
-                # round-trip (training) -- left untouched for generation/incremental decoding.
+                # pads real token count to a fixed block so Triton doesn't re-autotune every step.
                 bt = _round_up(total, _FLEX_BLOCK_SIZE)
                 pad_n = bt - total
                 if pad_n > 0:

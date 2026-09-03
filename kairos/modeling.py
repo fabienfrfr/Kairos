@@ -649,14 +649,12 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
             if gathered is not None:
                 cache_offset = local_cache.get_total_seen(0) if local_cache is not None else 0
                 position_ids = positions + cache_offset
-                # positions are argsort indices into [0, scale.shape[1]) -> this bound is exact and
-                # static (no data-dependent sync needed, unlike position_ids.max().item() below).
+                # positions are argsort indices into [0, scale.shape[1]) -> exact static bound.
                 max_position = cache_offset + scale.shape[1] - 1
                 cos, sin = self.rotary(scale, position_ids, max_position=max_position)
                 attn_block_mask = None
                 if ATTN_IMPL == "flex":
-                    # built once per backbone/step and shared by every attention layer inside it,
-                    # instead of each layer independently rebuilding an identical BlockMask.
+                    # built once per backbone/step, shared by every attention layer inside it.
                     attn_block_mask = build_backbone_flex_block_mask(
                         self.config.sliding_window_size, gathered.shape[1], gathered.shape[0], pad_mask, gathered.device
                     )

@@ -107,7 +107,7 @@ class TrainConfig:
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes checkpoints
     hub_private: bool = False
     hub_subfolder: str | None = None  # push under repo_id/<subfolder>
-    compile_model: bool = True  # torch.compile(model_forward); skipped under DataParallel (thread-unsafe)
+    compile_model: bool = True  # torch.compile(model_forward); skipped on CPU (needs CUDA)
     amp_dtype: str | None = None  # None=auto (bf16 whenever supported); "bf16"/"fp16" forces it
 
     def __post_init__(self):
@@ -146,8 +146,7 @@ def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
 
 
 def _resolve_amp_dtype(amp_dtype_override: str | None, bf16_supported: bool) -> torch.dtype:
-    """Picks the CUDA autocast dtype: explicit override wins; otherwise bf16 whenever the
-    GPU/driver supports it (no scaler needed), fp16 only as the fallback."""
+    """Picks the CUDA autocast dtype: override wins; else bf16 if supported, fp16 as the fallback."""
     if amp_dtype_override == "bf16":
         return torch.bfloat16
     if amp_dtype_override == "fp16":
@@ -172,14 +171,18 @@ def launch_ddp(
     n_proc=None,
     wait: bool = True,
     resume: bool = True,
+    action: str = "train",
+    action_kwargs: dict | None = None,
 ):
-    """Spawns DDP training of a fresh pipeline via torchrun; one GPU per rank (flex + memory gate work)."""
+    """Spawns a fresh pipeline via torchrun; one GPU per rank (flex + memory gate work)."""
     # Configs are pickled to run_dir/ddp_job; pass fresh copies (post-build DataConfig is emptied).
     run_dir = Path(train_config.run_dir)
     job_dir = run_dir / "ddp_job"
     job_dir.mkdir(parents=True, exist_ok=True)
     with (job_dir / "configs.pkl").open("wb") as f:
         pickle.dump((model_config, data_config, eval_data_config, train_config), f)
+    with (job_dir / "job.pkl").open("wb") as f:
+        pickle.dump({"action": action, "resume": resume, "kwargs": action_kwargs or {}}, f)
     n_proc = n_proc or (torch.cuda.device_count() or 1)
     cmd = [
         sys.executable,
@@ -190,13 +193,12 @@ def launch_ddp(
         "--rdzv-backend=c10d",
         str(Path(__file__).parent / "_entry_ddp.py"),
         str(job_dir),
-        str(int(resume)),
     ]
-    log_path = run_dir / "train_ddp.log"
+    log_path = run_dir / f"{action}_ddp.log"
     with log_path.open("ab") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
         if wait and proc.wait() != 0:
-            raise RuntimeError(f"DDP training failed (see {log_path})")
+            raise RuntimeError(f"DDP {action} failed (see {log_path})")
     return proc
 
 
@@ -243,8 +245,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer: KairosDiffusionTrainer | None = None
         self.writer: SummaryWriter | None = None
 
-        # AMP: bf16 whenever the GPU/driver supports it (is_bf16_supported, not a hand-rolled SM
-        # check), fp16+GradScaler only as the fallback on hardware without native bf16.
+        # AMP: bf16 if the GPU/driver supports it (is_bf16_supported), else fp16+GradScaler.
         if torch.cuda.is_available():
             self.amp_device_type = "cuda"
             self.amp_dtype = _resolve_amp_dtype(train_config.amp_dtype, torch.cuda.is_bf16_supported())
@@ -394,8 +395,6 @@ class KairosMultimodalPipeline:
             self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
         ).to(self.device)
         # state_dict/generate keep using self.model; self.model_forward is the parallel wrapper.
-        # torch.compile targets CUDA kernel-launch overhead; on CPU it mostly adds compile-time
-        # cost (and needs a C/Triton toolchain that test/sandbox environments often lack).
         should_compile = tc.compile_model and torch.cuda.is_available()
         self.compiled = should_compile
         if self.distributed:
@@ -407,19 +406,15 @@ class KairosMultimodalPipeline:
                 find_unused_parameters=True,
             )
         else:
-            n_gpus = torch.cuda.device_count()
-            if n_gpus > 1:
-                if _ATTN_IMPL == "flex":
-                    raise RuntimeError(
-                        "flex_attention + multi-GPU in a single process is not supported (torch.compile is not "
-                        "thread-safe under DataParallel). Launch with `torchrun --nproc_per_node=<n> --standalone "
-                        "<script>` so each rank drives its own GPU, or set KAIROS_ATTN_BACKEND=eager for a "
-                        "DataParallel run."
-                    )
-                # DataParallel threads share a compiled graph across GPUs -> unsafe, same as flex above.
-                self.model_forward = torch.nn.DataParallel(self.model)
-            else:
-                self.model_forward = torch.compile(self.model) if should_compile else self.model
+            if torch.cuda.device_count() > 1:
+                warnings.warn(
+                    "Multiple GPUs visible but not launched via torchrun: model_forward will only "
+                    "use cuda:0. train() still auto-launches DDP across all visible GPUs; launch "
+                    "the whole script via torchrun to use every GPU for summary/generate/evaluate "
+                    "too.",
+                    stacklevel=2,
+                )
+            self.model_forward = torch.compile(self.model) if should_compile else self.model
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr, fused=torch.cuda.is_available())
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
@@ -452,6 +447,10 @@ class KairosMultimodalPipeline:
     def summary(self, benchmark: bool = True, n_bench_steps: int = 5) -> TrainingSummary:
         """Report params/memory/time; benchmark=True uses one real step, not param formulas."""
         self._require_built()
+        if benchmark and not self.distributed and torch.cuda.device_count() > 1:
+            kwargs = {"benchmark": True, "n_bench_steps": n_bench_steps}
+            results = self._run_via_ddp("summary", resume=False, action_kwargs=kwargs)
+            return results["summary"]
 
         mem_report = None
         avg_step_time = None
@@ -515,7 +514,7 @@ class KairosMultimodalPipeline:
             num_experts_per_tok=self.model_config.num_experts_per_tok if self.model_config.use_moe else None,
             num_local_experts=self.model_config.num_local_experts if self.model_config.use_moe else None,
         )
-        # train() auto-launches DDP here too, splitting steps_per_epoch across ranks
+        # here only for the benchmark=False static estimate; benchmark=True routes via DDP above.
         n_gpus = torch.cuda.device_count() if not self.distributed and torch.cuda.device_count() > 1 else 1
         ts.n_gpus = n_gpus
         ts.attn_impl = _ATTN_IMPL
@@ -527,8 +526,6 @@ class KairosMultimodalPipeline:
         if avg_step_time is not None:
             ts.avg_step_time_sec = avg_step_time
             ts.estimated_total_time_sec = avg_step_time * ts.total_steps
-            if n_gpus > 1:
-                ts.estimated_total_time_sec *= 1.1  # rough DDP all-reduce overhead margin
         if mem_report is not None:
             ts.param_memory_mb = mem_report.unique_param_bytes / 1e6
             ts.optimizer_memory_mb = mem_report.optimizer_state_bytes / 1e6
@@ -782,7 +779,6 @@ class KairosMultimodalPipeline:
     ) -> list[dict]:
         """Trains on a tiny subset to check memorization; walks the active curriculum stages."""
         self._require_built()
-        self._ensure_not_data_parallel(self.model_forward)
         if not self.is_main_process:
             return []
         from torch.utils.data import Subset
@@ -894,16 +890,6 @@ class KairosMultimodalPipeline:
         if self.model is None:
             raise RuntimeError("call .build() before .train()/.evaluate()/.check_per_modality_loss()")
 
-    @staticmethod
-    def _ensure_not_data_parallel(model_forward) -> None:
-        """Rejects single-process multi-GPU training: DP can't drive compile'd flex or memory-gate caches."""
-        if isinstance(model_forward, torch.nn.DataParallel):
-            raise TypeError(
-                "DataParallel cannot train: torch.compile'd flex and the SSM memory gate need one GPU "
-                "per process. Launch DDP instead: kairos.launch_ddp(model_config, data_config, "
-                "eval_data_config, train_config, n_proc=<n_gpus>) or `torchrun --standalone --nproc_per_node=N`."
-            )
-
     def train(
         self,
         progress_callback=None,
@@ -914,12 +900,13 @@ class KairosMultimodalPipeline:
     ) -> list[dict]:
         """Runs the training loop; resumes from local last.pt or the hub if unavailable."""
         self._require_built()
-        # single process, several GPUs -> spawn a torchrun job (one GPU per rank) so flex and the
-        # SSM memory gate work; the job replays steps into progress_callback and its results come back.
+        # single process, several GPUs visible -> spawn a torchrun job (one GPU per rank).
         auto_launch = ddp_launch is None and not self.distributed and torch.cuda.device_count() > 1
         if auto_launch or ddp_launch:
-            return self._train_via_ddp(progress_callback=progress_callback, resume=resume, n_proc=n_proc)
-        self._ensure_not_data_parallel(self.model_forward)
+            results = self._run_via_ddp("train", n_proc=n_proc, progress_callback=progress_callback, resume=resume)
+            for key, value in results.items():
+                setattr(self, key, value)
+            return self.log_rows
         tc = self.train_config
         self.model.train()
 
@@ -1090,21 +1077,24 @@ class KairosMultimodalPipeline:
 
         return self.log_rows
 
-    def _train_via_ddp(self, progress_callback=None, resume: bool = True, n_proc: int | None = None) -> list[dict]:
-        """Spawns a torchrun DDP job from the pre-build config snapshot, then rehydrates this pipe."""
+    def _run_via_ddp(
+        self, action: str, n_proc=None, progress_callback=None, resume: bool = True, action_kwargs: dict | None = None
+    ) -> dict:
+        """Spawns a torchrun job (one GPU per rank), shared by train() and summary()."""
         tc = self.train_config
-        log_path = Path(tc.run_dir) / "train_ddp.log"
+        log_path = Path(tc.run_dir) / f"{action}_ddp.log"
         log_path.unlink(missing_ok=True)  # fresh log so step replay below never sees stale lines
-        proc = launch_ddp(*self._ddp_snapshot, n_proc=n_proc, resume=resume, wait=False)
+        proc = launch_ddp(
+            *self._ddp_snapshot, n_proc=n_proc, resume=resume, wait=False, action=action, action_kwargs=action_kwargs
+        )
         index = 0
         while proc.poll() is None:
             index = self._replay_ddp_log(log_path, index, progress_callback)
             time.sleep(0.25)
         index = self._replay_ddp_log(log_path, index, progress_callback)
         if proc.returncode != 0:
-            raise RuntimeError(f"DDP training failed (see {log_path})")
-        self._load_ddp_results(Path(tc.run_dir))
-        return self.log_rows
+            raise RuntimeError(f"DDP {action} failed (see {log_path})")
+        return self._load_ddp_results(Path(tc.run_dir))
 
     @staticmethod
     def _replay_ddp_log(log_path: Path, index: int, progress_callback) -> int:
@@ -1124,13 +1114,13 @@ class KairosMultimodalPipeline:
             index += 1
         return index
 
-    def _load_ddp_results(self, run_dir: Path) -> None:
+    @staticmethod
+    def _load_ddp_results(run_dir: Path) -> dict:
         res_path = run_dir / "ddp_job" / "results.pkl"
         if not res_path.exists():
             raise RuntimeError(f"DDP job finished but no {res_path} was written")
         with res_path.open("rb") as f:
-            for key, value in pickle.load(f).items():
-                setattr(self, key, value)
+            return pickle.load(f)
 
     def locate_nan_source(self) -> dict | None:
         """Re-runs the last non-finite batch with hooks to find which module first."""
@@ -1239,16 +1229,12 @@ class KairosMultimodalPipeline:
         }
 
     def _flush_checkpoint_writes(self) -> None:
-        """Waits for pending async checkpoint writes; re-raises the first failure (disk full,
-        permissions, ...) instead of letting it vanish silently on a background thread."""
+        """Waits for pending async checkpoint writes; re-raises the first failure instead of losing it."""
         while self._pending_ckpt_futures:
             self._pending_ckpt_futures.pop(0).result()
 
     def _save(self, path: Path, loss_val: float, epoch: int = 1, wait: bool = True):
-        """Clones model/optimizer/scheduler state (fast) then writes to disk off the main thread,
-        so frequent checkpoints (last_ckpt_every) don't stall the training loop on I/O. wait=True
-        (default) blocks until the write completes, matching the old synchronous behaviour --
-        needed right before a hub push or unlink reads/touches the same path."""
+        """Clones state (fast) then writes off the main thread; wait=True blocks until it lands."""
         payload = {
             "step": self.global_step,
             "epoch": epoch,
