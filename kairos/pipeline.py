@@ -444,13 +444,21 @@ class KairosMultimodalPipeline:
         return self
 
     # -------------------------------------------------------------- summary
-    def summary(self, benchmark: bool = True, n_bench_steps: int = 5) -> TrainingSummary:
+    def summary(self, benchmark: bool = True, n_bench_steps: int = 5, ddp_benchmark: bool = False) -> TrainingSummary:
         """Report params/memory/time; benchmark=True uses one real step, not param formulas."""
         self._require_built()
-        if benchmark and not self.distributed and torch.cuda.device_count() > 1:
+        if ddp_benchmark and benchmark and not self.distributed and torch.cuda.device_count() > 1:
             kwargs = {"benchmark": True, "n_bench_steps": n_bench_steps}
             results = self._run_via_ddp("summary", resume=False, action_kwargs=kwargs)
             return results["summary"]
+        if benchmark and not self.distributed and torch.cuda.device_count() > 1:
+            warnings.warn(
+                "Multiple GPUs visible: benchmark will only use cuda:0 (fast, single-process). "
+                "Pass summary(ddp_benchmark=True) for a real multi-GPU torchrun benchmark -- slower "
+                "to start (full pipeline rebuild per rank) and can hang in constrained notebook "
+                "environments (Kaggle/Colab rendezvous issues).",
+                stacklevel=2,
+            )
 
         mem_report = None
         avg_step_time = None

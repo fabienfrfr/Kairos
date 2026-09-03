@@ -995,9 +995,9 @@ def test_summary_does_not_scale_steps_when_already_distributed(built_pipeline, m
     assert summary.steps_per_epoch == len(built_pipeline.loader)
 
 
-def test_summary_benchmark_routes_through_ddp_when_multi_gpu_visible(built_pipeline, monkeypatch):
-    """summary(benchmark=True) must launch a real DDP job for an accurate multi-GPU benchmark
-    (mirrors train()'s auto-launch), not guess locally with a fudge-factor estimate."""
+def test_summary_ddp_benchmark_true_routes_through_ddp_when_multi_gpu_visible(built_pipeline, monkeypatch):
+    """summary(ddp_benchmark=True) is the opt-in for a real multi-GPU torchrun benchmark; it must
+    not be the default (full pipeline rebuild per rank is slow and can hang in notebooks)."""
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     fake_summary = TrainingSummary(
         total_params=1,
@@ -1018,11 +1018,21 @@ def test_summary_benchmark_routes_through_ddp_when_multi_gpu_visible(built_pipel
 
     monkeypatch.setattr(built_pipeline, "_run_via_ddp", _fake_run_via_ddp)
 
-    result = built_pipeline.summary(benchmark=True, n_bench_steps=3)
+    result = built_pipeline.summary(benchmark=True, n_bench_steps=3, ddp_benchmark=True)
 
     assert result is fake_summary
     expected_kwargs = {"benchmark": True, "n_bench_steps": 3}
     assert calls == [("summary", {"resume": False, "action_kwargs": expected_kwargs})]
+
+
+def test_summary_default_does_not_launch_ddp_and_warns_with_multi_gpu(built_pipeline, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not be called")))
+
+    with pytest.warns(UserWarning, match="cuda:0"):
+        summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+
+    assert summary.avg_step_time_sec is not None
 
 
 def test_summary_benchmark_false_does_not_launch_ddp_even_with_multi_gpu(built_pipeline, monkeypatch):
@@ -1040,7 +1050,7 @@ def test_summary_benchmark_does_not_relaunch_ddp_when_already_distributed(built_
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not relaunch")))
 
-    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1, ddp_benchmark=True)
 
     assert summary.avg_step_time_sec is not None
 
