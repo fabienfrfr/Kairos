@@ -18,7 +18,6 @@ from kairos.attentions import (
     KairosGatedDeltaNet,
     KairosLiZAttention2,
     KairosRotaryEmbedding,
-    _is_ddp_launch,
     _resolve_attn_impl,
     _supports_cu_seqlens,
 )
@@ -225,8 +224,7 @@ def test_deltanet_bidir_effect():
 
 
 class _CuSeqlensSpy:
-    """Stand-in for chunk_gated_delta_rule: records the exact args it received and returns a
-    shape-correct zero output, so process() can run to completion without a real fla/CUDA kernel."""
+    """Stand-in for chunk_gated_delta_rule: records args, returns a shape-correct zero output."""
 
     def __init__(self):
         self.calls = []
@@ -237,9 +235,7 @@ class _CuSeqlensSpy:
 
 
 def test_deltanet_varlen_pads_total_tokens_to_fixed_block_during_training():
-    """Regression test: Triton autotunes per input shape, and the real (unpadded) token count
-    varies every training step -- without padding, the kernel re-autotunes (several CPU-bound
-    seconds, observed directly via TRITON_PRINT_AUTOTUNING=1) on nearly every call."""
+    """Regression test: unpadded token count varies every step, so warmup=0 re-autotunes it."""
     from kairos.attentions import _FLEX_BLOCK_SIZE
 
     model = get_deltanet_model()
@@ -281,8 +277,7 @@ def test_deltanet_varlen_cu_seqlens_gets_a_phantom_trailing_segment():
 
 
 def test_deltanet_varlen_output_shape_unaffected_by_internal_padding():
-    """The padding is purely internal: process()'s output shape must still match the input,
-    regardless of the bucketed size used for the kernel call."""
+    """Padding is internal: process()'s output shape must still match the input."""
     model = get_deltanet_model()
     model._chunk_supports_varlen = True
     model.chunk_gated_delta_rule = _CuSeqlensSpy()
@@ -297,9 +292,7 @@ def test_deltanet_varlen_output_shape_unaffected_by_internal_padding():
 
 
 def test_deltanet_varlen_skips_padding_when_cache_params_present():
-    """Regression test: the padding/phantom-segment trick is only safe when there's no cache to
-    round-trip -- it must be a no-op for generation/incremental decoding (untouched, unverified
-    without real hardware), matching the exact pre-fix cu_seqlens construction."""
+    """Padding is only safe with no cache to round-trip: no-op for generation/decoding."""
     model = get_deltanet_model()
     model._chunk_supports_varlen = True
     spy = _CuSeqlensSpy()
@@ -319,6 +312,74 @@ def test_deltanet_varlen_skips_padding_when_cache_params_present():
     expected = F.pad(real_lengths.cumsum(0), (1, 0)).to(torch.int32)
     assert torch.equal(cu_seqlens, expected)  # no phantom segment appended
     assert spy.calls[0]["q_shape"][1] == int(real_lengths.sum())  # not padded to a block boundary
+
+
+def test_deltanet_varlen_pads_to_static_full_seq_len_when_provided():
+    """full_seq_len is the pre-gather scale length: padding to B*full_seq_len is run-invariant."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask, full_seq_len=64)
+
+    assert spy.calls[0]["q_shape"][1] == 2 * 64
+
+
+def test_deltanet_varlen_static_shape_is_stable_across_different_content_lengths():
+    """Core regression test: different real content must still produce the same padded shape."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask_a = torch.ones(2, 16, dtype=torch.bool)
+    mask_a[0, 12:] = False
+    mask_b = torch.ones(2, 16, dtype=torch.bool)
+    mask_b[1, 3:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask_a, full_seq_len=64)
+    model.process(x, cache_params=None, attention_mask=mask_b, full_seq_len=64)
+
+    assert spy.calls[0]["q_shape"] == spy.calls[1]["q_shape"]
+
+
+def test_deltanet_varlen_static_padding_never_goes_negative():
+    """Sanity bound: total valid tokens never exceeds B*full_seq_len, so pad_n stays >= 0."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)  # fully valid: total == B*L == B*full_seq_len
+
+    model.process(x, cache_params=None, attention_mask=mask, full_seq_len=16)
+
+    assert spy.calls[0]["q_shape"][1] == 2 * 16
+
+
+def test_deltanet_varlen_falls_back_to_block_rounding_without_full_seq_len():
+    """Backward compatibility: full_seq_len=None must keep the block-rounding fallback."""
+    from kairos.attentions import _FLEX_BLOCK_SIZE
+
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask)
+
+    assert spy.calls[0]["q_shape"][1] % _FLEX_BLOCK_SIZE == 0
 
 
 def test_deltanet_backward():
@@ -646,46 +707,28 @@ def test_kairos_attn_backend_eager_override(tmp_path):
     assert out.stdout.strip() == "eager"
 
 
-def test_is_ddp_launch_detects_world_size_env(monkeypatch):
-    monkeypatch.delenv("WORLD_SIZE", raising=False)
-    assert _is_ddp_launch() is False
-
-    monkeypatch.setenv("WORLD_SIZE", "4")
-    assert _is_ddp_launch() is True
+def test_auto_backend_picks_flex_on_a_usable_gpu():
+    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True)
+    assert got == "flex"
 
 
-def test_auto_backend_picks_eager_on_multi_gpu_outside_ddp():
-    # torchrun-less multi-GPU (e.g. plain DataParallel) is unsafe for compiled flex
-    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True, n_visible_gpus=4, is_ddp=False)
+def test_auto_backend_falls_back_without_a_usable_gpu():
+    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=False)
     assert got == "eager"
 
 
-def test_auto_backend_keeps_flex_under_ddp_despite_multiple_visible_gpus():
-    """Regression test: torchrun leaves every rank able to see all N GPUs on the node (only
-    set_device restricts the active one), so n_visible_gpus > 1 for every rank. Before
-    _is_ddp_launch(), auto-mode wrongly fell back to eager on the whole DDP run even though
-    each rank only ever drives its own single GPU."""
-    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True, n_visible_gpus=4, is_ddp=True)
-    assert got == "flex"
-
-
-def test_auto_backend_keeps_flex_on_single_gpu():
-    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True, n_visible_gpus=1, is_ddp=False)
-    assert got == "flex"
-
-
 def test_auto_backend_falls_back_when_flex_import_failed():
-    got = _resolve_attn_impl("auto", flex_import_ok=False, can_fuse=True, n_visible_gpus=1, is_ddp=False)
+    got = _resolve_attn_impl("auto", flex_import_ok=False, can_fuse=True)
     assert got == "eager"
 
 
 def test_explicit_flex_backend_raises_when_import_failed():
     with pytest.raises(ImportError):
-        _resolve_attn_impl("flex", flex_import_ok=False, can_fuse=True, n_visible_gpus=1, is_ddp=False)
+        _resolve_attn_impl("flex", flex_import_ok=False, can_fuse=True)
 
 
-def test_explicit_eager_backend_ignores_gpu_count():
-    got = _resolve_attn_impl("eager", flex_import_ok=True, can_fuse=True, n_visible_gpus=1, is_ddp=False)
+def test_explicit_eager_backend_ignores_gpu_availability():
+    got = _resolve_attn_impl("eager", flex_import_ok=True, can_fuse=True)
     assert got == "eager"
 
 
@@ -724,8 +767,7 @@ def test_build_flex_mask_bucketed_semantics():
 
 
 def test_build_backbone_flex_block_mask_no_padding_matches_bucketed_semantics():
-    """The shared, once-per-backbone mask must have the exact same windowed semantics as the
-    per-layer _flex_mask_bucketed it replaces (no-padding branch)."""
+    """The shared mask must match the per-layer _flex_mask_bucketed semantics it replaces."""
     from kairos.attentions import build_backbone_flex_block_mask
 
     window, bq, q_len, batch_size = 2, 8, 5, 2
@@ -757,8 +799,7 @@ def test_build_backbone_flex_block_mask_padded_matches_per_row_padding():
 
 
 def test_build_backbone_flex_block_mask_ignores_fully_valid_attention_mask():
-    """An all-True attention_mask means 'no real padding': must take the cheaper no-padding
-    branch (matches the has_padding=False fast path used per-layer before this refactor)."""
+    """An all-True attention_mask must take the cheaper no-padding branch."""
     from kairos.attentions import build_backbone_flex_block_mask
 
     window, q_len = 2, 5
@@ -776,8 +817,7 @@ def test_build_backbone_flex_block_mask_ignores_fully_valid_attention_mask():
     reason="flex_attention requires a CUDA device",
 )
 class TestSharedFlexBlockMask:
-    """Passing a pre-built block mask must not change attention output, and must skip the
-    layer's own per-instance mask construction/cache entirely."""
+    """Passing a pre-built mask must not change output and must skip the layer's own cache."""
 
     def _attn(self):
         cfg = DummySWAConfig()
@@ -991,8 +1031,7 @@ def test_causal_conv1d_backend_matches_installed_package():
 
 
 def test_warns_on_cuda_without_fast_kernels():
-    """On a CUDA machine without fla/causal-conv1d, importing kairos.attentions should warn
-    loudly instead of silently falling back — this used to be a silent ImportError->None swap."""
+    """On CUDA without fla/causal-conv1d, importing kairos.attentions should warn loudly."""
     from kairos.attentions import _warn_if_missing_fast_kernels
 
     with pytest.warns(UserWarning, match="fast-attn"):

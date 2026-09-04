@@ -353,8 +353,7 @@ def test_codec_conv_gradient_flow():
 
 
 def test_codec_conv_has_fewer_params_than_patch():
-    """conv mode is depthwise (O(patch*d_model)); patch mode is dense (O(patch*d_model^2)),
-    so conv is the cheaper mode, especially at larger patch sizes."""
+    """conv mode is depthwise (cheaper); patch mode is dense, especially at larger patch sizes."""
     patch = PyramidalCodec(32, stride=3, num_scales=2)
     conv = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
     n_patch = sum(p.numel() for p in patch.parameters())
@@ -363,8 +362,7 @@ def test_codec_conv_has_fewer_params_than_patch():
 
 
 def test_codec_conv_decoder_is_depthwise_not_dense():
-    """Guards against the O(patch*d_model^2) 1x1-conv decoder regression: a depthwise
-    ConvTranspose1d's params scale with d_model, not d_model^2."""
+    """Guards against the 1x1-conv decoder regression: depthwise params scale with d_model."""
     small = PyramidalCodec(32, stride=5, num_scales=1, mode="conv")
     big = PyramidalCodec(64, stride=5, num_scales=1, mode="conv")
     n_small = sum(p.numel() for p in small.decoders.parameters())
@@ -426,9 +424,7 @@ def test_kairos_model_forward_with_self_conditioning(config):
 
 
 def test_multiscale_forward_passes_static_max_position_to_rope(monkeypatch):
-    """Regression test: max_position must be a concrete bound, not None. None used to force an
-    avoidable GPU->CPU sync (position_ids.max().item()) inside KairosRotaryEmbedding, once per
-    active scale, every forward pass."""
+    """Regression test: max_position must be a concrete bound, not None (avoids a GPU sync)."""
     cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
     model = KairosDiffusionFM(cfg)
     seen_max_positions = []
@@ -448,8 +444,7 @@ def test_multiscale_forward_passes_static_max_position_to_rope(monkeypatch):
 
 
 def test_multiscale_forward_static_max_position_is_a_safe_upper_bound(config):
-    """The static bound (cache_offset + scale_len - 1) must never be smaller than the true
-    max position -- an under-estimate would leave the RoPE cache too small (index error)."""
+    """The static bound must never be smaller than the true max position (RoPE cache size)."""
     model = KairosDiffusionFM(config)
     true_max_positions = []
     real_forward = KairosRotaryEmbedding.forward
@@ -469,9 +464,7 @@ def test_multiscale_forward_static_max_position_is_a_safe_upper_bound(config):
 
 
 def test_flex_block_mask_built_once_per_active_scale_not_per_layer(monkeypatch):
-    """Regression test: the shared flex block mask must be built once per active scale/backbone
-    (n_layers=3 below), not once per attention layer inside it -- create_block_mask isn't
-    torch.compile'd, so redundant per-layer construction was pure wasted Python-side work."""
+    """Regression test: the shared flex block mask must be built once per scale, not per layer."""
     import kairos.modeling as modeling_mod
 
     monkeypatch.setattr(modeling_mod, "ATTN_IMPL", "flex")
@@ -489,9 +482,30 @@ def test_flex_block_mask_built_once_per_active_scale_not_per_layer(monkeypatch):
     x = torch.randint(0, 259, (2, 16))
     model(input_ids=x)
 
-    # one call per active scale: strictly less than num_scales * num_hidden_layers (3) would be
-    # if the old per-layer construction still ran inside each backbone.
+    # one call per active scale, not per layer (num_hidden_layers=3 above would multiply it).
     assert 0 < call_count["n"] <= cfg.num_scales
+
+
+def test_full_seq_len_reaches_deltanet_matching_scale_shape(monkeypatch):
+    """Regression test: full_seq_len must reach KairosGatedDeltaNet.process from the top."""
+    from kairos.attentions import KairosGatedDeltaNet
+
+    seen_full_seq_lens = []
+    real_process = KairosGatedDeltaNet.process
+
+    def _spy_process(self, hidden_states, cache_params=None, attention_mask=None, full_seq_len=None):
+        seen_full_seq_lens.append(full_seq_len)
+        return real_process(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
+
+    monkeypatch.setattr(KairosGatedDeltaNet, "process", _spy_process)
+
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x)
+
+    assert len(seen_full_seq_lens) > 0
+    assert all(fsl is not None for fsl in seen_full_seq_lens)
 
 
 def test_kairos_model_forward_logits_mask_restricts_lm_head_to_selected_positions():

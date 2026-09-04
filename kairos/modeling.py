@@ -280,6 +280,7 @@ class DiffusionBlock(nn.Module):
         attention_mask=None,
         position_ids=None,
         attn_block_mask=None,
+        full_seq_len=None,
     ):
         x = x + self.attn(
             self.norm1(x),
@@ -288,6 +289,7 @@ class DiffusionBlock(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             attn_block_mask=attn_block_mask,
+            full_seq_len=full_seq_len,
         )
         x = x + self.ffn(self.norm2(x))
         return x
@@ -332,6 +334,7 @@ class KairosDiffusionBackbone(nn.Module):
         attention_mask=None,
         position_ids=None,
         attn_block_mask=None,
+        full_seq_len=None,
     ):
         emb = x
         completed = []  # finalized block-sums of prior layer
@@ -351,6 +354,7 @@ class KairosDiffusionBackbone(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 attn_block_mask=attn_block_mask,
+                full_seq_len=full_seq_len,
             )
             partial = x if partial is None else partial + x
             in_block += 1
@@ -665,6 +669,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
                     attention_mask=pad_mask,
                     position_ids=position_ids,
                     attn_block_mask=attn_block_mask,
+                    full_seq_len=scale.shape[1],
                 )
                 output = self.router.scatter_active(output, chunk, pad_mask, positions)
             features.append(output)

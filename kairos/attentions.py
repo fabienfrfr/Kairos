@@ -35,32 +35,17 @@ def _can_fuse_flex():
     return cap >= _FLEX_MIN_COMPUTE_CAPABILITY
 
 
-def _n_visible_gpus() -> int:
-    if not torch.cuda.is_available():
-        return 0
-    try:
-        return torch.cuda.device_count()
-    except Exception:  # noqa: BLE001 - device probing can fail on some setups
-        return 0
-
-
-def _is_ddp_launch() -> bool:
-    return "WORLD_SIZE" in os.environ
-
-
-def _resolve_attn_impl(backend: str, flex_import_ok: bool, can_fuse: bool, n_visible_gpus: int, is_ddp: bool) -> str:
+def _resolve_attn_impl(backend: str, flex_import_ok: bool, can_fuse: bool) -> str:
     if backend == "flex":
         if not flex_import_ok:
             raise ImportError("KAIROS_ATTN_BACKEND=flex requested but flex_attention is unavailable")
         return "flex"
     if backend == "eager":
         return "eager"
-    # "auto": flex on a fused-capable GPU; only unsafe under un-set-device'd multi-GPU DataParallel
-    flex_safe = n_visible_gpus <= 1 or is_ddp
-    return "flex" if flex_import_ok and can_fuse and flex_safe else "eager"
+    return "flex" if flex_import_ok and can_fuse else "eager"
 
 
-ATTN_IMPL = _resolve_attn_impl(_ATTN_BACKEND, _FLEX_IMPORT_OK, _can_fuse_flex(), _n_visible_gpus(), _is_ddp_launch())
+ATTN_IMPL = _resolve_attn_impl(_ATTN_BACKEND, _FLEX_IMPORT_OK, _can_fuse_flex())
 
 try:
     from fla.ops.gated_delta_rule import (
@@ -447,7 +432,7 @@ class KairosGatedDeltaNet(nn.Module):
         self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False)
         self.out_proj = nn.Linear(self.hidden_size, config.hidden_size, bias=False)
 
-    def process(self, hidden_states, cache_params=None, attention_mask=None):
+    def process(self, hidden_states, cache_params=None, attention_mask=None, full_seq_len=None):
         B, L, _ = hidden_states.shape
         has_previous_state = cache_params is not None and cache_params.conv_caches[self.layer_idx] is not None
         has_ssm_state = cache_params is not None and cache_params.ssm_caches[self.layer_idx] is not None
@@ -526,8 +511,11 @@ class KairosGatedDeltaNet(nn.Module):
             beta_p = beta[bi, li].unsqueeze(0)
             total = q_p.shape[1]
             if cache_params is None:
-                # pads real token count to a fixed block so Triton doesn't re-autotune every step.
-                bt = _round_up(total, _FLEX_BLOCK_SIZE)
+                if full_seq_len is not None:
+                    # static per-scale bound: same shape every step, autotuned once and cached.
+                    bt = attention_mask.shape[0] * full_seq_len
+                else:
+                    bt = _round_up(total, _FLEX_BLOCK_SIZE)
                 pad_n = bt - total
                 if pad_n > 0:
                     q_p = F.pad(q_p, (0, 0, 0, 0, 0, pad_n))
@@ -583,11 +571,11 @@ class KairosGatedDeltaNet(nn.Module):
         o = o * F.silu(g_out)
         return o
 
-    def forward(self, hidden_states, cache_params=None, attention_mask=None):
-        out_f = self.process(hidden_states, cache_params, attention_mask=attention_mask)
+    def forward(self, hidden_states, cache_params=None, attention_mask=None, full_seq_len=None):
+        out_f = self.process(hidden_states, cache_params, attention_mask=attention_mask, full_seq_len=full_seq_len)
         x_rev = torch.flip(hidden_states, dims=[1])
         mask_rev = torch.flip(attention_mask, dims=[1]) if attention_mask is not None else None
-        out_b = self.process(x_rev, cache_params=None, attention_mask=mask_rev)
+        out_b = self.process(x_rev, cache_params=None, attention_mask=mask_rev, full_seq_len=full_seq_len)
         out_b = torch.flip(out_b, dims=[1])
         B, L = out_f.shape[:2]
         out = torch.cat([out_f, out_b], dim=-1)
@@ -622,6 +610,7 @@ class KairosLiZAttention2(nn.Module):
         attention_mask=None,
         position_ids=None,
         attn_block_mask=None,
+        full_seq_len=None,
     ):
         swa_out = self.swa(
             x,
@@ -631,7 +620,7 @@ class KairosLiZAttention2(nn.Module):
             position_ids=position_ids,
             attn_block_mask=attn_block_mask,
         )
-        delta_out = self.delta(x, cache_params=cache_params, attention_mask=attention_mask)
+        delta_out = self.delta(x, cache_params=cache_params, attention_mask=attention_mask, full_seq_len=full_seq_len)
         out = torch.cat([swa_out, delta_out], dim=-1)
         out = self.norm(out)
         out = self.out_proj(out)
