@@ -107,7 +107,7 @@ class TrainConfig:
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes checkpoints
     hub_private: bool = False
     hub_subfolder: str | None = None  # push under repo_id/<subfolder>
-    compile_model: bool = True  # torch.compile(model_forward); skipped on CPU (needs CUDA)
+    compile_model: bool = True  # torch.compile(model_forward); memory measurement bypasses it
     amp_dtype: str | None = None  # None=auto (bf16 whenever supported); "bf16"/"fp16" forces it
 
     def __post_init__(self):
@@ -245,10 +245,11 @@ class KairosMultimodalPipeline:
         self.hf_trainer: KairosDiffusionTrainer | None = None
         self.writer: SummaryWriter | None = None
 
-        # AMP: bf16 if the GPU/driver supports it (is_bf16_supported), else fp16+GradScaler.
+        # AMP: bf16 only on real tensor-core hardware (Ampere+); T4 "supports" bf16 unaccelerated.
         if torch.cuda.is_available():
             self.amp_device_type = "cuda"
-            self.amp_dtype = _resolve_amp_dtype(train_config.amp_dtype, torch.cuda.is_bf16_supported())
+            bf16_hw = torch.cuda.is_bf16_supported() and torch.cuda.get_device_capability() >= (8, 0)
+            self.amp_dtype = _resolve_amp_dtype(train_config.amp_dtype, bf16_hw)
         elif torch.backends.mps.is_available():
             self.amp_device_type = "mps"
             self.amp_dtype = torch.float16
@@ -480,14 +481,13 @@ class KairosMultimodalPipeline:
                 self.scaler.update()
 
             try:
-                # one real step, fully measured (reused as the memory_report() result) and timed
+                # memory: uncompiled self.model only, isolated from any compiled timing below.
                 batch = next(loader_iter)
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
                 def loss_fn():
-                    return self.hf_trainer.compute_loss(self._forward_model, batch)
+                    return self.hf_trainer.compute_loss(self.model, batch)
 
-                t0 = time.perf_counter()
                 mem_report = detailed_memory_report(
                     self.model,
                     self.optimizer,
@@ -496,15 +496,10 @@ class KairosMultimodalPipeline:
                     autocast_ctx=self._autocast,
                     scaler=self.scaler,
                 )
-                first_step_time = time.perf_counter() - t0
 
-                # remaining steps just for timing, continuing from the already-stepped model
-                remaining = max(0, n_bench_steps - 1)
-                rest_avg = benchmark_step_time(step_fn, n_steps=remaining, warmup=0) if remaining else None
-                if rest_avg is not None:
-                    avg_step_time = (first_step_time + rest_avg * remaining) / (1 + remaining)
-                else:
-                    avg_step_time = first_step_time
+                # timing: self._forward_model, warmup absorbs the one-time compile cost if any.
+                warmup = 1 if self.compiled else 0
+                avg_step_time = benchmark_step_time(step_fn, n_steps=n_bench_steps, warmup=warmup)
             except StopIteration:
                 pass
             finally:
@@ -554,7 +549,8 @@ class KairosMultimodalPipeline:
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
         def loss_fn():
-            return self.hf_trainer.compute_loss(self._forward_model, batch)
+            # hooks mutate a closure var every layer; torch.compile would recompile on each change.
+            return self.hf_trainer.compute_loss(self.model, batch)
 
         try:
             return detailed_memory_report(

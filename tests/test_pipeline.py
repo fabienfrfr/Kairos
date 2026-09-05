@@ -122,6 +122,7 @@ def test_train_config_rejects_invalid_amp_dtype(tmp_path):
 def test_pipeline_uses_bf16_when_cuda_reports_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.bfloat16
@@ -131,15 +132,29 @@ def test_pipeline_uses_bf16_when_cuda_reports_bf16_support(tmp_path, model_confi
 def test_pipeline_falls_back_to_fp16_when_cuda_lacks_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.float16
     assert pipe.scaler.is_enabled() is True  # fp16 needs GradScaler
 
 
+def test_pipeline_falls_back_to_fp16_on_t4_despite_is_bf16_supported_true(
+    tmp_path, model_config, text_examples, monkeypatch
+):
+    """Regression test: T4 (SM75) reports is_bf16_supported()=True but has no bf16 tensor cores."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    assert pipe.amp_dtype == torch.float16
+
+
 def test_pipeline_amp_dtype_override_forces_bf16_on_old_hardware(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples, amp_dtype="bf16")
 
     assert pipe.amp_dtype == torch.bfloat16
@@ -154,7 +169,7 @@ def _unbuilt_pipe(tmp_path, model_config, text_examples, **train_kwargs):
 
 
 def test_default_build_without_cuda_does_not_compile(built_pipeline):
-    # sandbox/CI is CPU-only: compile_model=True by default must not force torch.compile here
+    # compile_model=True by default, but sandbox/CI is CPU-only so nothing actually compiles
     assert built_pipeline.compiled is False
     assert built_pipeline.model_forward is built_pipeline.model
 
@@ -943,6 +958,40 @@ def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pip
     assert summary.optimizer_memory_mb > 0.5 * summary.param_memory_mb
 
 
+def test_summary_memory_measurement_uses_uncompiled_model_timing_uses_model_forward(built_pipeline, monkeypatch):
+    """Memory pass uses compute_loss(self.model, ...); timed steps use self.model_forward."""
+
+    class _Proxy(torch.nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def forward(self, *args, **kwargs):
+            return self.wrapped(*args, **kwargs)
+
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.wrapped, name)
+
+    proxy = _Proxy(built_pipeline.model)
+    monkeypatch.setattr(built_pipeline, "model_forward", proxy)
+    seen_models = []
+    real_compute_loss = built_pipeline.hf_trainer.compute_loss
+
+    def _spy_compute_loss(model, *args, **kwargs):
+        seen_models.append(model)
+        return real_compute_loss(model, *args, **kwargs)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _spy_compute_loss)
+
+    built_pipeline.summary(benchmark=True, n_bench_steps=1)
+
+    assert seen_models[0] is built_pipeline.model
+    assert seen_models[1] is proxy
+
+
 def test_summary_str_shows_measured_label_when_benchmarked(built_pipeline):
     summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
     text = str(summary)
@@ -959,9 +1008,7 @@ def test_summary_str_shows_est_label_without_benchmark(built_pipeline):
 
 
 def test_summary_n_bench_steps_one_still_produces_avg_step_time(built_pipeline):
-    """Regression test: the fused summary()/memory_report() used to consume the single
-    n_bench_steps=1 step for the memory measurement without timing it, leaving
-    avg_step_time_sec=None. The one measured step must count towards the timing budget."""
+    """Regression test: the single benchmarked step must still count towards the timing budget."""
     summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
     assert summary.avg_step_time_sec is not None
     assert summary.avg_step_time_sec > 0
@@ -969,10 +1016,7 @@ def test_summary_n_bench_steps_one_still_produces_avg_step_time(built_pipeline):
 
 
 def test_summary_scales_steps_by_visible_gpus_when_train_would_auto_launch_ddp(built_pipeline, monkeypatch):
-    """train() auto-launches DDP (one rank per visible GPU) whenever device_count() > 1 and the
-    pipeline isn't already distributed; summary() must mirror that split instead of reporting
-    steps for the full dataset on a single GPU (regression test for the mismatch vs real DDP
-    training time)."""
+    """summary() must mirror train()'s DDP step split, not the full single-GPU dataset."""
     single_gpu_summary = built_pipeline.summary(benchmark=False)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
 
@@ -984,8 +1028,7 @@ def test_summary_scales_steps_by_visible_gpus_when_train_would_auto_launch_ddp(b
 
 
 def test_summary_does_not_scale_steps_when_already_distributed(built_pipeline, monkeypatch):
-    """If the pipeline was itself built inside a DDP rank (self.distributed=True), train() will
-    not auto-launch again, so summary() must not divide steps a second time."""
+    """A DDP rank (self.distributed=True) must not have summary() divide its steps again."""
     monkeypatch.setattr(built_pipeline, "distributed", True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
 
@@ -996,8 +1039,7 @@ def test_summary_does_not_scale_steps_when_already_distributed(built_pipeline, m
 
 
 def test_summary_ddp_benchmark_true_routes_through_ddp_when_multi_gpu_visible(built_pipeline, monkeypatch):
-    """summary(ddp_benchmark=True) is the opt-in for a real multi-GPU torchrun benchmark; it must
-    not be the default (full pipeline rebuild per rank is slow and can hang in notebooks)."""
+    """ddp_benchmark=True is the opt-in for a real multi-GPU torchrun benchmark, not the default."""
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     fake_summary = TrainingSummary(
         total_params=1,
@@ -1110,9 +1152,7 @@ def test_save_async_write_completes_after_flush(built_pipeline, tmp_path):
 
 
 def test_async_save_does_not_block_caller(built_pipeline, tmp_path, monkeypatch):
-    """Regression test: last_ckpt_every writes used to be a blocking torch.save() on the main
-    training thread every N steps. wait=False must hand the write to the background executor
-    and return immediately, even while a slow write is still in flight."""
+    """Regression test: wait=False must return immediately, not block on a slow write."""
     import time
 
     def _slow_save(payload, path):
@@ -1144,8 +1184,7 @@ def test_flush_checkpoint_writes_reraises_background_failure(built_pipeline, tmp
 
 
 def test_train_flushes_pending_checkpoint_before_hub_push(tmp_path, model_config, text_examples, monkeypatch):
-    """save_every's last.pt hub push reads the file right after the async loop-frequency save;
-    train() must flush before pushing or the upload can race an in-flight write."""
+    """train() must flush the async last.pt write before the hub push reads it."""
     monkeypatch.setattr("huggingface_hub.HfApi.create_repo", lambda self, repo_id, **kw: None)
     uploaded_bytes = {}
 
@@ -1171,9 +1210,7 @@ def test_train_flushes_pending_checkpoint_before_hub_push(tmp_path, model_config
 
 
 def test_train_unlinks_last_ckpt_only_after_pending_write_lands(built_pipeline):
-    """Regression test: unlink() used to race the async write to the same path from the final
-    loop iteration -- it must flush first so it deletes a fully-written file, not a half-written
-    one, and never resurrects a deleted file from a late-arriving background write."""
+    """Regression test: unlink() must flush pending writes first, not race the final async save."""
     built_pipeline.train()
 
     assert not (built_pipeline.ckpt_dir / "last.pt").exists()
@@ -1293,8 +1330,7 @@ def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text
 
 
 def test_train_calls_compute_loss_with_model_forward_not_bare_model(built_pipeline, monkeypatch):
-    """Regression: train() used to call compute_loss(self.model, ...) directly, skipping
-    self.model_forward (DDP-wrapped under torchrun), unlike every other method."""
+    """Regression: train() must call compute_loss(self.model_forward, ...), not the bare model."""
 
     # distinct proxy identity, so we can prove train() calls model_forward and not self.model
     class _Proxy(torch.nn.Module):
