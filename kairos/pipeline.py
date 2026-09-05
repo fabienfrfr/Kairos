@@ -398,6 +398,9 @@ class KairosMultimodalPipeline:
         # state_dict/generate keep using self.model; self.model_forward is the parallel wrapper.
         should_compile = tc.compile_model and torch.cuda.is_available()
         self.compiled = should_compile
+        if should_compile:
+            # avoid a graph break on gather_active's data-dependent max_len().item()
+            torch._dynamo.config.capture_scalar_outputs = True
         if self.distributed:
             # Conditional forward (unused params) -> DDP needs find_unused_parameters.
             forward_module = torch.compile(self.model) if should_compile else self.model
@@ -416,6 +419,9 @@ class KairosMultimodalPipeline:
                     stacklevel=2,
                 )
             self.model_forward = torch.compile(self.model) if should_compile else self.model
+        # separate compiled instance for evaluate(): keeps grad_mode out of the train
+        # graph's guards so eval's no_grad() never forces the training graph to recompile.
+        self.eval_forward = torch.compile(self.model) if should_compile else self.model_forward
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr, fused=torch.cuda.is_available())
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
@@ -736,7 +742,7 @@ class KairosMultimodalPipeline:
                 for batch in self.eval_loader:
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with self._autocast():
-                        losses.append(self.hf_trainer.compute_loss(self.model_forward, batch).item())
+                        losses.append(self.hf_trainer.compute_loss(self.eval_forward, batch).item())
                     seen += 1
                     if tc.eval_batches and seen >= tc.eval_batches:
                         break

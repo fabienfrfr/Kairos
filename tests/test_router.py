@@ -9,6 +9,13 @@ from kairos.modeling import (
 )
 
 
+def _mask_first_n(batch, seq_len, n):
+    """Active mask with the first n positions of the first row set True."""
+    mask = torch.zeros(batch, seq_len, dtype=torch.bool)
+    mask[0, :n] = True
+    return mask
+
+
 @pytest.fixture
 def modality_scales():
     return {0: [0, 1], 1: [1, 2], 2: [2, 3]}
@@ -76,10 +83,11 @@ def test_gather_active_shapes(router):
     active_mask[0, [0, 1, 2]] = True
     active_mask[1, [5]] = True
     gathered, pad_mask, positions = router.gather_active(x, active_mask)
-    assert gathered.shape == (2, 3, 4)
-    assert pad_mask.shape == (2, 3)
-    assert positions.shape == (2, 3)
-    assert pad_mask[0].all()
+    # global raw max active count is 3 -> next power of two (4) floored to _MIN_BUCKET (8)
+    assert gathered.shape == (2, 8, 4)
+    assert pad_mask.shape == (2, 8)
+    assert positions.shape == (2, 8)
+    assert pad_mask[0].sum() == 3
     assert pad_mask[1].sum() == 1
 
 
@@ -96,9 +104,75 @@ def test_gather_active_preserves_relative_order(router):
     x = torch.arange(10).float().view(1, 10, 1)
     active_mask = torch.zeros(1, 10, dtype=torch.bool)
     active_mask[0, [2, 5, 7]] = True
-    gathered, _pad_mask, positions = router.gather_active(x, active_mask)
-    assert positions[0].tolist() == [2, 5, 7]
-    assert gathered[0, :, 0].tolist() == [2.0, 5.0, 7.0]
+    gathered, pad_mask, positions = router.gather_active(x, active_mask)
+    # only the first pad_mask.sum() entries are real (rest is bucket padding)
+    n_active = int(pad_mask[0].sum())
+    assert positions[0, :n_active].tolist() == [2, 5, 7]
+    assert gathered[0, :n_active, 0].tolist() == [2.0, 5.0, 7.0]
+
+
+def test_gather_active_rounds_up_to_min_bucket_floor(router):
+    x = torch.randn(1, 64, 4)
+    active_mask = torch.zeros(1, 64, dtype=torch.bool)
+    active_mask[0, [0, 1, 2]] = True  # 3 active tokens, below the floor
+    gathered, pad_mask, positions = router.gather_active(x, active_mask)
+    assert gathered.shape[1] == KairosScaleRouter._MIN_BUCKET
+    assert positions.shape[1] == KairosScaleRouter._MIN_BUCKET
+    assert pad_mask.sum() == 3
+
+
+def test_gather_active_bucket_stays_on_exact_power_of_two(router):
+    x = torch.randn(1, 64, 4)
+    active_mask = torch.zeros(1, 64, dtype=torch.bool)
+    active_mask[0, :32] = True  # already an exact power of two, no rounding needed
+    gathered, _pad_mask, _positions = router.gather_active(x, active_mask)
+    assert gathered.shape[1] == 32
+
+
+def test_gather_active_bucket_rounds_up_to_next_power_of_two(router):
+    x = torch.randn(1, 96, 4)
+    active_mask = torch.zeros(1, 96, dtype=torch.bool)
+    active_mask[0, :33] = True  # one token past a power-of-two boundary
+    gathered, _pad_mask, _positions = router.gather_active(x, active_mask)
+    assert gathered.shape[1] == 64
+
+
+def test_gather_active_bucket_count_grows_logarithmically_with_seq_len(router):
+    # the whole point of power-of-two bucketing: distinct shapes stay ~log2(seq_len),
+    # not linear in seq_len, so compiled-shape count stays bounded as models scale up.
+    x_small = torch.randn(1, 128, 4)
+    x_large = torch.randn(1, 8192, 4)
+    seen_small = {
+        router.gather_active(x_small, _mask_first_n(1, 128, n))[0].shape[1] for n in (1, 5, 20, 60, 128)
+    }
+    seen_large = {
+        router.gather_active(x_large, _mask_first_n(1, 8192, n))[0].shape[1]
+        for n in (1, 5, 20, 60, 500, 3000, 8192)
+    }
+    assert len(seen_small) <= 5  # log2(128) ~ 7, well short of "one shape per raw length"
+    assert len(seen_large) <= 8  # log2(8192) = 13; still small, unlike a linear 32-step bucket
+
+
+def test_gather_active_bucket_capped_at_sequence_length(router):
+    x = torch.randn(1, 6, 4)
+    active_mask = torch.zeros(1, 6, dtype=torch.bool)
+    active_mask[0, :5] = True  # bucket (8) would exceed the actual seq_len (6)
+    gathered, pad_mask, positions = router.gather_active(x, active_mask)
+    assert gathered.shape[1] == 6
+    assert positions.shape[1] == 6
+    assert pad_mask.sum() == 5
+
+
+def test_gather_scatter_roundtrip_identity_with_bucket_padding(router):
+    # S=64 so the bucketed length (8, from _MIN_BUCKET) is real padding, not capped by seq_len
+    x = torch.randn(2, 64, 4)
+    active_mask = torch.zeros(2, 64, dtype=torch.bool)
+    active_mask[0, [1, 3, 5]] = True
+    active_mask[1, [10]] = True
+    gathered, pad_mask, positions = router.gather_active(x, active_mask)
+    assert gathered.shape[1] == 8  # confirms real bucket padding is exercised here
+    output = router.scatter_active(x.clone(), gathered, pad_mask, positions)
+    assert torch.allclose(output, x, atol=1e-6)
 
 
 def test_scatter_active_does_not_touch_inactive_positions(router):

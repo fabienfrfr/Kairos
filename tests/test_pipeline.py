@@ -194,6 +194,59 @@ def test_compile_model_false_skips_compile_even_with_cuda(tmp_path, model_config
     assert pipe.model_forward is pipe.model
 
 
+@pytest.fixture
+def _restore_dynamo_scalar_capture():
+    original = torch._dynamo.config.capture_scalar_outputs
+    yield
+    torch._dynamo.config.capture_scalar_outputs = original
+
+
+def test_build_enables_capture_scalar_outputs_when_compiling(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_scalar_capture
+):
+    torch._dynamo.config.capture_scalar_outputs = False
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    # avoids the graph break on gather_active's data-dependent max_len().item()
+    assert torch._dynamo.config.capture_scalar_outputs is True
+
+
+def test_build_gives_eval_a_separate_compiled_instance_from_train(
+    tmp_path, model_config, text_examples, monkeypatch
+):
+    """eval_forward must not be the same compiled object as model_forward: reusing one
+    graph for both train (grad enabled) and eval (no_grad) makes grad_mode a guard axis
+    on that graph, which recompiles every time the mode flips. Two instances keep each
+    graph's guards limited to a single grad_mode, so switching never forces a recompile."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert pipe.eval_forward is not pipe.model_forward
+
+
+def test_build_eval_forward_falls_back_to_model_forward_without_cuda(built_pipeline):
+    # no compile on CPU -> nothing to isolate, both point at the same (uncompiled) forward
+    assert built_pipeline.eval_forward is built_pipeline.model_forward
+
+
+def test_build_leaves_capture_scalar_outputs_untouched_without_cuda(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_scalar_capture
+):
+    torch._dynamo.config.capture_scalar_outputs = False
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert pipe.compiled is False
+    assert torch._dynamo.config.capture_scalar_outputs is False
+
+
 def test_build_enables_tf32_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
     orig_matmul = torch.backends.cuda.matmul.allow_tf32
     orig_cudnn = torch.backends.cudnn.allow_tf32
