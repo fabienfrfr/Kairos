@@ -217,10 +217,7 @@ def test_build_enables_capture_scalar_outputs_when_compiling(
 def test_build_gives_eval_a_separate_compiled_instance_from_train(
     tmp_path, model_config, text_examples, monkeypatch
 ):
-    """eval_forward must not be the same compiled object as model_forward: reusing one
-    graph for both train (grad enabled) and eval (no_grad) makes grad_mode a guard axis
-    on that graph, which recompiles every time the mode flips. Two instances keep each
-    graph's guards limited to a single grad_mode, so switching never forces a recompile."""
+    """Separate instances keep grad_mode from becoming a recompile-triggering guard axis."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 

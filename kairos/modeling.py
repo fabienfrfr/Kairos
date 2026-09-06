@@ -419,10 +419,9 @@ class KairosScaleRouter(nn.Module):
         pooled = F.adaptive_max_pool1d(active_full.float().unsqueeze(1), scale_len).squeeze(1)
         return pooled > 0.5
 
-    # power-of-two bucketing: the number of distinct compiled shapes this produces is
-    # bounded by log2(seq_len), so it stays small and predictable however seq_len scales
-    # (unlike a fixed linear step, which grows linearly with seq_len).
+    # power-of-two-ish bucketing via lookup (not bit ops) bounds shapes to ~log2(seq_len)
     _MIN_BUCKET = 8  # floor so tiny lengths (1,2,4) don't each get their own compiled shape
+    _BUCKET_SIZES = tuple(8 << i for i in range(12))  # 8, 16, ..., 16384
 
     @staticmethod
     def gather_active(x, active_mask):
@@ -431,7 +430,7 @@ class KairosScaleRouter(nn.Module):
         raw_max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
         if raw_max_len == 0:
             return None, None, None
-        bucket = max(KairosScaleRouter._MIN_BUCKET, 1 << (raw_max_len - 1).bit_length())
+        bucket = next((b for b in KairosScaleRouter._BUCKET_SIZES if b >= raw_max_len), S)
         max_len = min(S, bucket)
         order = torch.argsort((~active_mask).long(), dim=1, stable=True)
         positions = order[:, :max_len]

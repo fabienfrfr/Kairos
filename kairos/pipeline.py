@@ -419,8 +419,7 @@ class KairosMultimodalPipeline:
                     stacklevel=2,
                 )
             self.model_forward = torch.compile(self.model) if should_compile else self.model
-        # separate compiled instance for evaluate(): keeps grad_mode out of the train
-        # graph's guards so eval's no_grad() never forces the training graph to recompile.
+        # separate compiled instance: keeps eval's no_grad() from forcing train's graph to recompile
         self.eval_forward = torch.compile(self.model) if should_compile else self.model_forward
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr, fused=torch.cuda.is_available())
         n_steps = max(1, tc.epochs * len(self.loader))
