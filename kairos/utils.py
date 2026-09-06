@@ -467,6 +467,7 @@ class TrainingSummary:
     estimated_total_time_sec: float | None = None
     measured_memory: bool = False
     n_gpus: int = 1  # DDP world size assumed for steps_per_epoch/estimated_total_time_sec
+    single_gpu_benchmark: bool = False  # avg_step_time_sec was measured on 1 GPU, not real DDP
     attn_impl: str | None = None
     delta_rule_backend: str | None = None
     causal_conv1d_backend: str | None = None
@@ -489,6 +490,8 @@ class TrainingSummary:
         if self.avg_step_time_sec is not None:
             lines.append(f"Avg step time:       {self.avg_step_time_sec * 1000:.1f} ms")
             lines.append(f"Est. total time:     {format_duration(self.estimated_total_time_sec)}")
+            if self.single_gpu_benchmark:
+                lines.append("  (benchmarked on 1 GPU; total time assumes real DDP scaling)")
         else:
             lines.append("Avg step time:       n/a")
         if self.attn_impl is not None:

@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+import kairos.pipeline as pipeline_module
 from kairos.dataset import pack_multimodal_data
 from kairos.modeling import KairosConfig, KairosDiffusionFM
 from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig, _resolve_amp_dtype
@@ -212,6 +213,47 @@ def test_build_enables_capture_scalar_outputs_when_compiling(
 
     # avoids the graph break on gather_active's data-dependent max_len().item()
     assert torch._dynamo.config.capture_scalar_outputs is True
+
+
+@pytest.fixture
+def _restore_dynamo_recompile_limit():
+    original = torch._dynamo.config.recompile_limit
+    yield
+    torch._dynamo.config.recompile_limit = original
+
+
+def test_build_raises_recompile_limit_when_compiling(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_recompile_limit
+):
+    torch._dynamo.config.recompile_limit = 8
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    # headroom for the 12 length buckets (+ grad_mode) to stabilize without eager fallback
+    assert torch._dynamo.config.recompile_limit > 8
+
+
+def test_build_and_train_actually_compile_on_cpu_when_forced(
+    tmp_path, model_config, text_examples, multimodal_examples, monkeypatch
+):
+    """Forces the real compile path (no CUDA mock) so recompile-avoidance logic runs for real."""
+    monkeypatch.setattr(pipeline_module, "_compile_backend_available", lambda: True)
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=multimodal_examples, max_len=64, batch_size=2
+    )
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    assert pipe.compiled is True
+    assert pipe.eval_forward is not pipe.model_forward
+
+    batch = next(iter(pipe.loader))
+    loss = pipe.hf_trainer.compute_loss(pipe.model_forward, batch)
+
+    assert torch.isfinite(loss)
 
 
 def test_build_gives_eval_a_separate_compiled_instance_from_train(
@@ -1008,6 +1050,38 @@ def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pip
     assert summary.optimizer_memory_mb > 0.5 * summary.param_memory_mb
 
 
+def test_summary_uses_generous_warmup_when_compiled(built_pipeline, monkeypatch):
+    """A single warmup step only compiles one bucket size; varied batches need more."""
+    monkeypatch.setattr(built_pipeline, "compiled", True)
+    seen_kwargs = {}
+    real_benchmark_step_time = pipeline_module.benchmark_step_time
+
+    def _spy_benchmark_step_time(step_fn, **kwargs):
+        seen_kwargs.update(kwargs)
+        return real_benchmark_step_time(step_fn, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "benchmark_step_time", _spy_benchmark_step_time)
+
+    built_pipeline.summary(benchmark=True, n_bench_steps=3)
+
+    assert seen_kwargs["warmup"] >= 10
+
+
+def test_summary_skips_warmup_when_not_compiled(built_pipeline, monkeypatch):
+    seen_kwargs = {}
+    real_benchmark_step_time = pipeline_module.benchmark_step_time
+
+    def _spy_benchmark_step_time(step_fn, **kwargs):
+        seen_kwargs.update(kwargs)
+        return real_benchmark_step_time(step_fn, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "benchmark_step_time", _spy_benchmark_step_time)
+
+    built_pipeline.summary(benchmark=True, n_bench_steps=3)
+
+    assert seen_kwargs["warmup"] == 0
+
+
 def test_summary_memory_measurement_uses_uncompiled_model_timing_uses_model_forward(built_pipeline, monkeypatch):
     """Memory pass uses compute_loss(self.model, ...); timed steps use self.model_forward."""
 
@@ -1125,6 +1199,13 @@ def test_summary_default_does_not_launch_ddp_and_warns_with_multi_gpu(built_pipe
         summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
 
     assert summary.avg_step_time_sec is not None
+    assert summary.single_gpu_benchmark is True
+
+
+def test_summary_does_not_flag_single_gpu_benchmark_on_one_visible_gpu(built_pipeline):
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+
+    assert summary.single_gpu_benchmark is False
 
 
 def test_summary_benchmark_false_does_not_launch_ddp_even_with_multi_gpu(built_pipeline, monkeypatch):

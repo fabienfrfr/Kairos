@@ -154,6 +154,11 @@ def _resolve_amp_dtype(amp_dtype_override: str | None, bf16_supported: bool) -> 
     return torch.bfloat16 if bf16_supported else torch.float16
 
 
+def _compile_backend_available() -> bool:
+    """Whether torch.compile should be attempted; a seam tests can monkeypatch for CPU."""
+    return torch.cuda.is_available()
+
+
 def init_distributed() -> bool:
     """Initializes the torch.distributed process group from torchrun env vars; True if DDP."""
     if dist.is_available() and not dist.is_initialized() and "WORLD_SIZE" in os.environ:
@@ -396,11 +401,13 @@ class KairosMultimodalPipeline:
             self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
         ).to(self.device)
         # state_dict/generate keep using self.model; self.model_forward is the parallel wrapper.
-        should_compile = tc.compile_model and torch.cuda.is_available()
+        should_compile = tc.compile_model and _compile_backend_available()
         self.compiled = should_compile
         if should_compile:
             # avoid a graph break on gather_active's data-dependent max_len().item()
             torch._dynamo.config.capture_scalar_outputs = True
+            # headroom for all 12 length buckets (+ grad_mode) to stabilize without eager fallback
+            torch._dynamo.config.recompile_limit = 32
         if self.distributed:
             # Conditional forward (unused params) -> DDP needs find_unused_parameters.
             forward_module = torch.compile(self.model) if should_compile else self.model
@@ -502,8 +509,8 @@ class KairosMultimodalPipeline:
                     scaler=self.scaler,
                 )
 
-                # timing: self._forward_model, warmup absorbs the one-time compile cost if any.
-                warmup = 1 if self.compiled else 0
+                # generous warmup so varied bucket sizes/grad_mode stabilize before timing
+                warmup = max(2 * n_bench_steps, 10) if self.compiled else 0
                 avg_step_time = benchmark_step_time(step_fn, n_steps=n_bench_steps, warmup=warmup)
             except StopIteration:
                 pass
@@ -525,6 +532,7 @@ class KairosMultimodalPipeline:
         # here only for the benchmark=False static estimate; benchmark=True routes via DDP above.
         n_gpus = torch.cuda.device_count() if not self.distributed and torch.cuda.device_count() > 1 else 1
         ts.n_gpus = n_gpus
+        ts.single_gpu_benchmark = benchmark and n_gpus > 1 and not self.distributed
         ts.attn_impl = _ATTN_IMPL
         ts.delta_rule_backend = _DELTA_RULE_BACKEND
         ts.causal_conv1d_backend = _CAUSAL_CONV1D_BACKEND

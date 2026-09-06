@@ -215,6 +215,32 @@ def test_training_summary_with_benchmark_shows_measured_step_time_in_str():
     assert "n/a" not in text
 
 
+def test_training_summary_str_notes_single_gpu_benchmark_when_flagged():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(10))
+
+    def step_fn():
+        time.sleep(0.001)
+
+    summary = training_summary(model, loader, epochs=2, step_fn=step_fn, n_bench_steps=3)
+    summary.n_gpus = 2
+    summary.single_gpu_benchmark = True
+    text = str(summary)
+    assert "benchmarked on 1 GPU" in text
+
+
+def test_training_summary_str_omits_single_gpu_note_by_default():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(10))
+
+    def step_fn():
+        time.sleep(0.001)
+
+    summary = training_summary(model, loader, epochs=2, step_fn=step_fn, n_bench_steps=3)
+    text = str(summary)
+    assert "benchmarked on 1 GPU" not in text
+
+
 def test_training_summary_str_uses_measured_label_when_flag_set():
     model = nn.Linear(4, 2)
     loader = _TinyLoader(range(4))
