@@ -914,13 +914,20 @@ class KairosMultimodalPipeline:
         memory_bank: KairosMultiCache | None = None,
         ddp_launch: bool | None = None,
         n_proc: int | None = None,
+        phase_callback=None,
     ) -> list[dict]:
         """Runs the training loop; resumes from local last.pt or the hub if unavailable."""
         self._require_built()
         # single process, several GPUs visible -> spawn a torchrun job (one GPU per rank).
         auto_launch = ddp_launch is None and not self.distributed and torch.cuda.device_count() > 1
         if auto_launch or ddp_launch:
-            results = self._run_via_ddp("train", n_proc=n_proc, progress_callback=progress_callback, resume=resume)
+            results = self._run_via_ddp(
+                "train",
+                n_proc=n_proc,
+                progress_callback=progress_callback,
+                phase_callback=phase_callback,
+                resume=resume,
+            )
             for key, value in results.items():
                 setattr(self, key, value)
             return self.log_rows
@@ -1094,8 +1101,21 @@ class KairosMultimodalPipeline:
 
         return self.log_rows
 
+    _HEARTBEAT_INTERVAL_SEC = 15  # how long the ddp log can stay quiet before a heartbeat fires
+
+    @staticmethod
+    def _heartbeat_due(now: float, last_activity: float, interval: float) -> bool:
+        """True once the log has been quiet for longer than interval (e.g. mid-compile step)."""
+        return now - last_activity > interval
+
     def _run_via_ddp(
-        self, action: str, n_proc=None, progress_callback=None, resume: bool = True, action_kwargs: dict | None = None
+        self,
+        action: str,
+        n_proc=None,
+        progress_callback=None,
+        phase_callback=None,
+        resume: bool = True,
+        action_kwargs: dict | None = None,
     ) -> dict:
         """Spawns a torchrun job (one GPU per rank), shared by train() and summary()."""
         tc = self.train_config
@@ -1105,30 +1125,38 @@ class KairosMultimodalPipeline:
             *self._ddp_snapshot, n_proc=n_proc, resume=resume, wait=False, action=action, action_kwargs=action_kwargs
         )
         index = 0
+        start = last_activity = time.monotonic()
         while proc.poll() is None:
-            index = self._replay_ddp_log(log_path, index, progress_callback)
+            new_index = self._replay_ddp_log(log_path, index, progress_callback, phase_callback)
+            now = time.monotonic()
+            if new_index != index:
+                index, last_activity = new_index, now
+            elif phase_callback is not None and self._heartbeat_due(now, last_activity, self._HEARTBEAT_INTERVAL_SEC):
+                phase_callback(f"still working ({int(now - start)}s elapsed, no new log lines yet)")
+                last_activity = now
             time.sleep(0.25)
-        index = self._replay_ddp_log(log_path, index, progress_callback)
+        index = self._replay_ddp_log(log_path, index, progress_callback, phase_callback)
         if proc.returncode != 0:
             raise RuntimeError(f"DDP {action} failed (see {log_path})")
         return self._load_ddp_results(Path(tc.run_dir))
 
     @staticmethod
-    def _replay_ddp_log(log_path: Path, index: int, progress_callback) -> int:
-        """Feeds progress_callback with step lines freshly written by the torchrun rank-0 process."""
-        if progress_callback is None or not log_path.exists():
-            return index
-        lines = log_path.read_text().splitlines()
-        for line in lines[index:]:
-            parts = line.split()
-            if len(parts) >= 4 and parts[0] == "step":
-                step_total = parts[1].split("/", 1)
-                if len(step_total) == 2:
-                    try:
-                        progress_callback(int(step_total[0]), int(step_total[1]), float(parts[3]))
-                    except ValueError:
-                        pass
-            index += 1
+    def _replay_ddp_log(log_path: Path, index: int, progress_callback, phase_callback=None) -> int:
+        """Feeds progress_callback/phase_callback from lines freshly written by rank-0."""
+        if log_path.exists():
+            lines = log_path.read_text().splitlines()
+            for line in lines[index:]:
+                parts = line.split()
+                if progress_callback is not None and len(parts) >= 4 and parts[0] == "step":
+                    step_total = parts[1].split("/", 1)
+                    if len(step_total) == 2:
+                        try:
+                            progress_callback(int(step_total[0]), int(step_total[1]), float(parts[3]))
+                        except ValueError:
+                            pass
+                elif phase_callback is not None and len(parts) >= 2 and parts[0] == "phase":
+                    phase_callback(parts[1])
+                index += 1
         return index
 
     @staticmethod

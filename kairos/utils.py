@@ -433,7 +433,7 @@ def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | N
 
 
 def make_progress_callback(desc: str = "training"):
-    """Returns a (step, total, loss) -> None callback for pipeline.train(), backed by."""
+    """Returns a (step, total, loss) callback for pipeline.train(); call .phase(name) for status."""
     from tqdm.auto import tqdm
 
     state = {"bar": None}
@@ -447,6 +447,10 @@ def make_progress_callback(desc: str = "training"):
         if step >= total:
             state["bar"].close()
 
+    def _phase(name: str) -> None:
+        tqdm.write(f"[{desc}] {name}")
+
+    _callback.phase = _phase
     return _callback
 
 

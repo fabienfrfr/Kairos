@@ -628,9 +628,13 @@ def _(FORCE_RESTART, make_progress_callback, mo, pipe):
                 _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
                 _state["last_step"] = step
 
-            logs = pipe.train(progress_callback=_on_step, resume=not FORCE_RESTART)
+            def _on_phase(name):
+                _bar.update(increment=0, subtitle=name)
+
+            logs = pipe.train(progress_callback=_on_step, phase_callback=_on_phase, resume=not FORCE_RESTART)
     else:
-        logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
+        _cb = make_progress_callback()
+        logs = pipe.train(progress_callback=_cb, phase_callback=_cb.phase, resume=not FORCE_RESTART)
 
     print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
     print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")

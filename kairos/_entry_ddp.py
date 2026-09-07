@@ -45,6 +45,7 @@ def main() -> None:
         model_config, data_config, eval_data_config, train_config = pickle.load(f)
     with (job_dir / "job.pkl").open("rb") as f:
         job = pickle.load(f)
+    print("phase build", flush=True)
     pipe = KairosMultimodalPipeline(
         model_config,
         data_config,
@@ -54,6 +55,7 @@ def main() -> None:
     )
     pipe.build()
     assert pipe.distributed, "expected DDP env from torchrun"
+    print("phase run", flush=True)
     _ACTIONS[job["action"]](pipe, job, job_dir)
 
 

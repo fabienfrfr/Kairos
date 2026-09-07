@@ -1191,6 +1191,79 @@ def test_summary_ddp_benchmark_true_routes_through_ddp_when_multi_gpu_visible(bu
     assert calls == [("summary", {"resume": False, "action_kwargs": expected_kwargs})]
 
 
+def test_train_auto_launch_passes_phase_callback_to_run_via_ddp(built_pipeline, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    calls = []
+
+    def _fake_run_via_ddp(action, **kwargs):
+        calls.append((action, kwargs))
+        return {"log_rows": ["fake_row"]}
+
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", _fake_run_via_ddp)
+    _phase_cb = lambda name: None  # noqa: E731
+
+    logs = built_pipeline.train(phase_callback=_phase_cb, resume=False)
+
+    assert calls[0][0] == "train"
+    assert calls[0][1]["phase_callback"] is _phase_cb
+    assert logs == ["fake_row"]
+
+
+def test_replay_ddp_log_forwards_step_and_phase_lines(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("phase build\nstep 1/5  loss 0.5000\nsome noise\nphase run\nstep 2/5  loss 0.4000\n")
+    steps, phases = [], []
+
+    index = KairosMultimodalPipeline._replay_ddp_log(
+        log_path, 0, lambda s, t, ell: steps.append((s, t, ell)), phases.append
+    )
+
+    assert steps == [(1, 5, 0.5), (2, 5, 0.4)]
+    assert phases == ["build", "run"]
+    assert index == 5
+
+
+def test_replay_ddp_log_ignores_phase_lines_without_phase_callback(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("phase build\nstep 1/2  loss 0.1000\n")
+    steps = []
+
+    index = KairosMultimodalPipeline._replay_ddp_log(log_path, 0, lambda s, t, ell: steps.append((s, t, ell)))
+
+    assert steps == [(1, 2, 0.1)]
+    assert index == 2
+
+
+def test_heartbeat_due_after_interval_elapsed():
+    assert KairosMultimodalPipeline._heartbeat_due(now=20.0, last_activity=0.0, interval=15) is True
+
+
+def test_heartbeat_not_due_before_interval_elapsed():
+    assert KairosMultimodalPipeline._heartbeat_due(now=10.0, last_activity=0.0, interval=15) is False
+
+
+def test_run_via_ddp_emits_heartbeat_when_log_stays_quiet(tmp_path, built_pipeline, monkeypatch):
+    monkeypatch.setattr(built_pipeline.train_config, "run_dir", str(tmp_path))
+    poll_results = iter([None, None, 0])
+
+    class _FakeProc:
+        returncode = 0
+
+        def poll(self):
+            return next(poll_results, 0)
+
+    monkeypatch.setattr(pipeline_module, "launch_ddp", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr(built_pipeline, "_load_ddp_results", lambda run_dir: {"log_rows": []})
+    monkeypatch.setattr(pipeline_module.time, "sleep", lambda s: None)
+    clock = iter([0.0, 1.0, 30.0])
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: next(clock, 30.0))
+    phases = []
+
+    built_pipeline._run_via_ddp("train", phase_callback=phases.append, resume=False)
+
+    assert any("still working" in p for p in phases)
+
+
 def test_summary_default_does_not_launch_ddp_and_warns_with_multi_gpu(built_pipeline, monkeypatch):
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not be called")))

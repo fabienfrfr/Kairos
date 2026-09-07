@@ -347,6 +347,30 @@ def test_make_progress_callback_closes_bar_at_last_step(monkeypatch):
     assert created[0].closed
 
 
+class _FakeTqdmFactory:
+    def __init__(self):
+        self.created = []
+        self.written = []
+
+    def __call__(self, total, desc):
+        bar = _FakeBar(total, desc)
+        self.created.append(bar)
+        return bar
+
+    def write(self, msg):
+        self.written.append(msg)
+
+
+def test_make_progress_callback_phase_writes_a_subtle_status_line(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    callback = make_progress_callback(desc="training")
+    callback.phase("compiling")
+
+    assert fake.written == ["[training] compiling"]
+
+
 # ------------------------------------------------------------- detailed_memory_report
 def _tiny_model_and_optimizer():
     model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 4))
