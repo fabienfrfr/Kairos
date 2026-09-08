@@ -123,6 +123,34 @@ def test_benchmark_step_time_returns_none_when_iterator_exhausted():
     assert benchmark_step_time(step_fn, n_steps=5, warmup=1) is None
 
 
+def test_benchmark_step_time_returns_none_for_zero_steps_instead_of_crashing():
+    calls = []
+
+    def step_fn():
+        calls.append(1)
+
+    assert benchmark_step_time(step_fn, n_steps=0, warmup=0) is None
+    assert calls == []  # never even attempted a step
+
+
+def test_benchmark_step_time_survives_a_broken_bar_without_breaking_step_fn(monkeypatch):
+    class _BrokenBar(_FakeBar):
+        def set_description(self, desc):
+            raise RuntimeError("display is broken")
+
+    monkeypatch.setattr("tqdm.auto.tqdm", lambda total, desc, **kw: _BrokenBar(total, desc, **kw))
+    calls = []
+
+    def step_fn():
+        calls.append(1)
+        print("Autotuning kernel some_kernel with config BT: 8")
+
+    result = benchmark_step_time(step_fn, n_steps=2, warmup=0)
+
+    assert calls == [1, 1]  # step_fn ran fully despite the display raising internally
+    assert result is not None and result >= 0
+
+
 def test_benchmark_step_time_shows_a_tqdm_bar_instead_of_raw_logs(monkeypatch):
     fake = _FakeTqdmFactory()
     monkeypatch.setattr("tqdm.auto.tqdm", fake)

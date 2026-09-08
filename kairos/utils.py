@@ -445,7 +445,10 @@ class _AutotuneRelay:
         self._buf += chunk
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            self._handle_line(line.strip())
+            try:
+                self._handle_line(line.strip())
+            except Exception:
+                pass  # a display hiccup must never break the real step_fn() call underway
 
     def _handle_line(self, line: str) -> None:
         parsed = parse_autotune_line(line)
@@ -463,10 +466,13 @@ class _AutotuneRelay:
 
     def tick(self, elapsed: float) -> None:
         """Called from a background thread; only fires before any real output has arrived."""
-        with self._lock:
-            if not self._seen_any:
-                self._bar.set_postfix_str(f"loading triton / compiling... {elapsed:.0f}s")
-                self._bar.refresh()
+        try:
+            with self._lock:
+                if not self._seen_any:
+                    self._bar.set_postfix_str(f"loading triton / compiling... {elapsed:.0f}s")
+                    self._bar.refresh()
+        except Exception:
+            pass  # a display hiccup in the background ticker must never crash the thread
 
     def flush(self) -> None:
         pass
@@ -493,6 +499,8 @@ def _run_step_with_heartbeat(step_fn, relay: _AutotuneRelay) -> None:
 
 def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
     """Average seconds/step over n_steps calls; relays Triton's real autotuning output live."""
+    if n_steps <= 0:
+        return None
     from tqdm.auto import tqdm
 
     try:

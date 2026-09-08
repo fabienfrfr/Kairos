@@ -1255,6 +1255,30 @@ def test_replay_ddp_log_forwards_step_and_phase_lines(tmp_path):
     assert index == 5
 
 
+def test_replay_ddp_log_survives_a_broken_progress_callback(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("step 1/2  loss 0.5000\nstep 2/2  loss 0.4000\n")
+
+    def _broken_callback(step, total, loss_val):
+        raise RuntimeError("UI widget crashed")
+
+    index = KairosMultimodalPipeline._replay_ddp_log(log_path, 0, _broken_callback)
+
+    assert index == 2  # both lines still consumed despite the callback raising every time
+
+
+def test_replay_ddp_log_survives_a_broken_phase_callback(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("phase build\nphase run\n")
+
+    def _broken_phase(name):
+        raise RuntimeError("UI widget crashed")
+
+    index = KairosMultimodalPipeline._replay_ddp_log(log_path, 0, None, _broken_phase)
+
+    assert index == 2
+
+
 def test_replay_ddp_log_relays_real_triton_autotuning_lines_as_phases(tmp_path):
     log_path = tmp_path / "train_ddp.log"
     log_path.write_text(

@@ -1160,16 +1160,25 @@ class KairosMultimodalPipeline:
             step_total = parts[1].split("/", 1)
             if len(step_total) == 2:
                 try:
-                    progress_callback(int(step_total[0]), int(step_total[1]), float(parts[3]))
+                    step, total, loss_val = int(step_total[0]), int(step_total[1]), float(parts[3])
                 except ValueError:
-                    pass
+                    return
+                KairosMultimodalPipeline._safe_call(progress_callback, step, total, loss_val)
         elif phase_callback is not None and len(parts) >= 2 and parts[0] == "phase":
-            phase_callback(parts[1])
+            KairosMultimodalPipeline._safe_call(phase_callback, parts[1])
         elif phase_callback is not None:
             parsed = parse_autotune_line(line)
             if parsed is not None:
                 kind, text = parsed
-                phase_callback(f"autotuning {text}" if kind == "kernel" else text)
+                KairosMultimodalPipeline._safe_call(phase_callback, f"autotuning {text}" if kind == "kernel" else text)
+
+    @staticmethod
+    def _safe_call(callback, *args) -> None:
+        """A broken progress/phase callback must never derail monitoring of the real DDP job."""
+        try:
+            callback(*args)
+        except Exception:
+            pass
 
     @staticmethod
     def _load_ddp_results(run_dir: Path) -> dict:
