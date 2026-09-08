@@ -419,16 +419,30 @@ def estimate_optimizer_memory_mb(trainable_params: int, optimizer_states: int = 
 
 
 def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
-    """Average seconds/step over n_steps calls to step_fn(), or None if step_fn runs."""
+    """Average seconds/step over n_steps calls to step_fn(); shows a tqdm bar, hides autotune spam."""
+    import os
+
+    from tqdm.auto import tqdm
+
+    prev_autotune_env = os.environ.get("TRITON_PRINT_AUTOTUNING")
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
     try:
-        for _ in range(warmup):
-            step_fn()
-        start = time.perf_counter()
-        for _ in range(n_steps):
-            step_fn()
-        elapsed = time.perf_counter() - start
+        with tqdm(total=warmup + n_steps, desc="benchmark", leave=False) as bar:
+            for _ in range(warmup):
+                step_fn()
+                bar.update(1)
+            start = time.perf_counter()
+            for _ in range(n_steps):
+                step_fn()
+                bar.update(1)
+            elapsed = time.perf_counter() - start
     except StopIteration:
         return None
+    finally:
+        if prev_autotune_env is None:
+            os.environ.pop("TRITON_PRINT_AUTOTUNING", None)
+        else:
+            os.environ["TRITON_PRINT_AUTOTUNING"] = prev_autotune_env
     return elapsed / n_steps
 
 

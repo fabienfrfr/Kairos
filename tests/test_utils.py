@@ -1,3 +1,4 @@
+import os
 import time
 
 import pytest
@@ -104,6 +105,44 @@ def test_benchmark_step_time_returns_none_when_iterator_exhausted():
         return next(values)
 
     assert benchmark_step_time(step_fn, n_steps=5, warmup=1) is None
+
+
+def test_benchmark_step_time_shows_a_tqdm_bar_instead_of_raw_logs(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        pass
+
+    benchmark_step_time(step_fn, n_steps=3, warmup=2)
+
+    assert fake.created[0].total == 5  # warmup + n_steps
+    assert fake.created[0].n == 5
+    assert fake.created[0].closed
+
+
+def test_benchmark_step_time_suppresses_triton_autotuning_prints(monkeypatch):
+    monkeypatch.delenv("TRITON_PRINT_AUTOTUNING", raising=False)
+    seen_during_call = {}
+
+    def step_fn():
+        seen_during_call["value"] = os.environ.get("TRITON_PRINT_AUTOTUNING")
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert seen_during_call["value"] == "0"
+    assert "TRITON_PRINT_AUTOTUNING" not in os.environ
+
+
+def test_benchmark_step_time_restores_prior_triton_env_value(monkeypatch):
+    monkeypatch.setenv("TRITON_PRINT_AUTOTUNING", "1")
+
+    def step_fn():
+        pass
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert os.environ["TRITON_PRINT_AUTOTUNING"] == "1"
 
 
 # ------------------------------------------------------------- training_summary
@@ -304,7 +343,7 @@ def test_training_summary_includes_active_params_for_moe():
 
 # ------------------------------------------------------------- make_progress_callback
 class _FakeBar:
-    def __init__(self, total, desc):
+    def __init__(self, total, desc, leave=True):
         self.total = total
         self.desc = desc
         self.n = 0
@@ -314,11 +353,20 @@ class _FakeBar:
     def set_postfix(self, **kw):
         self.postfix = kw
 
+    def update(self, n=1):
+        self.n += n
+
     def refresh(self):
         pass
 
     def close(self):
         self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
 
 
 def test_make_progress_callback_updates_bar(monkeypatch):
@@ -352,8 +400,8 @@ class _FakeTqdmFactory:
         self.created = []
         self.written = []
 
-    def __call__(self, total, desc):
-        bar = _FakeBar(total, desc)
+    def __call__(self, total, desc, **kwargs):
+        bar = _FakeBar(total, desc, **kwargs)
         self.created.append(bar)
         return bar
 
