@@ -121,20 +121,40 @@ def test_benchmark_step_time_shows_a_tqdm_bar_instead_of_raw_logs(monkeypatch):
     assert fake.created[0].closed
 
 
-def test_benchmark_step_time_suppresses_triton_autotuning_prints(monkeypatch):
-    monkeypatch.delenv("TRITON_PRINT_AUTOTUNING", raising=False)
-    seen_during_call = {}
+def test_benchmark_step_time_relays_real_triton_kernel_lines_into_bar_description(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
 
     def step_fn():
-        seen_during_call["value"] = os.environ.get("TRITON_PRINT_AUTOTUNING")
+        print("Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1")
 
     benchmark_step_time(step_fn, n_steps=1, warmup=0)
 
-    assert seen_during_call["value"] == "0"
-    assert "TRITON_PRINT_AUTOTUNING" not in os.environ
+    assert "l2norm_fwd_kernel" in fake.created[0].desc
 
 
-def test_benchmark_step_time_restores_prior_triton_env_value(monkeypatch):
+def test_benchmark_step_time_relays_real_triton_finished_line_into_postfix(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        print("finished after 6.31s,")
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert "finished after 6.31s" in fake.created[0].postfix_str
+
+
+def test_benchmark_step_time_does_not_leak_triton_lines_to_real_stdout(capsys):
+    def step_fn():
+        print("Autotuning kernel foo_kernel with config BT: 8")
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert "Autotuning kernel" not in capsys.readouterr().out
+
+
+def test_benchmark_step_time_does_not_touch_triton_env_var(monkeypatch):
     monkeypatch.setenv("TRITON_PRINT_AUTOTUNING", "1")
 
     def step_fn():
@@ -142,7 +162,7 @@ def test_benchmark_step_time_restores_prior_triton_env_value(monkeypatch):
 
     benchmark_step_time(step_fn, n_steps=1, warmup=0)
 
-    assert os.environ["TRITON_PRINT_AUTOTUNING"] == "1"
+    assert os.environ["TRITON_PRINT_AUTOTUNING"] == "1"  # respects the user's own setting, untouched
 
 
 # ------------------------------------------------------------- training_summary
@@ -348,10 +368,17 @@ class _FakeBar:
         self.desc = desc
         self.n = 0
         self.postfix = None
+        self.postfix_str = None
         self.closed = False
 
     def set_postfix(self, **kw):
         self.postfix = kw
+
+    def set_postfix_str(self, s):
+        self.postfix_str = s
+
+    def set_description(self, desc):
+        self.desc = desc
 
     def update(self, n=1):
         self.n += n

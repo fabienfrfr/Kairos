@@ -418,31 +418,57 @@ def estimate_optimizer_memory_mb(trainable_params: int, optimizer_states: int = 
     return trainable_params * optimizer_states * bytes_per_param / (1024**2)
 
 
-def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
-    """Average seconds/step over n_steps calls to step_fn(); shows a tqdm bar, hides autotune spam."""
-    import os
+class _AutotuneRelay:
+    """Reformats Triton's own real autotuning stdout into a live tqdm status (no invented data)."""
 
+    _KERNEL_PREFIX = "Autotuning kernel "
+    _DONE_PREFIX = "finished after "
+
+    def __init__(self, bar):
+        self._bar = bar
+        self._buf = ""
+        self._seen_kernels = set()
+
+    def write(self, chunk: str) -> None:
+        self._buf += chunk
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._handle_line(line.strip())
+
+    def _handle_line(self, line: str) -> None:
+        if line.startswith(self._KERNEL_PREFIX):
+            self._handle_kernel_line(line)
+        elif line.startswith(self._DONE_PREFIX):
+            self._bar.set_postfix_str(line)
+            self._bar.refresh()
+
+    def _handle_kernel_line(self, line: str) -> None:
+        name = line[len(self._KERNEL_PREFIX) :].split(" ", 1)[0]
+        self._seen_kernels.add(name)
+        self._bar.set_description(f"autotuning {name} ({len(self._seen_kernels)} kernels so far)")
+        self._bar.refresh()
+
+    def flush(self) -> None:
+        pass
+
+
+def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
+    """Average seconds/step over n_steps calls; relays Triton's real autotuning output live."""
     from tqdm.auto import tqdm
 
-    prev_autotune_env = os.environ.get("TRITON_PRINT_AUTOTUNING")
-    os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
     try:
         with tqdm(total=warmup + n_steps, desc="benchmark", leave=False) as bar:
-            for _ in range(warmup):
-                step_fn()
-                bar.update(1)
-            start = time.perf_counter()
-            for _ in range(n_steps):
-                step_fn()
-                bar.update(1)
-            elapsed = time.perf_counter() - start
+            with contextlib.redirect_stdout(_AutotuneRelay(bar)):
+                for _ in range(warmup):
+                    step_fn()
+                    bar.update(1)
+                start = time.perf_counter()
+                for _ in range(n_steps):
+                    step_fn()
+                    bar.update(1)
+                elapsed = time.perf_counter() - start
     except StopIteration:
         return None
-    finally:
-        if prev_autotune_env is None:
-            os.environ.pop("TRITON_PRINT_AUTOTUNING", None)
-        else:
-            os.environ["TRITON_PRINT_AUTOTUNING"] = prev_autotune_env
     return elapsed / n_steps
 
 
