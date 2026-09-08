@@ -53,6 +53,7 @@ from .utils import (
     benchmark_step_time,
     detailed_memory_report,
     locate_first_nonfinite_module,
+    parse_autotune_line,
     profile_module_time,
     training_summary,
 )
@@ -408,6 +409,8 @@ class KairosMultimodalPipeline:
             torch._dynamo.config.capture_scalar_outputs = True
             # headroom for all 12 length buckets (+ grad_mode) to stabilize without eager fallback
             torch._dynamo.config.recompile_limit = 32
+            # keeps autotuning in-process (no subprocess pool) so our tqdm relay can see it
+            torch._inductor.config.compile_threads = 1
         if self.distributed:
             # Conditional forward (unused params) -> DDP needs find_unused_parameters.
             forward_module = torch.compile(self.model) if should_compile else self.model
@@ -1146,18 +1149,27 @@ class KairosMultimodalPipeline:
         if log_path.exists():
             lines = log_path.read_text().splitlines()
             for line in lines[index:]:
-                parts = line.split()
-                if progress_callback is not None and len(parts) >= 4 and parts[0] == "step":
-                    step_total = parts[1].split("/", 1)
-                    if len(step_total) == 2:
-                        try:
-                            progress_callback(int(step_total[0]), int(step_total[1]), float(parts[3]))
-                        except ValueError:
-                            pass
-                elif phase_callback is not None and len(parts) >= 2 and parts[0] == "phase":
-                    phase_callback(parts[1])
+                KairosMultimodalPipeline._replay_ddp_log_line(line, progress_callback, phase_callback)
                 index += 1
         return index
+
+    @staticmethod
+    def _replay_ddp_log_line(line: str, progress_callback, phase_callback) -> None:
+        parts = line.split()
+        if progress_callback is not None and len(parts) >= 4 and parts[0] == "step":
+            step_total = parts[1].split("/", 1)
+            if len(step_total) == 2:
+                try:
+                    progress_callback(int(step_total[0]), int(step_total[1]), float(parts[3]))
+                except ValueError:
+                    pass
+        elif phase_callback is not None and len(parts) >= 2 and parts[0] == "phase":
+            phase_callback(parts[1])
+        elif phase_callback is not None:
+            parsed = parse_autotune_line(line)
+            if parsed is not None:
+                kind, text = parsed
+                phase_callback(f"autotuning {text}" if kind == "kernel" else text)
 
     @staticmethod
     def _load_ddp_results(run_dir: Path) -> dict:

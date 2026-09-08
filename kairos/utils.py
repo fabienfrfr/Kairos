@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -418,16 +419,27 @@ def estimate_optimizer_memory_mb(trainable_params: int, optimizer_states: int = 
     return trainable_params * optimizer_states * bytes_per_param / (1024**2)
 
 
+def parse_autotune_line(line: str) -> tuple[str, str] | None:
+    """Returns (kind, text) for a raw Triton autotuning line ('kernel' or 'done'), else None."""
+    if line.startswith("Autotuning kernel "):
+        return "kernel", line[len("Autotuning kernel ") :].split(" ", 1)[0]
+    if line.startswith("finished after "):
+        return "done", line
+    return None
+
+
+_LOADING_TICK_SEC = 1.0  # how often the heartbeat updates the bar before real Triton output arrives
+
+
 class _AutotuneRelay:
     """Reformats Triton's own real autotuning stdout into a live tqdm status (no invented data)."""
-
-    _KERNEL_PREFIX = "Autotuning kernel "
-    _DONE_PREFIX = "finished after "
 
     def __init__(self, bar):
         self._bar = bar
         self._buf = ""
         self._seen_kernels = set()
+        self._seen_any = False
+        self._lock = threading.Lock()
 
     def write(self, chunk: str) -> None:
         self._buf += chunk
@@ -436,20 +448,47 @@ class _AutotuneRelay:
             self._handle_line(line.strip())
 
     def _handle_line(self, line: str) -> None:
-        if line.startswith(self._KERNEL_PREFIX):
-            self._handle_kernel_line(line)
-        elif line.startswith(self._DONE_PREFIX):
-            self._bar.set_postfix_str(line)
+        parsed = parse_autotune_line(line)
+        if parsed is None:
+            return
+        kind, text = parsed
+        with self._lock:
+            self._seen_any = True
+            if kind == "kernel":
+                self._seen_kernels.add(text)
+                self._bar.set_description(f"autotuning {text} ({len(self._seen_kernels)} kernels so far)")
+            else:
+                self._bar.set_postfix_str(text)
             self._bar.refresh()
 
-    def _handle_kernel_line(self, line: str) -> None:
-        name = line[len(self._KERNEL_PREFIX) :].split(" ", 1)[0]
-        self._seen_kernels.add(name)
-        self._bar.set_description(f"autotuning {name} ({len(self._seen_kernels)} kernels so far)")
-        self._bar.refresh()
+    def tick(self, elapsed: float) -> None:
+        """Called from a background thread; only fires before any real output has arrived."""
+        with self._lock:
+            if not self._seen_any:
+                self._bar.set_postfix_str(f"loading triton / compiling... {elapsed:.0f}s")
+                self._bar.refresh()
 
     def flush(self) -> None:
         pass
+
+
+def _run_step_with_heartbeat(step_fn, relay: _AutotuneRelay) -> None:
+    """Runs step_fn(), ticking relay with elapsed time while nothing real has printed yet."""
+    stop = threading.Event()
+    start = time.perf_counter()
+
+    def _ticker() -> None:
+        while not stop.wait(_LOADING_TICK_SEC):
+            relay.tick(time.perf_counter() - start)
+
+    ticker = threading.Thread(target=_ticker, daemon=True)
+    ticker.start()
+    try:
+        with contextlib.redirect_stdout(relay):
+            step_fn()
+    finally:
+        stop.set()
+        ticker.join()
 
 
 def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
@@ -458,15 +497,15 @@ def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | N
 
     try:
         with tqdm(total=warmup + n_steps, desc="benchmark", leave=False) as bar:
-            with contextlib.redirect_stdout(_AutotuneRelay(bar)):
-                for _ in range(warmup):
-                    step_fn()
-                    bar.update(1)
-                start = time.perf_counter()
-                for _ in range(n_steps):
-                    step_fn()
-                    bar.update(1)
-                elapsed = time.perf_counter() - start
+            relay = _AutotuneRelay(bar)
+            for _ in range(warmup):
+                _run_step_with_heartbeat(step_fn, relay)
+                bar.update(1)
+            start = time.perf_counter()
+            for _ in range(n_steps):
+                _run_step_with_heartbeat(step_fn, relay)
+                bar.update(1)
+            elapsed = time.perf_counter() - start
     except StopIteration:
         return None
     return elapsed / n_steps

@@ -17,6 +17,7 @@ from kairos.utils import (
     format_duration,
     locate_first_nonfinite_module,
     make_progress_callback,
+    parse_autotune_line,
     training_summary,
 )
 
@@ -88,6 +89,21 @@ def test_estimate_optimizer_memory_mb_is_double_param_memory_for_adamw():
     assert estimate_optimizer_memory_mb(trainable) == pytest.approx(2 * estimate_param_memory_mb(trainable))
 
 
+# ------------------------------------------------------------- parse_autotune_line
+def test_parse_autotune_line_extracts_kernel_name():
+    line = "Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1"
+    assert parse_autotune_line(line) == ("kernel", "l2norm_fwd_kernel")
+
+
+def test_parse_autotune_line_extracts_done_line_verbatim():
+    line = "finished after 6.31s,"
+    assert parse_autotune_line(line) == ("done", line)
+
+
+def test_parse_autotune_line_ignores_unrelated_lines():
+    assert parse_autotune_line("some unrelated log output") is None
+
+
 # ------------------------------------------------------------- benchmark_step_time
 def test_benchmark_step_time_returns_positive_average():
     def step_fn():
@@ -119,6 +135,37 @@ def test_benchmark_step_time_shows_a_tqdm_bar_instead_of_raw_logs(monkeypatch):
     assert fake.created[0].total == 5  # warmup + n_steps
     assert fake.created[0].n == 5
     assert fake.created[0].closed
+
+
+def test_benchmark_step_time_ticks_elapsed_time_before_any_real_output(monkeypatch):
+    import kairos.utils as utils_module
+
+    monkeypatch.setattr(utils_module, "_LOADING_TICK_SEC", 0.02)
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        time.sleep(0.08)  # long enough for the 0.02s ticker to fire at least once
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert any("loading triton" in (p or "") for p in [fake.created[0].postfix_str])
+
+
+def test_benchmark_step_time_stops_ticking_once_real_output_seen(monkeypatch):
+    import kairos.utils as utils_module
+
+    monkeypatch.setattr(utils_module, "_LOADING_TICK_SEC", 0.02)
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        print("Autotuning kernel real_kernel with config BT: 8")
+        time.sleep(0.08)  # ticker keeps firing after this, but must not overwrite real info
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert "real_kernel" in fake.created[0].desc
 
 
 def test_benchmark_step_time_relays_real_triton_kernel_lines_into_bar_description(monkeypatch):

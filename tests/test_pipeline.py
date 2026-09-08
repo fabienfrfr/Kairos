@@ -235,6 +235,38 @@ def test_build_raises_recompile_limit_when_compiling(
     assert torch._dynamo.config.recompile_limit > 8
 
 
+@pytest.fixture
+def _restore_inductor_compile_threads():
+    original = torch._inductor.config.compile_threads
+    yield
+    torch._inductor.config.compile_threads = original
+
+
+def test_build_forces_single_compile_thread_when_compiling(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_inductor_compile_threads
+):
+    torch._inductor.config.compile_threads = 8
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    # forces autotuning to run in-process (no subprocess pool) so it can be observed/relayed
+    assert torch._inductor.config.compile_threads == 1
+
+
+def test_build_leaves_compile_threads_untouched_without_cuda(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_inductor_compile_threads
+):
+    torch._inductor.config.compile_threads = 8
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert torch._inductor.config.compile_threads == 8
+
+
 def test_build_and_train_actually_compile_on_cpu_when_forced(
     tmp_path, model_config, text_examples, multimodal_examples, monkeypatch
 ):
@@ -1221,6 +1253,20 @@ def test_replay_ddp_log_forwards_step_and_phase_lines(tmp_path):
     assert steps == [(1, 5, 0.5), (2, 5, 0.4)]
     assert phases == ["build", "run"]
     assert index == 5
+
+
+def test_replay_ddp_log_relays_real_triton_autotuning_lines_as_phases(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text(
+        "phase run\n"
+        "Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1\n"
+        "finished after 6.31s,\n"
+    )
+    phases = []
+
+    KairosMultimodalPipeline._replay_ddp_log(log_path, 0, None, phases.append)
+
+    assert phases == ["run", "autotuning l2norm_fwd_kernel", "finished after 6.31s,"]
 
 
 def test_replay_ddp_log_ignores_phase_lines_without_phase_callback(tmp_path):
