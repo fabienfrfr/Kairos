@@ -3,22 +3,32 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import itertools
 import json
 import math
 import os
+import pickle
 import random
+import subprocess
+import sys
 import time
 import warnings
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from transformers import TrainingArguments
 
+from .attentions import ATTN_IMPL as _ATTN_IMPL
+from .attentions import CAUSAL_CONV1D_BACKEND as _CAUSAL_CONV1D_BACKEND
+from .attentions import DELTA_RULE_BACKEND as _DELTA_RULE_BACKEND
 from .dataset import (
     KairosPretrainingDataset,
     diagnose_built_dataset,
@@ -43,7 +53,9 @@ from .utils import (
     benchmark_step_time,
     detailed_memory_report,
     locate_first_nonfinite_module,
+    parse_autotune_line,
     profile_module_time,
+    relay_autotune_output,
     training_summary,
 )
 
@@ -97,6 +109,8 @@ class TrainConfig:
     hub_push_every_ckpt: bool = False  # requires hub_repo_id; pushes checkpoints
     hub_private: bool = False
     hub_subfolder: str | None = None  # push under repo_id/<subfolder>
+    compile_model: bool = True  # torch.compile(model_forward); memory measurement bypasses it
+    amp_dtype: str | None = None  # None=auto (bf16 whenever supported); "bf16"/"fp16" forces it
 
     def __post_init__(self):
         if self.epochs is not None:
@@ -112,6 +126,8 @@ class TrainConfig:
                 "TrainConfig needs at least one epoch: mae_epochs + transition_epochs + "
                 f"diffusion_epochs must be > 0, got {self.epochs}"
             )
+        if self.amp_dtype is not None and self.amp_dtype not in ("bf16", "fp16"):
+            raise ValueError(f"TrainConfig.amp_dtype must be None, 'bf16', or 'fp16', got {self.amp_dtype!r}")
 
 
 def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
@@ -131,6 +147,68 @@ def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
     return longest
 
 
+def _resolve_amp_dtype(amp_dtype_override: str | None, bf16_supported: bool) -> torch.dtype:
+    """Picks the CUDA autocast dtype: override wins; else bf16 if supported, fp16 as the fallback."""
+    if amp_dtype_override == "bf16":
+        return torch.bfloat16
+    if amp_dtype_override == "fp16":
+        return torch.float16
+    return torch.bfloat16 if bf16_supported else torch.float16
+
+
+def _compile_backend_available() -> bool:
+    """Whether torch.compile should be attempted; a seam tests can monkeypatch for CPU."""
+    return torch.cuda.is_available()
+
+
+def init_distributed() -> bool:
+    """Initializes the torch.distributed process group from torchrun env vars; True if DDP."""
+    if dist.is_available() and not dist.is_initialized() and "WORLD_SIZE" in os.environ:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, timeout=datetime.timedelta(minutes=30))
+        return True
+    return False
+
+
+def launch_ddp(
+    model_config,
+    data_config,
+    eval_data_config,
+    train_config,
+    n_proc=None,
+    wait: bool = True,
+    resume: bool = True,
+    action: str = "train",
+    action_kwargs: dict | None = None,
+):
+    """Spawns a fresh pipeline via torchrun; one GPU per rank (flex + memory gate work)."""
+    # Configs are pickled to run_dir/ddp_job; pass fresh copies (post-build DataConfig is emptied).
+    run_dir = Path(train_config.run_dir)
+    job_dir = run_dir / "ddp_job"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    with (job_dir / "configs.pkl").open("wb") as f:
+        pickle.dump((model_config, data_config, eval_data_config, train_config), f)
+    with (job_dir / "job.pkl").open("wb") as f:
+        pickle.dump({"action": action, "resume": resume, "kwargs": action_kwargs or {}}, f)
+    n_proc = n_proc or (torch.cuda.device_count() or 1)
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={n_proc}",
+        "--rdzv-backend=c10d",
+        str(Path(__file__).parent / "_entry_ddp.py"),
+        str(job_dir),
+    ]
+    log_path = run_dir / f"{action}_ddp.log"
+    with log_path.open("ab") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+        if wait and proc.wait() != 0:
+            raise RuntimeError(f"DDP {action} failed (see {log_path})")
+    return proc
+
+
 class KairosMultimodalPipeline:
     def __init__(
         self,
@@ -146,7 +224,24 @@ class KairosMultimodalPipeline:
         self.train_config = train_config
         self.tokenizer = tokenizer or KairosTokenizer()
 
+        # build() empties data_config in place, so snapshot pre-build configs for a DDP-launched job.
+        self._ddp_snapshot = (
+            copy.deepcopy(model_config),
+            copy.deepcopy(data_config),
+            copy.deepcopy(eval_data_config),
+            copy.deepcopy(train_config),
+        )
+
+        # distributed (DDP) state; init_distributed()/build() fill these from torchrun env.
+        self.distributed = False
+        self.world_size = 1
+        self.rank = 0
+        self.local_rank = 0
+        self.compiled = False  # build() sets this once torch.compile is (or isn't) applied
+
         self.device = train_config.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"train_config.device={self.device!r} but no CUDA device is available")
 
         self.model: KairosDiffusionFM | None = None
         self.dataset: KairosPretrainingDataset | None = None
@@ -157,10 +252,11 @@ class KairosMultimodalPipeline:
         self.hf_trainer: KairosDiffusionTrainer | None = None
         self.writer: SummaryWriter | None = None
 
-        # AMP: fp16 on pre-Ampere (T4), bf16 on Ampere+; GradScaler only for fp16.
+        # AMP: bf16 only on real tensor-core hardware (Ampere+); T4 "supports" bf16 unaccelerated.
         if torch.cuda.is_available():
             self.amp_device_type = "cuda"
-            self.amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability() >= (8, 0) else torch.float16
+            bf16_hw = torch.cuda.is_bf16_supported() and torch.cuda.get_device_capability() >= (8, 0)
+            self.amp_dtype = _resolve_amp_dtype(train_config.amp_dtype, bf16_hw)
         elif torch.backends.mps.is_available():
             self.amp_device_type = "mps"
             self.amp_dtype = torch.float16
@@ -181,6 +277,20 @@ class KairosMultimodalPipeline:
         self.nan_log: list[dict] = []
         self._last_nonfinite_batch: dict | None = None
 
+        # background disk writes for the frequent resumable checkpoint; see _save()/_flush_checkpoint_writes()
+        self._ckpt_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_ckpt_futures: list[Future] = []
+
+    @property
+    def is_main_process(self) -> bool:
+        """True on rank 0 (or single process): logging / checkpoint / hub work is gated on this."""
+        return not self.distributed or self.rank == 0
+
+    @property
+    def _forward_model(self):
+        """Rank-0 diagnostic forward uses the raw model; DDP wrapper needs all ranks in sync."""
+        return self.model if self.distributed else self.model_forward
+
     def _autocast(self):
         return torch.autocast(device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.use_amp)
 
@@ -190,9 +300,9 @@ class KairosMultimodalPipeline:
             return self.data_config.num_workers
         if self.data_config.batch_size <= 1:
             return 0
-        # cap at available CPUs; a flat "4" can stall/hang on a 1-2 core machine.
+        # cap at available CPUs; a flat "8" can stall/hang on a 1-2 core machine.
         cpu_count = os.cpu_count() or 1
-        return max(0, min(4, cpu_count - 1))
+        return max(0, min(8, cpu_count - 1))
 
     # ------------------------------------------------------------------ build
     def _build_dataset(self, data_config: DataConfig | None = None) -> KairosPretrainingDataset:
@@ -240,12 +350,35 @@ class KairosMultimodalPipeline:
         """Wires up dataset, model, optimizer, scheduler, and (if resuming later) the checkpoint."""
         dc, tc = self.data_config, self.train_config
 
+        self.distributed = init_distributed()
+        if torch.cuda.is_available():
+            # TF32 matmul: free precision/perf trade on Ampere+ for the fp32 ops autocast leaves untouched.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        if self.distributed:
+            self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            self.rank = int(os.environ.get("RANK", "0"))
+            self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.local_rank)
+                self.device = f"cuda:{self.local_rank}"
+            if not dist.is_initialized():
+                raise RuntimeError("distributed env present but process group failed to initialize")
+
         self.dataset = self._build_dataset()
         num_workers = self._num_workers
+        train_sampler = None
+        if self.distributed:
+            train_sampler = DistributedSampler(
+                self.dataset, num_replicas=self.world_size, rank=self.rank, shuffle=dc.shuffle
+            )
+        self._train_sampler = train_sampler
         self.loader = DataLoader(
             self.dataset,
             batch_size=dc.batch_size,
-            shuffle=dc.shuffle,
+            shuffle=False if self.distributed else dc.shuffle,
+            sampler=train_sampler,
             drop_last=dc.drop_last,
             num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
@@ -254,20 +387,52 @@ class KairosMultimodalPipeline:
         )
 
         if self.eval_data_config is not None:
+            eval_dataset = self._build_dataset(self.eval_data_config)
+            eval_sampler = None
+            if self.distributed:
+                eval_sampler = DistributedSampler(eval_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False)
             self.eval_loader = DataLoader(
-                self._build_dataset(self.eval_data_config),
+                eval_dataset,
                 batch_size=self.eval_data_config.batch_size,
                 shuffle=False,
+                sampler=eval_sampler,
                 drop_last=False,
             )
 
         self.model = KairosDiffusionFM(
             self.model_config, vocab_size=len(self.tokenizer), num_octet_families=self.tokenizer.NUM_OCTET_FAMILIES
         ).to(self.device)
-        # split each batch across visible GPUs; state_dict/generate keep using self.model
-        n_gpus = torch.cuda.device_count()
-        self.model_forward = torch.nn.DataParallel(self.model) if n_gpus > 1 else self.model
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr)
+        # state_dict/generate keep using self.model; self.model_forward is the parallel wrapper.
+        should_compile = tc.compile_model and _compile_backend_available()
+        self.compiled = should_compile
+        if should_compile:
+            # avoid a graph break on gather_active's data-dependent max_len().item()
+            torch._dynamo.config.capture_scalar_outputs = True
+            # headroom for all 12 length buckets (+ grad_mode) to stabilize without eager fallback
+            torch._dynamo.config.recompile_limit = 32
+            # keeps autotuning in-process (no subprocess pool) so our tqdm relay can see it
+            torch._inductor.config.compile_threads = 1
+        if self.distributed:
+            # Conditional forward (unused params) -> DDP needs find_unused_parameters.
+            forward_module = torch.compile(self.model) if should_compile else self.model
+            self.model_forward = DDP(
+                forward_module,
+                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                find_unused_parameters=True,
+            )
+        else:
+            if torch.cuda.device_count() > 1:
+                warnings.warn(
+                    "Multiple GPUs visible but not launched via torchrun: model_forward will only "
+                    "use cuda:0. train() still auto-launches DDP across all visible GPUs; launch "
+                    "the whole script via torchrun to use every GPU for summary/generate/evaluate "
+                    "too.",
+                    stacklevel=2,
+                )
+            self.model_forward = torch.compile(self.model) if should_compile else self.model
+        # separate compiled instance: keeps eval's no_grad() from forcing train's graph to recompile
+        self.eval_forward = torch.compile(self.model) if should_compile else self.model_forward
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr, fused=torch.cuda.is_available())
         n_steps = max(1, tc.epochs * len(self.loader))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
 
@@ -276,7 +441,8 @@ class KairosMultimodalPipeline:
         self.tb_dir = run_dir / "tensorboard"
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.tb_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "training_config.json").write_text(json.dumps(self.run_config_dict(), indent=2))
+        if self.is_main_process:
+            (run_dir / "training_config.json").write_text(json.dumps(self.run_config_dict(), indent=2))
 
         self.hf_trainer = KairosDiffusionTrainer(
             model=self.model, args=TrainingArguments(output_dir=str(run_dir), report_to=tc.report_to)
@@ -286,22 +452,34 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_reweight = tc.mask_reweight
         self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
         self.hf_trainer.self_conditioning_prob = tc.self_conditioning_prob
-        self.writer = SummaryWriter(str(self.tb_dir))
+        self.writer = SummaryWriter(str(self.tb_dir)) if self.is_main_process else None
 
-        if tc.hub_repo_id and tc.hub_push_every_ckpt:
+        if tc.hub_repo_id and tc.hub_push_every_ckpt and self.is_main_process:
             from huggingface_hub import HfApi
 
             HfApi().create_repo(tc.hub_repo_id, private=tc.hub_private, exist_ok=True)
         return self
 
     # -------------------------------------------------------------- summary
-    def summary(self, benchmark: bool = True, n_bench_steps: int = 5) -> TrainingSummary:
+    def summary(self, benchmark: bool = True, n_bench_steps: int = 5, ddp_benchmark: bool = False) -> TrainingSummary:
         """Report params/memory/time; benchmark=True uses one real step, not param formulas."""
         self._require_built()
+        if ddp_benchmark and benchmark and not self.distributed and torch.cuda.device_count() > 1:
+            kwargs = {"benchmark": True, "n_bench_steps": n_bench_steps}
+            results = self._run_via_ddp("summary", resume=False, action_kwargs=kwargs)
+            return results["summary"]
+        if benchmark and not self.distributed and torch.cuda.device_count() > 1:
+            warnings.warn(
+                "Multiple GPUs visible: benchmark will only use cuda:0 (fast, single-process). "
+                "Pass summary(ddp_benchmark=True) for a real multi-GPU torchrun benchmark -- slower "
+                "to start (full pipeline rebuild per rank) and can hang in constrained notebook "
+                "environments (Kaggle/Colab rendezvous issues).",
+                stacklevel=2,
+            )
 
         mem_report = None
         avg_step_time = None
-        if benchmark:
+        if benchmark and self.is_main_process:
             model_state = copy.deepcopy(self.model.state_dict())
             optimizer_state = copy.deepcopy(self.optimizer.state_dict())
             loader_iter = iter(self.loader)
@@ -311,7 +489,7 @@ class KairosMultimodalPipeline:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 self.optimizer.zero_grad()
                 with self._autocast():
-                    loss = self.hf_trainer.compute_loss(self.model_forward, batch)
+                    loss = self.hf_trainer.compute_loss(self._forward_model, batch)
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
@@ -319,31 +497,26 @@ class KairosMultimodalPipeline:
                 self.scaler.update()
 
             try:
-                # one real step, fully measured (reused as the memory_report() result) and timed
+                # memory: uncompiled self.model only, isolated from any compiled timing below.
                 batch = next(loader_iter)
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
                 def loss_fn():
-                    return self.hf_trainer.compute_loss(self.model_forward, batch)
+                    return self.hf_trainer.compute_loss(self.model, batch)
 
-                t0 = time.perf_counter()
-                mem_report = detailed_memory_report(
-                    self.model,
-                    self.optimizer,
-                    loss_fn,
-                    self.device,
-                    autocast_ctx=self._autocast,
-                    scaler=self.scaler,
-                )
-                first_step_time = time.perf_counter() - t0
+                with relay_autotune_output("memory measurement"):
+                    mem_report = detailed_memory_report(
+                        self.model,
+                        self.optimizer,
+                        loss_fn,
+                        self.device,
+                        autocast_ctx=self._autocast,
+                        scaler=self.scaler,
+                    )
 
-                # remaining steps just for timing, continuing from the already-stepped model
-                remaining = max(0, n_bench_steps - 1)
-                rest_avg = benchmark_step_time(step_fn, n_steps=remaining, warmup=0) if remaining else None
-                if rest_avg is not None:
-                    avg_step_time = (first_step_time + rest_avg * remaining) / (1 + remaining)
-                else:
-                    avg_step_time = first_step_time
+                # generous warmup so varied bucket sizes/grad_mode stabilize before timing
+                warmup = max(2 * n_bench_steps, 10) if self.compiled else 0
+                avg_step_time = benchmark_step_time(step_fn, n_steps=n_bench_steps, warmup=warmup)
             except StopIteration:
                 pass
             finally:
@@ -361,6 +534,16 @@ class KairosMultimodalPipeline:
             num_experts_per_tok=self.model_config.num_experts_per_tok if self.model_config.use_moe else None,
             num_local_experts=self.model_config.num_local_experts if self.model_config.use_moe else None,
         )
+        # here only for the benchmark=False static estimate; benchmark=True routes via DDP above.
+        n_gpus = torch.cuda.device_count() if not self.distributed and torch.cuda.device_count() > 1 else 1
+        ts.n_gpus = n_gpus
+        ts.single_gpu_benchmark = benchmark and n_gpus > 1 and not self.distributed
+        ts.attn_impl = _ATTN_IMPL
+        ts.delta_rule_backend = _DELTA_RULE_BACKEND
+        ts.causal_conv1d_backend = _CAUSAL_CONV1D_BACKEND
+        if n_gpus > 1:
+            ts.steps_per_epoch = math.ceil(ts.steps_per_epoch / n_gpus)
+            ts.total_steps = ts.epochs * ts.steps_per_epoch
         if avg_step_time is not None:
             ts.avg_step_time_sec = avg_step_time
             ts.estimated_total_time_sec = avg_step_time * ts.total_steps
@@ -375,6 +558,8 @@ class KairosMultimodalPipeline:
     def memory_report(self) -> DetailedMemoryReport:
         """Real measured memory for one train step; runs it then restores model/optimizer state."""
         self._require_built()
+        if not self.is_main_process:
+            return None
         model_state = copy.deepcopy(self.model.state_dict())
         optimizer_state = copy.deepcopy(self.optimizer.state_dict())
         loader_iter = iter(self.loader)
@@ -382,7 +567,8 @@ class KairosMultimodalPipeline:
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
         def loss_fn():
-            return self.hf_trainer.compute_loss(self.model_forward, batch)
+            # hooks mutate a closure var every layer; torch.compile would recompile on each change.
+            return self.hf_trainer.compute_loss(self.model, batch)
 
         try:
             return detailed_memory_report(
@@ -403,6 +589,8 @@ class KairosMultimodalPipeline:
     def profile(self, n_steps: int = 3) -> ModuleTimeReport:
         """Per-module wall-clock time (fwd+bwd), avg over n_steps; restores state after."""
         self._require_built()
+        if not self.is_main_process:
+            return None
         model_state = copy.deepcopy(self.model.state_dict())
         optimizer_state = copy.deepcopy(self.optimizer.state_dict())
         loader_iter = iter(self.loader)
@@ -412,7 +600,7 @@ class KairosMultimodalPipeline:
         def step_fn():
             self.optimizer.zero_grad()
             with self._autocast():
-                loss = self.hf_trainer.compute_loss(self.model_forward, batch)
+                loss = self.hf_trainer.compute_loss(self._forward_model, batch)
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config.grad_clip)
@@ -566,7 +754,7 @@ class KairosMultimodalPipeline:
                 for batch in self.eval_loader:
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     with self._autocast():
-                        losses.append(self.hf_trainer.compute_loss(self.model_forward, batch).item())
+                        losses.append(self.hf_trainer.compute_loss(self.eval_forward, batch).item())
                     seen += 1
                     if tc.eval_batches and seen >= tc.eval_batches:
                         break
@@ -575,9 +763,18 @@ class KairosMultimodalPipeline:
         if not losses:
             return None
 
-        eval_loss = sum(losses) / len(losses)
+        local_sum = sum(losses)
+        local_count = len(losses)
+        if self.distributed:
+            stats = torch.tensor([local_sum, local_count], device=self.device, dtype=torch.float)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            local_sum, local_count = float(stats[0]), int(stats[1])
+        eval_loss = local_sum / max(1, local_count)
+
+        if not self.is_main_process:
+            return None
         self.best_eval_loss = min(self.best_eval_loss, eval_loss)
-        row = {"step": step, "loss": eval_loss, "batches": seen}
+        row = {"step": step, "loss": eval_loss, "batches": local_count}
         self.eval_log_rows.append(row)
         self.writer.add_scalar("eval/loss", eval_loss, step)
         return row
@@ -604,6 +801,8 @@ class KairosMultimodalPipeline:
     ) -> list[dict]:
         """Trains on a tiny subset to check memorization; walks the active curriculum stages."""
         self._require_built()
+        if not self.is_main_process:
+            return []
         from torch.utils.data import Subset
 
         saved_model = copy.deepcopy(self.model.state_dict())
@@ -673,7 +872,7 @@ class KairosMultimodalPipeline:
                 opt.zero_grad()
                 self.hf_trainer.mask_p_max, self.hf_trainer.mask_reweight = stage_at(step)
                 with self._autocast():
-                    loss = self.hf_trainer.compute_loss(self.model_forward, batch)
+                    loss = self.hf_trainer.compute_loss(self._forward_model, batch)
                 loss_val = loss.item()
                 if not math.isfinite(loss_val):
                     warnings.warn(
@@ -714,21 +913,51 @@ class KairosMultimodalPipeline:
             raise RuntimeError("call .build() before .train()/.evaluate()/.check_per_modality_loss()")
 
     def train(
-        self, progress_callback=None, resume: bool = True, memory_bank: KairosMultiCache | None = None
+        self,
+        progress_callback=None,
+        resume: bool = True,
+        memory_bank: KairosMultiCache | None = None,
+        ddp_launch: bool | None = None,
+        n_proc: int | None = None,
+        phase_callback=None,
     ) -> list[dict]:
         """Runs the training loop; resumes from local last.pt or the hub if unavailable."""
         self._require_built()
+        # single process, several GPUs visible -> spawn a torchrun job (one GPU per rank).
+        auto_launch = ddp_launch is None and not self.distributed and torch.cuda.device_count() > 1
+        if auto_launch or ddp_launch:
+            results = self._run_via_ddp(
+                "train",
+                n_proc=n_proc,
+                progress_callback=progress_callback,
+                phase_callback=phase_callback,
+                resume=resume,
+            )
+            for key, value in results.items():
+                setattr(self, key, value)
+            return self.log_rows
         tc = self.train_config
         self.model.train()
 
         last_ckpt = self.ckpt_dir / "last.pt"
         start_epoch = 1
-        if resume and last_ckpt.exists():
-            start_epoch = self._safe_resume(last_ckpt)
-        elif resume and tc.hub_repo_id:
-            ckpt = self._try_resume_from_hub(tc.hub_repo_id)
-            if ckpt is not None:
-                start_epoch = ckpt.get("epoch", 1)
+        if resume:
+            if self.distributed:
+                # rank0 materializes last.pt (local or hub); all ranks then load the same file.
+                if self.is_main_process and not last_ckpt.exists() and tc.hub_repo_id:
+                    ckpt = self._try_resume_from_hub(tc.hub_repo_id)
+                    if ckpt is not None:
+                        torch.save(ckpt, last_ckpt)
+                dist.barrier()
+                if last_ckpt.exists():
+                    start_epoch = self._safe_resume(last_ckpt)
+            else:
+                if last_ckpt.exists():
+                    start_epoch = self._safe_resume(last_ckpt)
+                elif tc.hub_repo_id:
+                    ckpt = self._try_resume_from_hub(tc.hub_repo_id)
+                    if ckpt is not None:
+                        start_epoch = ckpt.get("epoch", 1)
 
         total_steps = tc.epochs * len(self.loader)
         mae_steps = tc.mae_epochs * len(self.loader)
@@ -750,6 +979,8 @@ class KairosMultimodalPipeline:
 
         try:
             for epoch in range(start_epoch, tc.epochs + 1):
+                if self._train_sampler is not None:
+                    self._train_sampler.set_epoch(epoch)  # reshuffle per epoch identically on all ranks
                 epoch_loss = 0.0
                 for batch in self.loader:
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -777,6 +1008,11 @@ class KairosMultimodalPipeline:
                     with self._autocast():
                         loss = self.hf_trainer.compute_loss(self.model_forward, batch, cache_params=cache_params)
                     loss_val = loss.item()
+                    if self.distributed:
+                        # identical loss on every rank -> identical skip/abort decisions and logs
+                        loss_reduced = loss.detach().clone()
+                        dist.all_reduce(loss_reduced, op=dist.ReduceOp.SUM)
+                        loss_val = float(loss_reduced / self.world_size)
                     if use_memory_gate:
                         for scale_cache in cache_params.caches:
                             for layer_idx, s in enumerate(scale_cache.ssm_caches):
@@ -813,52 +1049,146 @@ class KairosMultimodalPipeline:
                     epoch_loss += loss_val
                     self.global_step += 1
 
-                    self.writer.add_scalar("train/loss", loss_val, self.global_step)
-                    self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.global_step)
-                    self.writer.add_scalar("train/mask_p_max", self.hf_trainer.mask_p_max, self.global_step)
-                    self.writer.add_scalar("train/mask_reweight", self.hf_trainer.mask_reweight, self.global_step)
-                    self.log_rows.append({"step": self.global_step, "epoch": epoch, "loss": loss_val})
+                    if self.is_main_process:
+                        self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                        self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.global_step)
+                        self.writer.add_scalar("train/mask_p_max", self.hf_trainer.mask_p_max, self.global_step)
+                        self.writer.add_scalar(
+                            "train/mask_reweight", self.hf_trainer.mask_reweight, self.global_step
+                        )
+                        self.log_rows.append({"step": self.global_step, "epoch": epoch, "loss": loss_val})
 
-                    if progress_callback is not None:
-                        progress_callback(self.global_step, total_steps, loss_val)
+                        if progress_callback is not None:
+                            progress_callback(self.global_step, total_steps, loss_val)
 
                     if eval_every_steps > 0 and self.global_step % eval_every_steps == 0:
-                        eval_row = self.evaluate()
+                        eval_row = self.evaluate()  # all ranks join the all_reduce inside
                         if eval_row is not None:
                             print(
                                 f"[eval @ step {eval_row['step']}] loss {eval_row['loss']:.4f} "
                                 f"(best {self.best_eval_loss:.4f})"
                             )
 
-                    if self.global_step % tc.last_ckpt_every == 0:
-                        self._save(last_ckpt, loss_val, epoch)  # overwritten, resumable
-                    if self.global_step % tc.save_every == 0:
-                        step_ckpt = self.ckpt_dir / f"step_{self.global_step:06d}.pt"
-                        self._save(step_ckpt, loss_val, epoch)
+                    if self.is_main_process:
+                        if self.global_step % tc.last_ckpt_every == 0:
+                            self._save(last_ckpt, loss_val, epoch, wait=False)  # overwritten, resumable
+                        if self.global_step % tc.save_every == 0:
+                            step_ckpt = self.ckpt_dir / f"step_{self.global_step:06d}.pt"
+                            self._save(step_ckpt, loss_val, epoch)
+                            if tc.hub_repo_id and tc.hub_push_every_ckpt:
+                                self._flush_checkpoint_writes()  # last_ckpt may still be in-flight (async save)
+                                self._push_checkpoint_to_hub(step_ckpt)
+                                self._push_checkpoint_to_hub(last_ckpt)
+
+                if self.is_main_process:
+                    self._save(last_ckpt, loss_val, epoch)  # always resumable at epoch boundaries
+
+                    avg_loss = epoch_loss / max(1, len(self.loader))
+                    self.writer.add_scalar("train/epoch_avg_loss", avg_loss, epoch)
+                    if avg_loss < self.best_loss:
+                        self.best_loss = avg_loss
+                        self._save(self.ckpt_dir / "best.pt", avg_loss, epoch)
                         if tc.hub_repo_id and tc.hub_push_every_ckpt:
-                            self._push_checkpoint_to_hub(step_ckpt)
-                            self._push_checkpoint_to_hub(last_ckpt)
+                            self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
 
-                self._save(last_ckpt, loss_val, epoch)  # always resumable at epoch boundaries
-
-                avg_loss = epoch_loss / max(1, len(self.loader))
-                self.writer.add_scalar("train/epoch_avg_loss", avg_loss, epoch)
-                if avg_loss < self.best_loss:
-                    self.best_loss = avg_loss
-                    self._save(self.ckpt_dir / "best.pt", avg_loss, epoch)
-                    if tc.hub_repo_id and tc.hub_push_every_ckpt:
-                        self._push_checkpoint_to_hub(self.ckpt_dir / "best.pt")
-
-            last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume
-            # skip if the last step already triggered a periodic eval (avoids a duplicate)
+            if self.is_main_process:
+                self._flush_checkpoint_writes()  # last_ckpt's last async write must land before unlink
+                last_ckpt.unlink(missing_ok=True)  # finished cleanly: nothing to resume
+            # final eval on the converged weights (skip if the last step already evaluated)
             if eval_every_steps > 0 and self.global_step % eval_every_steps != 0:
-                self.evaluate()  # final eval on the converged weights
+                self.evaluate()  # all ranks join the all_reduce inside
         finally:
+            self._flush_checkpoint_writes()
             self.skipped_nonfinite_steps = skipped_nonfinite
-            self.writer.flush()
-            self.writer.close()
+            if self.writer is not None:
+                self.writer.flush()
+                self.writer.close()
 
         return self.log_rows
+
+    _HEARTBEAT_INTERVAL_SEC = 15  # how long the ddp log can stay quiet before a heartbeat fires
+
+    @staticmethod
+    def _heartbeat_due(now: float, last_activity: float, interval: float) -> bool:
+        """True once the log has been quiet for longer than interval (e.g. mid-compile step)."""
+        return now - last_activity > interval
+
+    def _run_via_ddp(
+        self,
+        action: str,
+        n_proc=None,
+        progress_callback=None,
+        phase_callback=None,
+        resume: bool = True,
+        action_kwargs: dict | None = None,
+    ) -> dict:
+        """Spawns a torchrun job (one GPU per rank), shared by train() and summary()."""
+        tc = self.train_config
+        log_path = Path(tc.run_dir) / f"{action}_ddp.log"
+        log_path.unlink(missing_ok=True)  # fresh log so step replay below never sees stale lines
+        proc = launch_ddp(
+            *self._ddp_snapshot, n_proc=n_proc, resume=resume, wait=False, action=action, action_kwargs=action_kwargs
+        )
+        index = 0
+        start = last_activity = time.monotonic()
+        while proc.poll() is None:
+            new_index = self._replay_ddp_log(log_path, index, progress_callback, phase_callback)
+            now = time.monotonic()
+            if new_index != index:
+                index, last_activity = new_index, now
+            elif phase_callback is not None and self._heartbeat_due(now, last_activity, self._HEARTBEAT_INTERVAL_SEC):
+                phase_callback(f"still working ({int(now - start)}s elapsed, no new log lines yet)")
+                last_activity = now
+            time.sleep(0.25)
+        index = self._replay_ddp_log(log_path, index, progress_callback, phase_callback)
+        if proc.returncode != 0:
+            raise RuntimeError(f"DDP {action} failed (see {log_path})")
+        return self._load_ddp_results(Path(tc.run_dir))
+
+    @staticmethod
+    def _replay_ddp_log(log_path: Path, index: int, progress_callback, phase_callback=None) -> int:
+        """Feeds progress_callback/phase_callback from lines freshly written by rank-0."""
+        if log_path.exists():
+            lines = log_path.read_text().splitlines()
+            for line in lines[index:]:
+                KairosMultimodalPipeline._replay_ddp_log_line(line, progress_callback, phase_callback)
+                index += 1
+        return index
+
+    @staticmethod
+    def _replay_ddp_log_line(line: str, progress_callback, phase_callback) -> None:
+        parts = line.split()
+        if progress_callback is not None and len(parts) >= 4 and parts[0] == "step":
+            step_total = parts[1].split("/", 1)
+            if len(step_total) == 2:
+                try:
+                    step, total, loss_val = int(step_total[0]), int(step_total[1]), float(parts[3])
+                except ValueError:
+                    return
+                KairosMultimodalPipeline._safe_call(progress_callback, step, total, loss_val)
+        elif phase_callback is not None and len(parts) >= 2 and parts[0] == "phase":
+            KairosMultimodalPipeline._safe_call(phase_callback, parts[1])
+        elif phase_callback is not None:
+            parsed = parse_autotune_line(line)
+            if parsed is not None:
+                kind, text = parsed
+                KairosMultimodalPipeline._safe_call(phase_callback, f"autotuning {text}" if kind == "kernel" else text)
+
+    @staticmethod
+    def _safe_call(callback, *args) -> None:
+        """A broken progress/phase callback must never derail monitoring of the real DDP job."""
+        try:
+            callback(*args)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    @staticmethod
+    def _load_ddp_results(run_dir: Path) -> dict:
+        res_path = run_dir / "ddp_job" / "results.pkl"
+        if not res_path.exists():
+            raise RuntimeError(f"DDP job finished but no {res_path} was written")
+        with res_path.open("rb") as f:
+            return pickle.load(f)
 
     def locate_nan_source(self) -> dict | None:
         """Re-runs the last non-finite batch with hooks to find which module first."""
@@ -966,20 +1296,26 @@ class KairosMultimodalPipeline:
             "eval_data_config": edc,
         }
 
-    def _save(self, path: Path, loss_val: float, epoch: int = 1):
-        torch.save(
-            {
-                "step": self.global_step,
-                "epoch": epoch,
-                "model_state": self.model.state_dict(),
-                "optimizer_state": self.optimizer.state_dict(),
-                "scheduler_state": self.scheduler.state_dict(),
-                "loss": loss_val,
-                "config": self.model_config.to_dict(),
-                "train_config": asdict(self.train_config),
-            },
-            path,
-        )
+    def _flush_checkpoint_writes(self) -> None:
+        """Waits for pending async checkpoint writes; re-raises the first failure instead of losing it."""
+        while self._pending_ckpt_futures:
+            self._pending_ckpt_futures.pop(0).result()
+
+    def _save(self, path: Path, loss_val: float, epoch: int = 1, wait: bool = True):
+        """Clones state (fast) then writes off the main thread; wait=True blocks until it lands."""
+        payload = {
+            "step": self.global_step,
+            "epoch": epoch,
+            "model_state": copy.deepcopy(self.model.state_dict()),
+            "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),
+            "scheduler_state": copy.deepcopy(self.scheduler.state_dict()),
+            "loss": loss_val,
+            "config": self.model_config.to_dict(),
+            "train_config": asdict(self.train_config),
+        }
+        self._pending_ckpt_futures.append(self._ckpt_executor.submit(torch.save, payload, path))
+        if wait:
+            self._flush_checkpoint_writes()
 
     def load_checkpoint(self, path: str):
         """Loads a local .pt checkpoint into the built model/optimizer/scheduler."""

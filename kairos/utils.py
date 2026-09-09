@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -131,12 +132,18 @@ class DetailedMemoryReport:
             "",
             "Process RSS (real OS memory, /proc/self/status VmRSS):",
             f"  before step:                 {self.rss_before_mb:.1f} MB",
-            f"  after forward:                {self.rss_after_forward_mb:.1f} MB "
-            f"(+{self.rss_after_forward_mb - self.rss_before_mb:.1f} MB)",
-            f"  after backward:               {self.rss_after_backward_mb:.1f} MB "
-            f"(+{self.rss_after_backward_mb - self.rss_after_forward_mb:.1f} MB)",
-            f"  after optimizer.step():       {self.rss_after_optimizer_step_mb:.1f} MB "
-            f"(+{self.rss_after_optimizer_step_mb - self.rss_after_backward_mb:.1f} MB)",
+            (
+                f"  after forward:                {self.rss_after_forward_mb:.1f} MB "
+                f"(+{self.rss_after_forward_mb - self.rss_before_mb:.1f} MB)"
+            ),
+            (
+                f"  after backward:               {self.rss_after_backward_mb:.1f} MB "
+                f"(+{self.rss_after_backward_mb - self.rss_after_forward_mb:.1f} MB)"
+            ),
+            (
+                f"  after optimizer.step():       {self.rss_after_optimizer_step_mb:.1f} MB "
+                f"(+{self.rss_after_optimizer_step_mb - self.rss_after_backward_mb:.1f} MB)"
+            ),
             "",
             "Per top-level module (unique bytes, shared modules counted once):",
         ]
@@ -412,22 +419,126 @@ def estimate_optimizer_memory_mb(trainable_params: int, optimizer_states: int = 
     return trainable_params * optimizer_states * bytes_per_param / (1024**2)
 
 
-def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
-    """Average seconds/step over n_steps calls to step_fn(), or None if step_fn runs."""
+def parse_autotune_line(line: str) -> tuple[str, str] | None:
+    """Returns (kind, text) for a raw Triton autotuning line ('kernel' or 'done'), else None."""
+    if line.startswith("Autotuning kernel "):
+        return "kernel", line[len("Autotuning kernel ") :].split(" ", 1)[0]
+    if line.startswith("finished after "):
+        return "done", line
+    return None
+
+
+_LOADING_TICK_SEC = 1.0  # how often the heartbeat updates the bar before real Triton output arrives
+
+
+class _AutotuneRelay:
+    """Reformats Triton's own real autotuning stdout into a live tqdm status (no invented data)."""
+
+    def __init__(self, bar):
+        self._bar = bar
+        self._buf = ""
+        self._seen_kernels = set()
+        self._seen_any = False
+        self._lock = threading.Lock()
+
+    def write(self, chunk: str) -> None:
+        self._buf += chunk
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            try:
+                self._handle_line(line.strip())
+            except Exception:  # noqa: BLE001, S110
+                pass  # a display hiccup must never break the real step_fn() call underway
+
+    def _handle_line(self, line: str) -> None:
+        parsed = parse_autotune_line(line)
+        if parsed is None:
+            return
+        kind, text = parsed
+        with self._lock:
+            self._seen_any = True
+            if kind == "kernel":
+                self._seen_kernels.add(text)
+                self._bar.set_description(f"autotuning {text} ({len(self._seen_kernels)} kernels so far)")
+            else:
+                self._bar.set_postfix_str(text)
+            self._bar.refresh()
+
+    def tick(self, elapsed: float) -> None:
+        """Called from a background thread; only fires before any real output has arrived."""
+        try:
+            with self._lock:
+                if not self._seen_any:
+                    self._bar.set_postfix_str(f"loading triton / compiling... {elapsed:.0f}s")
+                    self._bar.refresh()
+        except Exception:  # noqa: BLE001, S110
+            pass  # a display hiccup in the background ticker must never crash the thread
+
+    def flush(self) -> None:
+        pass
+
+
+@contextlib.contextmanager
+def _heartbeat_and_redirect(relay: _AutotuneRelay):
+    """Ticks relay with elapsed time on a background thread while stdout is captured."""
+    stop = threading.Event()
+    start = time.perf_counter()
+
+    def _ticker() -> None:
+        while not stop.wait(_LOADING_TICK_SEC):
+            relay.tick(time.perf_counter() - start)
+
+    ticker = threading.Thread(target=_ticker, daemon=True)
+    ticker.start()
     try:
-        for _ in range(warmup):
-            step_fn()
-        start = time.perf_counter()
-        for _ in range(n_steps):
-            step_fn()
-        elapsed = time.perf_counter() - start
+        with contextlib.redirect_stdout(relay):
+            yield
+    finally:
+        stop.set()
+        ticker.join()
+
+
+def _run_step_with_heartbeat(step_fn, relay: _AutotuneRelay) -> None:
+    """Runs step_fn(), ticking relay with elapsed time while nothing real has printed yet."""
+    with _heartbeat_and_redirect(relay):
+        step_fn()
+
+
+@contextlib.contextmanager
+def relay_autotune_output(desc: str = "compiling"):
+    """Wraps a block of code: relays Triton's real autotuning stdout into a live tqdm status."""
+    from tqdm.auto import tqdm
+
+    with tqdm(total=0, desc=desc, bar_format="{desc}: {postfix}", leave=False) as bar:
+        relay = _AutotuneRelay(bar)
+        with _heartbeat_and_redirect(relay):
+            yield
+
+
+def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:
+    """Average seconds/step over n_steps calls; relays Triton's real autotuning output live."""
+    if n_steps <= 0:
+        return None
+    from tqdm.auto import tqdm
+
+    try:
+        with tqdm(total=warmup + n_steps, desc="benchmark", leave=False) as bar:
+            relay = _AutotuneRelay(bar)
+            for _ in range(warmup):
+                _run_step_with_heartbeat(step_fn, relay)
+                bar.update(1)
+            start = time.perf_counter()
+            for _ in range(n_steps):
+                _run_step_with_heartbeat(step_fn, relay)
+                bar.update(1)
+            elapsed = time.perf_counter() - start
     except StopIteration:
         return None
     return elapsed / n_steps
 
 
 def make_progress_callback(desc: str = "training"):
-    """Returns a (step, total, loss) -> None callback for pipeline.train(), backed by."""
+    """Returns a (step, total, loss) callback for pipeline.train(); call .phase(name) for status."""
     from tqdm.auto import tqdm
 
     state = {"bar": None}
@@ -441,6 +552,10 @@ def make_progress_callback(desc: str = "training"):
         if step >= total:
             state["bar"].close()
 
+    def _phase(name: str) -> None:
+        tqdm.write(f"[{desc}] {name}")
+
+    _callback.phase = _phase
     return _callback
 
 
@@ -459,8 +574,12 @@ class TrainingSummary:
     total_steps: int
     avg_step_time_sec: float | None = None
     estimated_total_time_sec: float | None = None
-    measured_memory: bool = False  # True when the memory fields below come from a real
-    # forward+backward+step (detailed_memory_report), not from the param-count formulas.
+    measured_memory: bool = False
+    n_gpus: int = 1  # DDP world size assumed for steps_per_epoch/estimated_total_time_sec
+    single_gpu_benchmark: bool = False  # avg_step_time_sec was measured on 1 GPU, not real DDP
+    attn_impl: str | None = None
+    delta_rule_backend: str | None = None
+    causal_conv1d_backend: str | None = None
 
     def __str__(self) -> str:
         mem_label = "Measured" if self.measured_memory else "Est."
@@ -473,16 +592,30 @@ class TrainingSummary:
             f"{mem_label} model memory:".ljust(21) + f"{self.param_memory_mb:.1f} MB",
             f"{mem_label} optimizer mem:".ljust(21) + f"{self.optimizer_memory_mb:.1f} MB",
             f"{mem_label} total memory:".ljust(21) + f"{self.total_memory_mb:.1f} MB",
-            f"Steps/epoch:         {self.steps_per_epoch}",
+            f"Steps/epoch:         {self.steps_per_epoch}" + (f" (x{self.n_gpus} GPU, DDP)" if self.n_gpus > 1 else ""),
             f"Epochs:              {self.epochs}",
             f"Total steps:         {self.total_steps}",
         ]
         if self.avg_step_time_sec is not None:
             lines.append(f"Avg step time:       {self.avg_step_time_sec * 1000:.1f} ms")
             lines.append(f"Est. total time:     {format_duration(self.estimated_total_time_sec)}")
+            if self.single_gpu_benchmark:
+                lines.append("  (benchmarked on 1 GPU; total time assumes real DDP scaling)")
         else:
             lines.append("Avg step time:       n/a")
+        if self.attn_impl is not None:
+            lines.append("")
+            lines.append("Compute backends")
+            lines.append("-----------------")
+            lines.append(f"Attention:           {self.attn_impl}")
+            lines.append(_backend_line("DeltaNet:", self.delta_rule_backend, slow_value="torch_fallback"))
+            lines.append(_backend_line("Causal conv1d:", self.causal_conv1d_backend, slow_value="torch_fallback"))
         return "\n".join(lines)
+
+
+def _backend_line(label: str, backend: str | None, slow_value: str) -> str:
+    warning = "  <- pip install -e '.[fast-attn]' for the fused kernel" if backend == slow_value else ""
+    return f"{label.ljust(21)}{backend}{warning}"
 
 
 def training_summary(

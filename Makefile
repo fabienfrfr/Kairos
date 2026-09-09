@@ -29,7 +29,12 @@ notebook: ## Working test
 	uv run marimo edit notebook/kairos_pretraining.py
 
 jupyter: ## If you want to use Kaggle T4x2
+	uv run marimo check --fix notebook/kairos_pretraining.py
 	uv run marimo export ipynb notebook/kairos_pretraining.py -o notebook/notebook.ipynb
+
+ddp-smoke: ## 2-process DDP smoke test (gloo/CPU); validates the multi-GPU train path
+	KAIROS_DDP_SMOKE=1 uv run pytest -q tests/test_ddp_smoke.py
+	
 
 mapper: ## Export full project structure to JSON
 	uv run python3 mapper.py --to-json
@@ -45,6 +50,7 @@ dev: ## Install dev + scripts dependency groups (these are uv groups, not extras
 
 format:
 	uv run ruff format .
+
 
 ##@ Maintenance
 clean: ## Remove python caches and temporary files

@@ -9,9 +9,10 @@ import numpy as np
 import pytest
 import torch
 
+import kairos.pipeline as pipeline_module
 from kairos.dataset import pack_multimodal_data
 from kairos.modeling import KairosConfig, KairosDiffusionFM
-from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig, _resolve_amp_dtype
 from kairos.tokenizer import Modality
 from kairos.utils import TrainingSummary, count_parameters
 
@@ -97,6 +98,276 @@ def test_build_wires_self_conditioning_prob_to_trainer(tmp_path, model_config, t
     assert pipe.hf_trainer.self_conditioning_prob == 0.75
 
 
+# --------------------------------------------------------------------------- AMP dtype
+def test_resolve_amp_dtype_defaults_to_bf16_when_supported():
+    assert _resolve_amp_dtype(None, bf16_supported=True) == torch.bfloat16
+
+
+def test_resolve_amp_dtype_falls_back_to_fp16_when_bf16_unsupported():
+    assert _resolve_amp_dtype(None, bf16_supported=False) == torch.float16
+
+
+def test_resolve_amp_dtype_explicit_bf16_override_wins_even_if_unsupported():
+    assert _resolve_amp_dtype("bf16", bf16_supported=False) == torch.bfloat16
+
+
+def test_resolve_amp_dtype_explicit_fp16_override_wins_even_if_bf16_supported():
+    assert _resolve_amp_dtype("fp16", bf16_supported=True) == torch.float16
+
+
+def test_train_config_rejects_invalid_amp_dtype(tmp_path):
+    with pytest.raises(ValueError, match="amp_dtype"):
+        TrainConfig(epochs=1, run_dir=str(tmp_path / "run"), amp_dtype="fp8")
+
+
+def test_pipeline_uses_bf16_when_cuda_reports_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    assert pipe.amp_dtype == torch.bfloat16
+    assert pipe.scaler.is_enabled() is False  # bf16 needs no loss scaling
+
+
+def test_pipeline_falls_back_to_fp16_when_cuda_lacks_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    assert pipe.amp_dtype == torch.float16
+    assert pipe.scaler.is_enabled() is True  # fp16 needs GradScaler
+
+
+def test_pipeline_falls_back_to_fp16_on_t4_despite_is_bf16_supported_true(
+    tmp_path, model_config, text_examples, monkeypatch
+):
+    """Regression test: T4 (SM75) reports is_bf16_supported()=True but has no bf16 tensor cores."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    assert pipe.amp_dtype == torch.float16
+
+
+def test_pipeline_amp_dtype_override_forces_bf16_on_old_hardware(tmp_path, model_config, text_examples, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples, amp_dtype="bf16")
+
+    assert pipe.amp_dtype == torch.bfloat16
+    assert pipe.scaler.is_enabled() is False
+
+
+# -------------------------------------------------------- torch.compile / TF32
+def _unbuilt_pipe(tmp_path, model_config, text_examples, **train_kwargs):
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"), device="cpu", **train_kwargs)
+    return KairosMultimodalPipeline(model_config, data_config, train_config)
+
+
+def test_default_build_without_cuda_does_not_compile(built_pipeline):
+    # compile_model=True by default, but sandbox/CI is CPU-only so nothing actually compiles
+    assert built_pipeline.compiled is False
+    assert built_pipeline.model_forward is built_pipeline.model
+
+
+def test_build_compiles_model_forward_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert pipe.compiled is True
+    assert pipe.model_forward is not pipe.model
+
+
+def test_compile_model_false_skips_compile_even_with_cuda(tmp_path, model_config, text_examples, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples, compile_model=False)
+
+    pipe.build()
+
+    assert pipe.compiled is False
+    assert pipe.model_forward is pipe.model
+
+
+@pytest.fixture
+def _restore_dynamo_scalar_capture():
+    original = torch._dynamo.config.capture_scalar_outputs
+    yield
+    torch._dynamo.config.capture_scalar_outputs = original
+
+
+def test_build_enables_capture_scalar_outputs_when_compiling(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_scalar_capture
+):
+    torch._dynamo.config.capture_scalar_outputs = False
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    # avoids the graph break on gather_active's data-dependent max_len().item()
+    assert torch._dynamo.config.capture_scalar_outputs is True
+
+
+@pytest.fixture
+def _restore_dynamo_recompile_limit():
+    original = torch._dynamo.config.recompile_limit
+    yield
+    torch._dynamo.config.recompile_limit = original
+
+
+def test_build_raises_recompile_limit_when_compiling(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_recompile_limit
+):
+    torch._dynamo.config.recompile_limit = 8
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    # headroom for the 12 length buckets (+ grad_mode) to stabilize without eager fallback
+    assert torch._dynamo.config.recompile_limit > 8
+
+
+@pytest.fixture
+def _restore_inductor_compile_threads():
+    original = torch._inductor.config.compile_threads
+    yield
+    torch._inductor.config.compile_threads = original
+
+
+def test_build_forces_single_compile_thread_when_compiling(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_inductor_compile_threads
+):
+    torch._inductor.config.compile_threads = 8
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    # forces autotuning to run in-process (no subprocess pool) so it can be observed/relayed
+    assert torch._inductor.config.compile_threads == 1
+
+
+def test_build_leaves_compile_threads_untouched_without_cuda(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_inductor_compile_threads
+):
+    torch._inductor.config.compile_threads = 8
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert torch._inductor.config.compile_threads == 8
+
+
+def test_build_and_train_actually_compile_on_cpu_when_forced(
+    tmp_path, model_config, text_examples, multimodal_examples, monkeypatch
+):
+    """Forces the real compile path (no CUDA mock) so recompile-avoidance logic runs for real."""
+    monkeypatch.setattr(pipeline_module, "_compile_backend_available", lambda: True)
+    data_config = DataConfig(
+        text_examples=text_examples, multimodal_examples=multimodal_examples, max_len=64, batch_size=2
+    )
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    assert pipe.compiled is True
+    assert pipe.eval_forward is not pipe.model_forward
+
+    batch = next(iter(pipe.loader))
+    loss = pipe.hf_trainer.compute_loss(pipe.model_forward, batch)
+
+    assert torch.isfinite(loss)
+
+
+def test_build_gives_eval_a_separate_compiled_instance_from_train(
+    tmp_path, model_config, text_examples, monkeypatch
+):
+    """Separate instances keep grad_mode from becoming a recompile-triggering guard axis."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert pipe.eval_forward is not pipe.model_forward
+
+
+def test_build_eval_forward_falls_back_to_model_forward_without_cuda(built_pipeline):
+    # no compile on CPU -> nothing to isolate, both point at the same (uncompiled) forward
+    assert built_pipeline.eval_forward is built_pipeline.model_forward
+
+
+def test_build_leaves_capture_scalar_outputs_untouched_without_cuda(
+    tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_scalar_capture
+):
+    torch._dynamo.config.capture_scalar_outputs = False
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert pipe.compiled is False
+    assert torch._dynamo.config.capture_scalar_outputs is False
+
+
+def test_build_enables_tf32_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
+    orig_matmul = torch.backends.cuda.matmul.allow_tf32
+    orig_cudnn = torch.backends.cudnn.allow_tf32
+    orig_precision = torch.get_float32_matmul_precision()
+    try:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+        pipe.build()
+
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+        assert torch.backends.cudnn.allow_tf32 is True
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = orig_matmul
+        torch.backends.cudnn.allow_tf32 = orig_cudnn
+        torch.set_float32_matmul_precision(orig_precision)
+
+
+def test_build_leaves_tf32_untouched_without_cuda(tmp_path, model_config, text_examples, monkeypatch):
+    orig_matmul = torch.backends.cuda.matmul.allow_tf32
+    orig_cudnn = torch.backends.cudnn.allow_tf32
+    try:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+        pipe.build()
+
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = orig_matmul
+        torch.backends.cudnn.allow_tf32 = orig_cudnn
+
+
+def test_optimizer_uses_fused_adamw_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    pipe.build()
+
+    assert pipe.optimizer.defaults["fused"] is True
+
+
+def test_optimizer_is_not_fused_without_cuda(built_pipeline):
+    assert built_pipeline.optimizer.defaults["fused"] is False
+
+
 # --------------------------------------------------------------------- num_workers
 def test_num_workers_explicit_override_is_respected(model_config, text_examples):
     data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8, num_workers=2)
@@ -120,13 +391,13 @@ def test_num_workers_default_caps_at_available_cpus(model_config, text_examples,
     assert pipe._num_workers == 0  # cpu_count - 1 == 0: main process only, no forking
 
 
-def test_num_workers_default_never_exceeds_four_on_a_big_machine(model_config, text_examples, monkeypatch):
+def test_num_workers_default_never_exceeds_eight_on_a_big_machine(model_config, text_examples, monkeypatch):
     import kairos.pipeline as pipeline_mod
 
     monkeypatch.setattr(pipeline_mod.os, "cpu_count", lambda: 64)
     data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=8)
     pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(run_dir="unused"))
-    assert pipe._num_workers == 4
+    assert pipe._num_workers == 8
 
 
 def test_num_workers_default_handles_cpu_count_none(model_config, text_examples, monkeypatch):
@@ -649,6 +920,17 @@ def test_summary_with_benchmark_estimates_time(built_pipeline):
     assert summary.estimated_total_time_sec == pytest.approx(summary.avg_step_time_sec * summary.total_steps)
 
 
+def test_summary_reports_current_compute_backends(built_pipeline):
+    import kairos.pipeline as pipeline_mod
+
+    summary = built_pipeline.summary(benchmark=False)
+
+    assert summary.attn_impl == pipeline_mod._ATTN_IMPL
+    assert summary.delta_rule_backend == pipeline_mod._DELTA_RULE_BACKEND
+    assert summary.causal_conv1d_backend == pipeline_mod._CAUSAL_CONV1D_BACKEND
+    assert "Compute backends" in str(summary)
+
+
 def test_summary_active_params_equals_total_when_dense(built_pipeline):
     summary = built_pipeline.summary(benchmark=False)
     assert built_pipeline.model_config.use_moe is False
@@ -800,6 +1082,72 @@ def test_summary_benchmark_uses_measured_memory_matching_memory_report(built_pip
     assert summary.optimizer_memory_mb > 0.5 * summary.param_memory_mb
 
 
+def test_summary_uses_generous_warmup_when_compiled(built_pipeline, monkeypatch):
+    """A single warmup step only compiles one bucket size; varied batches need more."""
+    monkeypatch.setattr(built_pipeline, "compiled", True)
+    seen_kwargs = {}
+    real_benchmark_step_time = pipeline_module.benchmark_step_time
+
+    def _spy_benchmark_step_time(step_fn, **kwargs):
+        seen_kwargs.update(kwargs)
+        return real_benchmark_step_time(step_fn, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "benchmark_step_time", _spy_benchmark_step_time)
+
+    built_pipeline.summary(benchmark=True, n_bench_steps=3)
+
+    assert seen_kwargs["warmup"] >= 10
+
+
+def test_summary_skips_warmup_when_not_compiled(built_pipeline, monkeypatch):
+    seen_kwargs = {}
+    real_benchmark_step_time = pipeline_module.benchmark_step_time
+
+    def _spy_benchmark_step_time(step_fn, **kwargs):
+        seen_kwargs.update(kwargs)
+        return real_benchmark_step_time(step_fn, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "benchmark_step_time", _spy_benchmark_step_time)
+
+    built_pipeline.summary(benchmark=True, n_bench_steps=3)
+
+    assert seen_kwargs["warmup"] == 0
+
+
+def test_summary_memory_measurement_uses_uncompiled_model_timing_uses_model_forward(built_pipeline, monkeypatch):
+    """Memory pass uses compute_loss(self.model, ...); timed steps use self.model_forward."""
+
+    class _Proxy(torch.nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def forward(self, *args, **kwargs):
+            return self.wrapped(*args, **kwargs)
+
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.wrapped, name)
+
+    proxy = _Proxy(built_pipeline.model)
+    monkeypatch.setattr(built_pipeline, "model_forward", proxy)
+    seen_models = []
+    real_compute_loss = built_pipeline.hf_trainer.compute_loss
+
+    def _spy_compute_loss(model, *args, **kwargs):
+        seen_models.append(model)
+        return real_compute_loss(model, *args, **kwargs)
+
+    monkeypatch.setattr(built_pipeline.hf_trainer, "compute_loss", _spy_compute_loss)
+
+    built_pipeline.summary(benchmark=True, n_bench_steps=1)
+
+    assert seen_models[0] is built_pipeline.model
+    assert seen_models[1] is proxy
+
+
 def test_summary_str_shows_measured_label_when_benchmarked(built_pipeline):
     summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
     text = str(summary)
@@ -816,13 +1164,234 @@ def test_summary_str_shows_est_label_without_benchmark(built_pipeline):
 
 
 def test_summary_n_bench_steps_one_still_produces_avg_step_time(built_pipeline):
-    """Regression test: the fused summary()/memory_report() used to consume the single
-    n_bench_steps=1 step for the memory measurement without timing it, leaving
-    avg_step_time_sec=None. The one measured step must count towards the timing budget."""
+    """Regression test: the single benchmarked step must still count towards the timing budget."""
     summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
     assert summary.avg_step_time_sec is not None
     assert summary.avg_step_time_sec > 0
     assert summary.estimated_total_time_sec is not None
+
+
+def test_summary_scales_steps_by_visible_gpus_when_train_would_auto_launch_ddp(built_pipeline, monkeypatch):
+    """summary() must mirror train()'s DDP step split, not the full single-GPU dataset."""
+    single_gpu_summary = built_pipeline.summary(benchmark=False)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    multi_gpu_summary = built_pipeline.summary(benchmark=False)
+
+    assert multi_gpu_summary.n_gpus == 4
+    assert multi_gpu_summary.steps_per_epoch == math.ceil(single_gpu_summary.steps_per_epoch / 4)
+    assert multi_gpu_summary.total_steps == multi_gpu_summary.epochs * multi_gpu_summary.steps_per_epoch
+
+
+def test_summary_does_not_scale_steps_when_already_distributed(built_pipeline, monkeypatch):
+    """A DDP rank (self.distributed=True) must not have summary() divide its steps again."""
+    monkeypatch.setattr(built_pipeline, "distributed", True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    summary = built_pipeline.summary(benchmark=False)
+
+    assert summary.n_gpus == 1
+    assert summary.steps_per_epoch == len(built_pipeline.loader)
+
+
+def test_summary_ddp_benchmark_true_routes_through_ddp_when_multi_gpu_visible(built_pipeline, monkeypatch):
+    """ddp_benchmark=True is the opt-in for a real multi-GPU torchrun benchmark, not the default."""
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    fake_summary = TrainingSummary(
+        total_params=1,
+        trainable_params=1,
+        active_params=1,
+        param_memory_mb=0.0,
+        optimizer_memory_mb=0.0,
+        total_memory_mb=0.0,
+        steps_per_epoch=1,
+        epochs=1,
+        total_steps=1,
+    )
+    calls = []
+
+    def _fake_run_via_ddp(action, **kwargs):
+        calls.append((action, kwargs))
+        return {"summary": fake_summary}
+
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", _fake_run_via_ddp)
+
+    result = built_pipeline.summary(benchmark=True, n_bench_steps=3, ddp_benchmark=True)
+
+    assert result is fake_summary
+    expected_kwargs = {"benchmark": True, "n_bench_steps": 3}
+    assert calls == [("summary", {"resume": False, "action_kwargs": expected_kwargs})]
+
+
+def test_train_auto_launch_passes_phase_callback_to_run_via_ddp(built_pipeline, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    calls = []
+
+    def _fake_run_via_ddp(action, **kwargs):
+        calls.append((action, kwargs))
+        return {"log_rows": ["fake_row"]}
+
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", _fake_run_via_ddp)
+    _phase_cb = lambda name: None
+
+    logs = built_pipeline.train(phase_callback=_phase_cb, resume=False)
+
+    assert calls[0][0] == "train"
+    assert calls[0][1]["phase_callback"] is _phase_cb
+    assert logs == ["fake_row"]
+
+
+def test_replay_ddp_log_forwards_step_and_phase_lines(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("phase build\nstep 1/5  loss 0.5000\nsome noise\nphase run\nstep 2/5  loss 0.4000\n")
+    steps, phases = [], []
+
+    index = KairosMultimodalPipeline._replay_ddp_log(
+        log_path, 0, lambda s, t, ell: steps.append((s, t, ell)), phases.append
+    )
+
+    assert steps == [(1, 5, 0.5), (2, 5, 0.4)]
+    assert phases == ["build", "run"]
+    assert index == 5
+
+
+def test_replay_ddp_log_survives_a_broken_progress_callback(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("step 1/2  loss 0.5000\nstep 2/2  loss 0.4000\n")
+
+    def _broken_callback(step, total, loss_val):
+        raise RuntimeError("UI widget crashed")
+
+    index = KairosMultimodalPipeline._replay_ddp_log(log_path, 0, _broken_callback)
+
+    assert index == 2  # both lines still consumed despite the callback raising every time
+
+
+def test_replay_ddp_log_survives_a_broken_phase_callback(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("phase build\nphase run\n")
+
+    def _broken_phase(name):
+        raise RuntimeError("UI widget crashed")
+
+    index = KairosMultimodalPipeline._replay_ddp_log(log_path, 0, None, _broken_phase)
+
+    assert index == 2
+
+
+def test_replay_ddp_log_relays_real_triton_autotuning_lines_as_phases(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text(
+        "phase run\n"
+        "Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1\n"
+        "finished after 6.31s,\n"
+    )
+    phases = []
+
+    KairosMultimodalPipeline._replay_ddp_log(log_path, 0, None, phases.append)
+
+    assert phases == ["run", "autotuning l2norm_fwd_kernel", "finished after 6.31s,"]
+
+
+def test_replay_ddp_log_ignores_phase_lines_without_phase_callback(tmp_path):
+    log_path = tmp_path / "train_ddp.log"
+    log_path.write_text("phase build\nstep 1/2  loss 0.1000\n")
+    steps = []
+
+    index = KairosMultimodalPipeline._replay_ddp_log(log_path, 0, lambda s, t, ell: steps.append((s, t, ell)))
+
+    assert steps == [(1, 2, 0.1)]
+    assert index == 2
+
+
+def test_heartbeat_due_after_interval_elapsed():
+    assert KairosMultimodalPipeline._heartbeat_due(now=20.0, last_activity=0.0, interval=15) is True
+
+
+def test_heartbeat_not_due_before_interval_elapsed():
+    assert KairosMultimodalPipeline._heartbeat_due(now=10.0, last_activity=0.0, interval=15) is False
+
+
+def test_run_via_ddp_emits_heartbeat_when_log_stays_quiet(tmp_path, built_pipeline, monkeypatch):
+    monkeypatch.setattr(built_pipeline.train_config, "run_dir", str(tmp_path))
+    poll_results = iter([None, None, 0])
+
+    class _FakeProc:
+        returncode = 0
+
+        def poll(self):
+            return next(poll_results, 0)
+
+    monkeypatch.setattr(pipeline_module, "launch_ddp", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr(built_pipeline, "_load_ddp_results", lambda run_dir: {"log_rows": []})
+    monkeypatch.setattr(pipeline_module.time, "sleep", lambda s: None)
+    clock = iter([0.0, 1.0, 30.0])
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: next(clock, 30.0))
+    phases = []
+
+    built_pipeline._run_via_ddp("train", phase_callback=phases.append, resume=False)
+
+    assert any("still working" in p for p in phases)
+
+
+def test_summary_default_does_not_launch_ddp_and_warns_with_multi_gpu(built_pipeline, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not be called")))
+
+    with pytest.warns(UserWarning, match="cuda:0"):
+        summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+
+    assert summary.avg_step_time_sec is not None
+    assert summary.single_gpu_benchmark is True
+
+
+def test_summary_does_not_flag_single_gpu_benchmark_on_one_visible_gpu(built_pipeline):
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1)
+
+    assert summary.single_gpu_benchmark is False
+
+
+def test_summary_benchmark_false_does_not_launch_ddp_even_with_multi_gpu(built_pipeline, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not be called")))
+
+    summary = built_pipeline.summary(benchmark=False)
+
+    assert summary.n_gpus == 4
+
+
+def test_summary_benchmark_does_not_relaunch_ddp_when_already_distributed(built_pipeline, monkeypatch):
+    """A rank inside an already-launched DDP job must never spawn another torchrun subprocess."""
+    monkeypatch.setattr(built_pipeline, "distributed", True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(built_pipeline, "_run_via_ddp", MagicMock(side_effect=AssertionError("must not relaunch")))
+
+    summary = built_pipeline.summary(benchmark=True, n_bench_steps=1, ddp_benchmark=True)
+
+    assert summary.avg_step_time_sec is not None
+
+
+def test_build_never_constructs_data_parallel(built_pipeline):
+    # regression: DataParallel is fully removed -- model_forward must never be that type
+    assert not isinstance(built_pipeline.model_forward, torch.nn.DataParallel)
+
+
+def test_build_warns_and_uses_single_gpu_when_multiple_visible_without_torchrun(
+    tmp_path, model_config, text_examples, monkeypatch
+):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+
+    with pytest.warns(UserWarning, match="Multiple GPUs visible"):
+        pipe.build()
+
+    assert not isinstance(pipe.model_forward, torch.nn.DataParallel)
+
+
+def test_build_does_not_warn_with_a_single_gpu(tmp_path, model_config, text_examples, recwarn):
+    pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
+    pipe.build()
+    assert not any("Multiple GPUs visible" in str(w.message) for w in recwarn)
 
 
 def test_summary_benchmark_handles_exhausted_loader_gracefully(built_pipeline, monkeypatch):
@@ -836,6 +1405,97 @@ def test_summary_benchmark_handles_exhausted_loader_gracefully(built_pipeline, m
     assert summary.avg_step_time_sec is None
     assert summary.estimated_total_time_sec is None
     assert summary.measured_memory is False
+
+
+# -------------------------------------------------------------- async checkpoints
+def test_save_defaults_to_synchronous_write(built_pipeline, tmp_path):
+    path = tmp_path / "sync.pt"
+    built_pipeline._save(path, loss_val=0.5, epoch=1)
+    assert path.exists()  # wait=True (default): file must exist the instant _save() returns
+
+
+def test_save_async_write_completes_after_flush(built_pipeline, tmp_path):
+    path = tmp_path / "async.pt"
+    built_pipeline._save(path, loss_val=0.5, epoch=1, wait=False)
+
+    built_pipeline._flush_checkpoint_writes()
+
+    assert path.exists()
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    assert ckpt["loss"] == 0.5
+
+
+def test_async_save_does_not_block_caller(built_pipeline, tmp_path, monkeypatch):
+    """Regression test: wait=False must return immediately, not block on a slow write."""
+    import time
+
+    def _slow_save(payload, path):
+        time.sleep(0.3)
+        torch.save(payload, path)
+
+    monkeypatch.setattr(torch, "save", _slow_save)
+    path = tmp_path / "slow.pt"
+
+    start = time.monotonic()
+    built_pipeline._save(path, loss_val=0.5, epoch=1, wait=False)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.2  # returned well before the 0.3s write finished
+    built_pipeline._flush_checkpoint_writes()
+    assert path.exists()
+
+
+def test_flush_checkpoint_writes_reraises_background_failure(built_pipeline, tmp_path, monkeypatch):
+    def _broken_save(payload, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", _broken_save)
+
+    built_pipeline._save(tmp_path / "broken.pt", loss_val=0.5, epoch=1, wait=False)
+
+    with pytest.raises(OSError, match="disk full"):
+        built_pipeline._flush_checkpoint_writes()
+
+
+def test_train_flushes_pending_checkpoint_before_hub_push(tmp_path, model_config, text_examples, monkeypatch):
+    """train() must flush the async last.pt write before the hub push reads it."""
+    monkeypatch.setattr("huggingface_hub.HfApi.create_repo", lambda self, repo_id, **kw: None)
+    uploaded_bytes = {}
+
+    def _fake_upload(self, path_or_fileobj, path_in_repo, repo_id):
+        uploaded_bytes[path_in_repo] = Path(path_or_fileobj).read_bytes()
+
+    monkeypatch.setattr("huggingface_hub.HfApi.upload_file", _fake_upload)
+
+    data_config = DataConfig(text_examples=text_examples, max_len=256, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1,
+        save_every=1,
+        last_ckpt_every=1,
+        run_dir=str(tmp_path / "run"),
+        hub_repo_id="me/kairos-test",
+        hub_push_every_ckpt=True,
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    pipe.train()
+
+    assert any(b for name, b in uploaded_bytes.items() if name.endswith("last.pt"))
+
+
+def test_train_unlinks_last_ckpt_only_after_pending_write_lands(built_pipeline):
+    """Regression test: unlink() must flush pending writes first, not race the final async save."""
+    built_pipeline.train()
+
+    assert not (built_pipeline.ckpt_dir / "last.pt").exists()
+    assert built_pipeline._pending_ckpt_futures == []
+
+
+def test_last_ckpt_saves_are_async_but_still_readable_after_train(built_pipeline):
+    logs = built_pipeline.train()
+    assert len(logs) > 0
+    # every pending background write must be drained by train()'s own finally block
+    assert built_pipeline._pending_ckpt_futures == []
 
 
 # --------------------------------------------------------------------- hub
@@ -944,8 +1604,7 @@ def test_train_starts_fresh_when_local_checkpoint_is_incompatible(tmp_path, text
 
 
 def test_train_calls_compute_loss_with_model_forward_not_bare_model(built_pipeline, monkeypatch):
-    """Regression: train() used to call compute_loss(self.model, ...) directly, skipping
-    self.model_forward (DataParallel-wrapped when n_gpus > 1), unlike every other method."""
+    """Regression: train() must call compute_loss(self.model_forward, ...), not the bare model."""
 
     # distinct proxy identity, so we can prove train() calls model_forward and not self.model
     class _Proxy(torch.nn.Module):
@@ -1276,9 +1935,9 @@ def test_last_ckpt_not_written_every_step(built_pipeline, monkeypatch):
     save_calls = []
     real_save = built_pipeline._save
 
-    def _tracking_save(path, loss_val, epoch=1):
+    def _tracking_save(path, loss_val, epoch=1, wait=True):
         save_calls.append(path.name)
-        return real_save(path, loss_val, epoch)
+        return real_save(path, loss_val, epoch, wait=wait)
 
     monkeypatch.setattr(built_pipeline, "_save", _tracking_save)
     built_pipeline.train_config.last_ckpt_every = 1000  # higher than total steps in

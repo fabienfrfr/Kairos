@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Code Mapper: bidirectional sync between code and JSON, with strict .gitignore support."""
 
 import argparse

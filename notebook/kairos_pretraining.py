@@ -1,19 +1,22 @@
 import marimo
 
-__generated_with = "0.23.9"
+__generated_with = "0.24.0"
 app = marimo.App(width="medium")
 
 
 @app.cell
 def _():
     import os
-
     from huggingface_hub import login
 
-    # set via Kaggle > Secrets > Add secret (key: HF_TOKEN), or paste the token here
-    HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
+    try:
+        from kaggle_secrets import UserSecretsClient
+        HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
+    except ImportError:
+        HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
+
     login(token=HF_TOKEN, add_to_git_credential=False)
-    return
+    return (os,)
 
 
 @app.cell
@@ -34,17 +37,18 @@ def _():
 
 @app.cell
 def _():
-    # --force-reinstall required since pip skips reinstalling an unchanged version.
-    # !pip install -q --force-reinstall git+https://github.com/fabienfrfr/Kairos@dev
+    # !pip install -q git+https://github.com/fabienfrfr/Kairos@dev
+    # OR with fast-attn (flash-linear-attention + causal-conv1d: fused DeltaNet/conv1d kernels)
+    # !pip install -q --no-build-isolation causal-conv1d flash-linear-attention
+    # !pip install -q "kairos-fm @ git+https://github.com/fabienfrfr/Kairos@dev"
     return
 
 
 @app.cell
-def _():
-    import os
+def _(os):
     from pathlib import Path
 
-    # auto: fused flex_attention on SM>=7.0 GPUs (T4), eager O(L*W) below that.
+    # auto: fused flex_attention on SM>=7.0 GPUs (T4); multi-GPU (T4x2) needs torchrun for DDP.
     os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
 
     import torch
@@ -66,7 +70,11 @@ def _():
 
     tokenizer = KairosTokenizer()
     print(f"vocab size: {len(tokenizer)}")
+
+    # ---- dev settings ----
+    DEV_MODE = True
     return (
+        DEV_MODE,
         DataConfig,
         KairosConfig,
         KairosMultimodalPipeline,
@@ -85,16 +93,20 @@ def _():
 
 
 @app.cell
-def _():
+def _(DEV_MODE):
     # ---- data settings ----
     MULTIMODAL_SOURCE = "hf"  # "hf" or "local" (.pt built
     MULTIMODAL_LOCAL_PATH = "data/keep-it-simple-multimodal.pt"
     BUILD_LOCAL_IF_MISSING = False
 
-    TEXT_SOURCE = "hf"  # "hf" (ffurfaro/keep-it-simple) or "inline" (tiny
-    TEXT_PCT = 10  # % of keep-it-simple to load; was 2%, too little data for enough optimizer steps
+    TEXT_SOURCE = "hf"  # "hf" (ffurfaro/keep-it-simple) or "inline"
 
-    EVAL_PCT = 10  # % held out for eval
+    if DEV_MODE :
+        TEXT_PCT = 1  # % of keep-it-simple to load
+        EVAL_PCT = 1  # % held out for eval
+    else :
+        TEXT_PCT = 100   # % of keep-it-simple to load
+        EVAL_PCT = 0.001 # % held out for eval
     return (
         BUILD_LOCAL_IF_MISSING,
         EVAL_PCT,
@@ -212,7 +224,7 @@ def _():
     CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
     CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     CFG_SHARE_BACKBONES = True  # share one backbone across all scales (saves ~75% params)
-    CFG_CODEC_MODE = "conv"  # "conv" (fast, cuDNN) or "patch" (nn.Linear per scale)
+    CFG_CODEC_MODE = "patch"  # "conv" (fast, cuDNN) or "patch" (nn.Linear per scale)
     return (
         CFG_ATTNRES_BLOCK,
         CFG_CODEC_MODE,
@@ -553,18 +565,25 @@ def _(RUN_BENCHMARK, pipe, report):
 @app.cell
 def _():
     OVERFIT_RUN = True  # sanity-check the model can memorize before the real run
-    OVERFIT_EXAMPLES = 64  # tiny subset, repeated each epoch
+    OVERFIT_EXAMPLES = 16  # tiny subset, repeated each epoch
     OVERFIT_STEPS = 200  # steps on that subset; loss should crash toward 0
     return OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS
 
 
 @app.cell
-def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, pipe):
+def _(
+    OVERFIT_EXAMPLES,
+    OVERFIT_RUN,
+    OVERFIT_STEPS,
+    make_progress_callback,
+    mo,
+    pipe,
+):
     # walks whichever of the MAE / transition / diffusion stages are configured, proportionally
     if OVERFIT_RUN:
         if mo.running_in_notebook():
             with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
-                overfit_logs = pipe.overfit_test(
+                pipe.overfit_test(
                     n_examples=OVERFIT_EXAMPLES,
                     steps=OVERFIT_STEPS,
                     progress_callback=lambda step, total, loss_val: _bar.update(
@@ -572,15 +591,14 @@ def _(OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS, make_progress_callback, mo, 
                     ),
                 )
         else:
-            overfit_logs = pipe.overfit_test(
+            pipe.overfit_test(
                 n_examples=OVERFIT_EXAMPLES,
                 steps=OVERFIT_STEPS,
                 progress_callback=make_progress_callback(desc="overfit_test"),
             )
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
-        overfit_logs = []
-    return (overfit_logs,)
+    return
 
 
 @app.cell
@@ -597,6 +615,8 @@ def _(FORCE_RESTART, make_progress_callback, mo, pipe):
     elif FORCE_RESTART:
         print("FORCE_RESTART is True - ignoring any existing checkpoint")
 
+    # on multi-GPU, pipe.train itself spawns a torchrun job (flex + memory gate per rank)
+    # and replays its steps into the progress_callback; results come back into this pipe.
     _total_steps = pipe.train_config.epochs * len(pipe.loader)
 
     if mo.running_in_notebook():
@@ -607,9 +627,13 @@ def _(FORCE_RESTART, make_progress_callback, mo, pipe):
                 _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
                 _state["last_step"] = step
 
-            logs = pipe.train(progress_callback=_on_step, resume=not FORCE_RESTART)
+            def _on_phase(name):
+                _bar.update(increment=0, subtitle=name)
+
+            logs = pipe.train(progress_callback=_on_step, phase_callback=_on_phase, resume=not FORCE_RESTART)
     else:
-        logs = pipe.train(progress_callback=make_progress_callback(), resume=not FORCE_RESTART)
+        _cb = make_progress_callback()
+        logs = pipe.train(progress_callback=_cb, phase_callback=_cb.phase, resume=not FORCE_RESTART)
 
     print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
     print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")

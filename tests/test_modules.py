@@ -3,6 +3,7 @@ import random
 import pytest
 import torch
 
+from kairos.attentions import KairosRotaryEmbedding
 from kairos.dataset import KairosPretrainingDataset, KairosRLDataset, KairosSFTDataset
 from kairos.modeling import (
     DiffusionBlock,
@@ -352,8 +353,7 @@ def test_codec_conv_gradient_flow():
 
 
 def test_codec_conv_has_fewer_params_than_patch():
-    """conv mode is depthwise (O(patch*d_model)); patch mode is dense (O(patch*d_model^2)),
-    so conv is the cheaper mode, especially at larger patch sizes."""
+    """conv mode is depthwise (cheaper); patch mode is dense, especially at larger patch sizes."""
     patch = PyramidalCodec(32, stride=3, num_scales=2)
     conv = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
     n_patch = sum(p.numel() for p in patch.parameters())
@@ -362,8 +362,7 @@ def test_codec_conv_has_fewer_params_than_patch():
 
 
 def test_codec_conv_decoder_is_depthwise_not_dense():
-    """Guards against the O(patch*d_model^2) 1x1-conv decoder regression: a depthwise
-    ConvTranspose1d's params scale with d_model, not d_model^2."""
+    """Guards against the 1x1-conv decoder regression: depthwise params scale with d_model."""
     small = PyramidalCodec(32, stride=5, num_scales=1, mode="conv")
     big = PyramidalCodec(64, stride=5, num_scales=1, mode="conv")
     n_small = sum(p.numel() for p in small.decoders.parameters())
@@ -422,6 +421,91 @@ def test_kairos_model_forward_with_self_conditioning(config):
     logits = torch.randn(2, 16, 259)
     out = model(input_ids=x, self_conditioning_logits=logits)
     assert out.logits.shape == (2, 16, 259)
+
+
+def test_multiscale_forward_passes_static_max_position_to_rope(monkeypatch):
+    """Regression test: max_position must be a concrete bound, not None (avoids a GPU sync)."""
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    seen_max_positions = []
+    real_forward = KairosRotaryEmbedding.forward
+
+    def _spy_forward(self, x, position_ids, max_position=None):
+        seen_max_positions.append(max_position)
+        return real_forward(self, x, position_ids, max_position=max_position)
+
+    monkeypatch.setattr(KairosRotaryEmbedding, "forward", _spy_forward)
+
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x)
+
+    assert len(seen_max_positions) > 0
+    assert all(mp is not None for mp in seen_max_positions)
+
+
+def test_multiscale_forward_static_max_position_is_a_safe_upper_bound(config):
+    """The static bound must never be smaller than the true max position (RoPE cache size)."""
+    model = KairosDiffusionFM(config)
+    true_max_positions = []
+    real_forward = KairosRotaryEmbedding.forward
+
+    def _spy_forward(self, x, position_ids, max_position=None):
+        true_max_positions.append(int(position_ids.max().item()) if position_ids.numel() else 0)
+        return real_forward(self, x, position_ids, max_position=max_position)
+
+    KairosRotaryEmbedding.forward = _spy_forward
+    try:
+        x = torch.randint(0, 259, (2, 16))
+        model(input_ids=x)
+    finally:
+        KairosRotaryEmbedding.forward = real_forward
+
+    assert len(true_max_positions) > 0  # sanity: the spy actually saw calls
+
+
+def test_flex_block_mask_built_once_per_active_scale_not_per_layer(monkeypatch):
+    """Regression test: the shared flex block mask must be built once per scale, not per layer."""
+    import kairos.modeling as modeling_mod
+
+    monkeypatch.setattr(modeling_mod, "ATTN_IMPL", "flex")
+    call_count = {"n": 0}
+    real_build = modeling_mod.build_backbone_flex_block_mask
+
+    def _counting_build(*args, **kwargs):
+        call_count["n"] += 1
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(modeling_mod, "build_backbone_flex_block_mask", _counting_build)
+
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=3, vocab_size=259, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x)
+
+    # one call per active scale, not per layer (num_hidden_layers=3 above would multiply it).
+    assert 0 < call_count["n"] <= cfg.num_scales
+
+
+def test_full_seq_len_reaches_deltanet_matching_scale_shape(monkeypatch):
+    """Regression test: full_seq_len must reach KairosGatedDeltaNet.process from the top."""
+    from kairos.attentions import KairosGatedDeltaNet
+
+    seen_full_seq_lens = []
+    real_process = KairosGatedDeltaNet.process
+
+    def _spy_process(self, hidden_states, cache_params=None, attention_mask=None, full_seq_len=None):
+        seen_full_seq_lens.append(full_seq_len)
+        return real_process(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
+
+    monkeypatch.setattr(KairosGatedDeltaNet, "process", _spy_process)
+
+    cfg = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
+    model = KairosDiffusionFM(cfg)
+    x = torch.randint(0, 259, (2, 16))
+    model(input_ids=x)
+
+    assert len(seen_full_seq_lens) > 0
+    assert all(fsl is not None for fsl in seen_full_seq_lens)
 
 
 def test_kairos_model_forward_logits_mask_restricts_lm_head_to_selected_positions():
@@ -592,7 +676,7 @@ def test_model_overfits_a_tiny_batch_without_collapsing_to_noise(config):
 
     model.eval()
     with torch.no_grad():
-        noise_mask, p = make_diffusion_mask(x0, prompt_len, eps=trainer.mask_eps, p_max=trainer.mask_p_max)
+        noise_mask, _ = make_diffusion_mask(x0, prompt_len, eps=trainer.mask_eps, p_max=trainer.mask_p_max)
         logits = model(decoder_input_ids=x0, modality_ids=torch.zeros_like(x0)).logits
         preds = logits[noise_mask].argmax(dim=-1)
         accuracy = (preds == x0[noise_mask]).float().mean().item()

@@ -257,6 +257,21 @@ def test_compute_masked_diffusion_losses_reweight_false_is_plain_ce(dense_model)
     assert plain.max() < 50  # sane CE range for a small vocab, no 1/p blowup
 
 
+def test_compute_masked_diffusion_losses_with_data_parallel_wrapper(dense_model):
+    """Regression for wrapped (DataParallel/multi-GPU) models; .module resolution."""
+    torch.manual_seed(0)
+    wrapped = torch.nn.DataParallel(dense_model)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=5, dtype=torch.float)
+
+    per_token_loss, _, _, _ = compute_masked_diffusion_losses(wrapped, x0, noise_mask, p, reweight=False)
+
+    assert per_token_loss.shape == (6,)
+    assert torch.isfinite(per_token_loss).all()
+
+
 def test_trainer_mask_p_max_and_reweight_default_to_full_diffusion(dense_model):
     """Defaults must reproduce the pre-curriculum behavior exactly."""
     trainer = KairosDiffusionTrainer(model=dense_model)
@@ -330,7 +345,7 @@ def test_compute_masked_diffusion_losses_self_conditioning_does_not_break_backwa
     per_token_loss.mean().backward()
 
     grad_norms = [p.grad.norm().item() for p in dense_model.parameters() if p.grad is not None]
-    assert grad_norms and all(g == g for g in grad_norms)  # non-empty, no NaNs
+    assert grad_norms and all(np.isfinite(g) for g in grad_norms)  # non-empty, no NaNs
 
 
 def test_trainer_self_conditioning_prob_defaults_to_nonzero(dense_model):
@@ -412,9 +427,9 @@ def test_stage_mask_schedule_zero_transition_jumps_straight_to_target():
 def test_stage_mask_schedule_zero_mae_steps_starts_in_transition_immediately():
     """mae_steps=0: no flat MAE phase — the ramp (or target, if transition_steps=0 too) starts
     from step 0."""
-    p_max, reweight = stage_mask_schedule(0, 0, 100, 0.3, False, 1.0, True)
+    p_max, _ = stage_mask_schedule(0, 0, 100, 0.3, False, 1.0, True)
     assert p_max == pytest.approx(0.3)
-    p_max, reweight = stage_mask_schedule(50, 0, 100, 0.3, False, 1.0, True)
+    p_max, _ = stage_mask_schedule(50, 0, 100, 0.3, False, 1.0, True)
     assert p_max == pytest.approx(0.65)
 
 

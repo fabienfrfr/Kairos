@@ -10,7 +10,13 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 
-from .attentions import KairosLiZAttention2, KairosNorm, KairosRotaryEmbedding
+from .attentions import (
+    ATTN_IMPL,
+    KairosLiZAttention2,
+    KairosNorm,
+    KairosRotaryEmbedding,
+    build_backbone_flex_block_mask,
+)
 
 try:
     from .generation import KairosDiffusionGenerationMixin
@@ -266,13 +272,24 @@ class DiffusionBlock(nn.Module):
         self.attn = KairosLiZAttention2(config, layer_idx)
         self.ffn = KairosMoE(config) if use_moe else KairosFFN(config)
 
-    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        cache_params=None,
+        attention_mask=None,
+        position_ids=None,
+        attn_block_mask=None,
+        full_seq_len=None,
+    ):
         x = x + self.attn(
             self.norm1(x),
             position_embeddings=position_embeddings,
             cache_params=cache_params,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            attn_block_mask=attn_block_mask,
+            full_seq_len=full_seq_len,
         )
         x = x + self.ffn(self.norm2(x))
         return x
@@ -309,7 +326,16 @@ class KairosDiffusionBackbone(nn.Module):
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
         self.deltanet_layer_indices = [i for i, lt in enumerate(config.layers_config) if "d" in lt]
 
-    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        cache_params=None,
+        attention_mask=None,
+        position_ids=None,
+        attn_block_mask=None,
+        full_seq_len=None,
+    ):
         emb = x
         completed = []  # finalized block-sums of prior layer
         partial = None  # running sum of the current
@@ -327,6 +353,8 @@ class KairosDiffusionBackbone(nn.Module):
                 cache_params=cache_params,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                attn_block_mask=attn_block_mask,
+                full_seq_len=full_seq_len,
             )
             partial = x if partial is None else partial + x
             in_block += 1
@@ -391,13 +419,19 @@ class KairosScaleRouter(nn.Module):
         pooled = F.adaptive_max_pool1d(active_full.float().unsqueeze(1), scale_len).squeeze(1)
         return pooled > 0.5
 
+    # power-of-two-ish bucketing via lookup (not bit ops) bounds shapes to ~log2(seq_len)
+    _MIN_BUCKET = 8  # floor so tiny lengths (1,2,4) don't each get their own compiled shape
+    _BUCKET_SIZES = tuple(8 << i for i in range(12))  # 8, 16, ..., 16384
+
     @staticmethod
     def gather_active(x, active_mask):
-        _, _, D = x.shape
+        _, S, D = x.shape
         lengths = active_mask.sum(dim=1)
-        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
-        if max_len == 0:
+        raw_max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        if raw_max_len == 0:
             return None, None, None
+        bucket = next((b for b in KairosScaleRouter._BUCKET_SIZES if b >= raw_max_len), S)
+        max_len = min(S, bucket)
         order = torch.argsort((~active_mask).long(), dim=1, stable=True)
         positions = order[:, :max_len]
         gathered = torch.gather(x, 1, positions.unsqueeze(-1).expand(-1, -1, D))
@@ -625,13 +659,23 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
             if gathered is not None:
                 cache_offset = local_cache.get_total_seen(0) if local_cache is not None else 0
                 position_ids = positions + cache_offset
-                cos, sin = self.rotary(scale, position_ids, max_position=None)
+                # positions are argsort indices into [0, scale.shape[1]) -> exact static bound.
+                max_position = cache_offset + scale.shape[1] - 1
+                cos, sin = self.rotary(scale, position_ids, max_position=max_position)
+                attn_block_mask = None
+                if ATTN_IMPL == "flex":
+                    # built once per backbone/step, shared by every attention layer inside it.
+                    attn_block_mask = build_backbone_flex_block_mask(
+                        self.config.sliding_window_size, gathered.shape[1], gathered.shape[0], pad_mask, gathered.device
+                    )
                 chunk = backbone(
                     gathered,
                     position_embeddings=(cos, sin),
                     cache_params=local_cache,
                     attention_mask=pad_mask,
                     position_ids=position_ids,
+                    attn_block_mask=attn_block_mask,
+                    full_seq_len=scale.shape[1],
                 )
                 output = self.router.scatter_active(output, chunk, pad_mask, positions)
             features.append(output)

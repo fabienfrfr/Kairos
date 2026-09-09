@@ -4,9 +4,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from kairos.attentions import (
     ATTN_IMPL,
@@ -16,6 +18,7 @@ from kairos.attentions import (
     KairosGatedDeltaNet,
     KairosLiZAttention2,
     KairosRotaryEmbedding,
+    _resolve_attn_impl,
     _supports_cu_seqlens,
 )
 from kairos.modeling import KairosCache
@@ -218,6 +221,165 @@ def test_deltanet_bidir_effect():
     out_b = model.process(x_rev)
     out_b = torch.flip(out_b, dims=[1])
     assert not torch.allclose(out_f, out_b, atol=1e-3)
+
+
+class _CuSeqlensSpy:
+    """Stand-in for chunk_gated_delta_rule: records args, returns a shape-correct zero output."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, q, k, v, g, beta, **kwargs):
+        self.calls.append({"q_shape": tuple(q.shape), "cu_seqlens": kwargs["cu_seqlens"].clone()})
+        return v.new_zeros(v.shape), None
+
+
+def test_deltanet_varlen_pads_total_tokens_to_fixed_block_during_training():
+    """Regression test: unpadded token count varies every step, so warmup=0 re-autotunes it."""
+    from kairos.attentions import _FLEX_BLOCK_SIZE
+
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False  # row 0 has real length 12 -> total valid tokens = 12 + 16 = 28
+
+    model.process(x, cache_params=None, attention_mask=mask)
+
+    assert len(spy.calls) == 1
+    padded_total = spy.calls[0]["q_shape"][1]
+    assert padded_total % _FLEX_BLOCK_SIZE == 0
+    assert padded_total >= 28  # never smaller than the real content
+
+
+def test_deltanet_varlen_cu_seqlens_gets_a_phantom_trailing_segment():
+    """The padding rows must form their own segment (never mixed into a real one's state)."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask)
+
+    cu_seqlens = spy.calls[0]["cu_seqlens"]
+    real_lengths = mask.sum(dim=1)
+    expected_real_boundaries = F.pad(real_lengths.cumsum(0), (1, 0)).to(torch.int32)
+    assert torch.equal(cu_seqlens[: len(expected_real_boundaries)], expected_real_boundaries)
+    assert len(cu_seqlens) == len(expected_real_boundaries) + 1  # + 1 phantom segment
+    assert cu_seqlens[-1] == spy.calls[0]["q_shape"][1]  # phantom segment ends at the padded total
+
+
+def test_deltanet_varlen_output_shape_unaffected_by_internal_padding():
+    """Padding is internal: process()'s output shape must still match the input."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    model.chunk_gated_delta_rule = _CuSeqlensSpy()
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    out = model.process(x, cache_params=None, attention_mask=mask)
+
+    assert out.shape == (2, 16, model.n_heads, 2 * model.head_dim)
+
+
+def test_deltanet_varlen_skips_padding_when_cache_params_present():
+    """Padding is only safe with no cache to round-trip: no-op for generation/decoding."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+    fake_cache = MagicMock()
+    fake_cache.conv_caches = [None]
+    fake_cache.ssm_caches = [None]
+
+    model.process(x, cache_params=fake_cache, attention_mask=mask)
+
+    cu_seqlens = spy.calls[0]["cu_seqlens"]
+    real_lengths = mask.sum(dim=1)
+    expected = F.pad(real_lengths.cumsum(0), (1, 0)).to(torch.int32)
+    assert torch.equal(cu_seqlens, expected)  # no phantom segment appended
+    assert spy.calls[0]["q_shape"][1] == int(real_lengths.sum())  # not padded to a block boundary
+
+
+def test_deltanet_varlen_pads_to_static_full_seq_len_when_provided():
+    """full_seq_len is the pre-gather scale length: padding to B*full_seq_len is run-invariant."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask, full_seq_len=64)
+
+    assert spy.calls[0]["q_shape"][1] == 2 * 64
+
+
+def test_deltanet_varlen_static_shape_is_stable_across_different_content_lengths():
+    """Core regression test: different real content must still produce the same padded shape."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask_a = torch.ones(2, 16, dtype=torch.bool)
+    mask_a[0, 12:] = False
+    mask_b = torch.ones(2, 16, dtype=torch.bool)
+    mask_b[1, 3:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask_a, full_seq_len=64)
+    model.process(x, cache_params=None, attention_mask=mask_b, full_seq_len=64)
+
+    assert spy.calls[0]["q_shape"] == spy.calls[1]["q_shape"]
+
+
+def test_deltanet_varlen_static_padding_never_goes_negative():
+    """Sanity bound: total valid tokens never exceeds B*full_seq_len, so pad_n stays >= 0."""
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)  # fully valid: total == B*L == B*full_seq_len
+
+    model.process(x, cache_params=None, attention_mask=mask, full_seq_len=16)
+
+    assert spy.calls[0]["q_shape"][1] == 2 * 16
+
+
+def test_deltanet_varlen_falls_back_to_block_rounding_without_full_seq_len():
+    """Backward compatibility: full_seq_len=None must keep the block-rounding fallback."""
+    from kairos.attentions import _FLEX_BLOCK_SIZE
+
+    model = get_deltanet_model()
+    model._chunk_supports_varlen = True
+    spy = _CuSeqlensSpy()
+    model.chunk_gated_delta_rule = spy
+
+    x = get_deltanet_inputs(B=2, L=16)
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    mask[0, 12:] = False
+
+    model.process(x, cache_params=None, attention_mask=mask)
+
+    assert spy.calls[0]["q_shape"][1] % _FLEX_BLOCK_SIZE == 0
 
 
 def test_deltanet_backward():
@@ -539,9 +701,35 @@ def test_kairos_attn_backend_eager_override(tmp_path):
         capture_output=True,
         text=True,
         env={**os.environ, "PYTHONPATH": repo_root},
+        check=False,
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "eager"
+
+
+def test_auto_backend_picks_flex_on_a_usable_gpu():
+    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=True)
+    assert got == "flex"
+
+
+def test_auto_backend_falls_back_without_a_usable_gpu():
+    got = _resolve_attn_impl("auto", flex_import_ok=True, can_fuse=False)
+    assert got == "eager"
+
+
+def test_auto_backend_falls_back_when_flex_import_failed():
+    got = _resolve_attn_impl("auto", flex_import_ok=False, can_fuse=True)
+    assert got == "eager"
+
+
+def test_explicit_flex_backend_raises_when_import_failed():
+    with pytest.raises(ImportError):
+        _resolve_attn_impl("flex", flex_import_ok=False, can_fuse=True)
+
+
+def test_explicit_eager_backend_ignores_gpu_availability():
+    got = _resolve_attn_impl("eager", flex_import_ok=True, can_fuse=True)
+    assert got == "eager"
 
 
 def test_round_up_flex_block():
@@ -576,6 +764,96 @@ def test_build_flex_mask_bucketed_semantics():
     for q in range(q_len, bq):
         row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
         assert row[0] is True and not any(row[1:]), q
+
+
+def test_build_backbone_flex_block_mask_no_padding_matches_bucketed_semantics():
+    """The shared mask must match the per-layer _flex_mask_bucketed semantics it replaces."""
+    from kairos.attentions import build_backbone_flex_block_mask
+
+    window, bq, q_len, batch_size = 2, 8, 5, 2
+    m = build_backbone_flex_block_mask(window, q_len, batch_size, attention_mask=None, device="cpu")
+    mask_mod = m.mask_mod
+    for q in range(q_len):
+        row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
+        lo, hi = max(0, q - window), min(q_len, q + window + 1)
+        assert row == [lo <= k < hi for k in range(bq)], q
+    for q in range(q_len, bq):
+        row = [bool(mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(bq)]
+        assert row[0] is True and not any(row[1:]), q
+
+
+def test_build_backbone_flex_block_mask_padded_matches_per_row_padding():
+    """Padding branch: must respect each row's real length, same as _flex_mask_bucketed_padded."""
+    from kairos.attentions import build_backbone_flex_block_mask
+
+    window, q_len = 2, 5
+    pad = torch.ones(2, q_len, dtype=torch.bool)
+    pad[1, 3:] = False  # row 1 has real length 3
+    m = build_backbone_flex_block_mask(window, q_len, batch_size=2, attention_mask=pad, device="cpu")
+    mask_mod = m.mask_mod
+    for b, length in ((0, 5), (1, 3)):
+        for q in range(length):
+            row = [bool(mask_mod(b, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+            lo, hi = max(0, q - window), min(length, q + window + 1)
+            assert row == [lo <= k < hi for k in range(8)], (b, q)
+
+
+def test_build_backbone_flex_block_mask_ignores_fully_valid_attention_mask():
+    """An all-True attention_mask must take the cheaper no-padding branch."""
+    from kairos.attentions import build_backbone_flex_block_mask
+
+    window, q_len = 2, 5
+    all_valid = torch.ones(2, q_len, dtype=torch.bool)
+    m_with_full_mask = build_backbone_flex_block_mask(window, q_len, 2, all_valid, device="cpu")
+    m_without_mask = build_backbone_flex_block_mask(window, q_len, 2, None, device="cpu")
+    for q in range(8):
+        row_a = [bool(m_with_full_mask.mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+        row_b = [bool(m_without_mask.mask_mod(0, 0, torch.tensor(q), torch.tensor(k))) for k in range(8)]
+        assert row_a == row_b, q
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or ATTN_IMPL != "flex",
+    reason="flex_attention requires a CUDA device",
+)
+class TestSharedFlexBlockMask:
+    """Passing a pre-built mask must not change output and must skip the layer's own cache."""
+
+    def _attn(self):
+        cfg = DummySWAConfig()
+        attn = KairosAttention(cfg, layer_idx=0)
+        rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+        return attn, rope
+
+    def test_pre_built_mask_matches_default_construction(self):
+        from kairos.attentions import build_backbone_flex_block_mask
+
+        attn, rope = self._attn()
+        L = 114
+        x = torch.randn(2, L, 32, device="cuda")
+        pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+        cos_sin = rope(x, pos)
+
+        out_default = attn(x, cos_sin)
+
+        shared_mask = build_backbone_flex_block_mask(attn.window, L, 2, None, device="cuda")
+        out_shared = attn(x, cos_sin, attn_block_mask=shared_mask)
+
+        assert torch.allclose(out_default, out_shared, atol=1e-5)
+
+    def test_pre_built_mask_skips_internal_cache(self):
+        from kairos.attentions import build_backbone_flex_block_mask
+
+        attn, rope = self._attn()
+        L = 114
+        x = torch.randn(2, L, 32, device="cuda")
+        pos = torch.arange(L, device="cuda").unsqueeze(0).expand(2, -1)
+        cos_sin = rope(x, pos)
+        shared_mask = build_backbone_flex_block_mask(attn.window, L, 2, None, device="cuda")
+
+        attn(x, cos_sin, attn_block_mask=shared_mask)
+
+        assert attn._flex_mask_cache == {}  # internal build was skipped entirely
 
 
 def test_flex_mask_bucketed_padded_per_row(monkeypatch):
@@ -753,8 +1031,7 @@ def test_causal_conv1d_backend_matches_installed_package():
 
 
 def test_warns_on_cuda_without_fast_kernels():
-    """On a CUDA machine without fla/causal-conv1d, importing kairos.attentions should warn
-    loudly instead of silently falling back — this used to be a silent ImportError->None swap."""
+    """On CUDA without fla/causal-conv1d, importing kairos.attentions should warn loudly."""
     from kairos.attentions import _warn_if_missing_fast_kernels
 
     with pytest.warns(UserWarning, match="fast-attn"):

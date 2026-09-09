@@ -1,3 +1,4 @@
+import os
 import time
 
 import pytest
@@ -16,6 +17,8 @@ from kairos.utils import (
     format_duration,
     locate_first_nonfinite_module,
     make_progress_callback,
+    parse_autotune_line,
+    relay_autotune_output,
     training_summary,
 )
 
@@ -87,6 +90,43 @@ def test_estimate_optimizer_memory_mb_is_double_param_memory_for_adamw():
     assert estimate_optimizer_memory_mb(trainable) == pytest.approx(2 * estimate_param_memory_mb(trainable))
 
 
+# ------------------------------------------------------------- parse_autotune_line
+def test_parse_autotune_line_extracts_kernel_name():
+    line = "Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1"
+    assert parse_autotune_line(line) == ("kernel", "l2norm_fwd_kernel")
+
+
+def test_parse_autotune_line_extracts_done_line_verbatim():
+    line = "finished after 6.31s,"
+    assert parse_autotune_line(line) == ("done", line)
+
+
+def test_parse_autotune_line_ignores_unrelated_lines():
+    assert parse_autotune_line("some unrelated log output") is None
+
+
+# ------------------------------------------------------------- relay_autotune_output
+def test_relay_autotune_output_relays_real_lines_for_arbitrary_code(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    with relay_autotune_output("memory measurement"):
+        print("Autotuning kernel l2norm_fwd_kernel with config BT: 8")
+
+    assert "l2norm_fwd_kernel" in fake.created[0].desc
+
+
+def test_relay_autotune_output_restores_stdout_even_on_exception(monkeypatch, capsys):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    with pytest.raises(RuntimeError), relay_autotune_output("memory measurement"):
+        raise RuntimeError("boom")
+
+    print("back to normal")
+    assert "back to normal" in capsys.readouterr().out
+
+
 # ------------------------------------------------------------- benchmark_step_time
 def test_benchmark_step_time_returns_positive_average():
     def step_fn():
@@ -104,6 +144,123 @@ def test_benchmark_step_time_returns_none_when_iterator_exhausted():
         return next(values)
 
     assert benchmark_step_time(step_fn, n_steps=5, warmup=1) is None
+
+
+def test_benchmark_step_time_returns_none_for_zero_steps_instead_of_crashing():
+    calls = []
+
+    def step_fn():
+        calls.append(1)
+
+    assert benchmark_step_time(step_fn, n_steps=0, warmup=0) is None
+    assert calls == []  # never even attempted a step
+
+
+def test_benchmark_step_time_survives_a_broken_bar_without_breaking_step_fn(monkeypatch):
+    class _BrokenBar(_FakeBar):
+        def set_description(self, desc):
+            raise RuntimeError("display is broken")
+
+    monkeypatch.setattr("tqdm.auto.tqdm", lambda total, desc, **kw: _BrokenBar(total, desc, **kw))
+    calls = []
+
+    def step_fn():
+        calls.append(1)
+        print("Autotuning kernel some_kernel with config BT: 8")
+
+    result = benchmark_step_time(step_fn, n_steps=2, warmup=0)
+
+    assert calls == [1, 1]  # step_fn ran fully despite the display raising internally
+    assert result is not None and result >= 0
+
+
+def test_benchmark_step_time_shows_a_tqdm_bar_instead_of_raw_logs(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        pass
+
+    benchmark_step_time(step_fn, n_steps=3, warmup=2)
+
+    assert fake.created[0].total == 5  # warmup + n_steps
+    assert fake.created[0].n == 5
+    assert fake.created[0].closed
+
+
+def test_benchmark_step_time_ticks_elapsed_time_before_any_real_output(monkeypatch):
+    import kairos.utils as utils_module
+
+    monkeypatch.setattr(utils_module, "_LOADING_TICK_SEC", 0.02)
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        time.sleep(0.08)  # long enough for the 0.02s ticker to fire at least once
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert any("loading triton" in (p or "") for p in [fake.created[0].postfix_str])
+
+
+def test_benchmark_step_time_stops_ticking_once_real_output_seen(monkeypatch):
+    import kairos.utils as utils_module
+
+    monkeypatch.setattr(utils_module, "_LOADING_TICK_SEC", 0.02)
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        print("Autotuning kernel real_kernel with config BT: 8")
+        time.sleep(0.08)  # ticker keeps firing after this, but must not overwrite real info
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert "real_kernel" in fake.created[0].desc
+
+
+def test_benchmark_step_time_relays_real_triton_kernel_lines_into_bar_description(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        print("Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1")
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert "l2norm_fwd_kernel" in fake.created[0].desc
+
+
+def test_benchmark_step_time_relays_real_triton_finished_line_into_postfix(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    def step_fn():
+        print("finished after 6.31s,")
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert "finished after 6.31s" in fake.created[0].postfix_str
+
+
+def test_benchmark_step_time_does_not_leak_triton_lines_to_real_stdout(capsys):
+    def step_fn():
+        print("Autotuning kernel foo_kernel with config BT: 8")
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert "Autotuning kernel" not in capsys.readouterr().out
+
+
+def test_benchmark_step_time_does_not_touch_triton_env_var(monkeypatch):
+    monkeypatch.setenv("TRITON_PRINT_AUTOTUNING", "1")
+
+    def step_fn():
+        pass
+
+    benchmark_step_time(step_fn, n_steps=1, warmup=0)
+
+    assert os.environ["TRITON_PRINT_AUTOTUNING"] == "1"  # respects the user's own setting, untouched
 
 
 # ------------------------------------------------------------- training_summary
@@ -140,6 +297,55 @@ def test_training_summary_with_benchmark():
     assert summary.estimated_total_time_sec == pytest.approx(summary.avg_step_time_sec * summary.total_steps)
 
 
+def test_training_summary_str_omits_backend_section_when_unset():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(4))
+    summary = training_summary(model, loader, epochs=1, step_fn=None)
+    assert "Compute backends" not in str(summary)
+
+
+def test_training_summary_str_shows_fused_backend_without_warning():
+    summary = TrainingSummary(
+        total_params=10,
+        trainable_params=10,
+        active_params=10,
+        param_memory_mb=0.0,
+        optimizer_memory_mb=0.0,
+        total_memory_mb=0.0,
+        steps_per_epoch=1,
+        epochs=1,
+        total_steps=1,
+        attn_impl="flex",
+        delta_rule_backend="fla",
+        causal_conv1d_backend="causal_conv1d",
+    )
+    text = str(summary)
+    assert "Compute backends" in text
+    assert "Attention:           flex" in text
+    assert "DeltaNet:            fla" in text
+    assert "pip install" not in text
+
+
+def test_training_summary_str_warns_on_slow_deltanet_fallback():
+    summary = TrainingSummary(
+        total_params=10,
+        trainable_params=10,
+        active_params=10,
+        param_memory_mb=0.0,
+        optimizer_memory_mb=0.0,
+        total_memory_mb=0.0,
+        steps_per_epoch=1,
+        epochs=1,
+        total_steps=1,
+        attn_impl="flex",
+        delta_rule_backend="torch_fallback",
+        causal_conv1d_backend="torch_fallback",
+    )
+    text = str(summary)
+    assert "DeltaNet:            torch_fallback  <- pip install -e '.[fast-attn]'" in text
+    assert "Causal conv1d:       torch_fallback  <- pip install -e '.[fast-attn]'" in text
+
+
 def test_training_summary_str_contains_key_fields():
     model = nn.Linear(4, 2)
     loader = _TinyLoader(range(4))
@@ -164,6 +370,32 @@ def test_training_summary_with_benchmark_shows_measured_step_time_in_str():
     assert "ms" in text
     assert "Est. total time:" in text
     assert "n/a" not in text
+
+
+def test_training_summary_str_notes_single_gpu_benchmark_when_flagged():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(10))
+
+    def step_fn():
+        time.sleep(0.001)
+
+    summary = training_summary(model, loader, epochs=2, step_fn=step_fn, n_bench_steps=3)
+    summary.n_gpus = 2
+    summary.single_gpu_benchmark = True
+    text = str(summary)
+    assert "benchmarked on 1 GPU" in text
+
+
+def test_training_summary_str_omits_single_gpu_note_by_default():
+    model = nn.Linear(4, 2)
+    loader = _TinyLoader(range(10))
+
+    def step_fn():
+        time.sleep(0.001)
+
+    summary = training_summary(model, loader, epochs=2, step_fn=step_fn, n_bench_steps=3)
+    text = str(summary)
+    assert "benchmarked on 1 GPU" not in text
 
 
 def test_training_summary_str_uses_measured_label_when_flag_set():
@@ -229,21 +461,37 @@ def test_training_summary_includes_active_params_for_moe():
 
 # ------------------------------------------------------------- make_progress_callback
 class _FakeBar:
-    def __init__(self, total, desc):
+    def __init__(self, total, desc, leave=True, bar_format=None):
         self.total = total
         self.desc = desc
         self.n = 0
         self.postfix = None
+        self.postfix_str = None
         self.closed = False
 
     def set_postfix(self, **kw):
         self.postfix = kw
+
+    def set_postfix_str(self, s):
+        self.postfix_str = s
+
+    def set_description(self, desc):
+        self.desc = desc
+
+    def update(self, n=1):
+        self.n += n
 
     def refresh(self):
         pass
 
     def close(self):
         self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
 
 
 def test_make_progress_callback_updates_bar(monkeypatch):
@@ -270,6 +518,30 @@ def test_make_progress_callback_closes_bar_at_last_step(monkeypatch):
     callback(3, 3, 0.1)
 
     assert created[0].closed
+
+
+class _FakeTqdmFactory:
+    def __init__(self):
+        self.created = []
+        self.written = []
+
+    def __call__(self, total, desc, **kwargs):
+        bar = _FakeBar(total, desc, **kwargs)
+        self.created.append(bar)
+        return bar
+
+    def write(self, msg):
+        self.written.append(msg)
+
+
+def test_make_progress_callback_phase_writes_a_subtle_status_line(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    callback = make_progress_callback(desc="training")
+    callback.phase("compiling")
+
+    assert fake.written == ["[training] compiling"]
 
 
 # ------------------------------------------------------------- detailed_memory_report

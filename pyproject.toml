@@ -63,7 +63,7 @@ kairos = ["templates/*.md"]
 
 [tool.setuptools_scm]
 version_file = "kairos/_version.py"
-fallback_version = "0.3.1"  # editable/no-git-history installs (this sandbox's checkout)
+fallback_version = "0.4.0"  # editable/no-git-history installs (this sandbox's checkout)
 local_scheme = "no-local-version"
 
 [tool.pytest.ini_options]
@@ -82,7 +82,7 @@ dev = [
     "mwparserfromhell>=0.7.2",
     "pytest>=8.4.2",
     "pytest-cov>=7.1.0",
-    "ruff>=0.15.20",
+    "ruff>=0.16.5",
 ]
 # scripts/ (dataset builders): `uv sync --group scripts` to install
 scripts = [
@@ -99,4 +99,8 @@ line-length = 120
 quote-style = "double"
 
 [tool.ruff.lint.per-file-ignores]
+# marimo notebook source + its ipynb export share the same import ordering / relaxed rules
 "notebook/*.py" = ["PLR1711", "B018", "I001"]
+"notebook/*.ipynb" = ["PLR1711", "B018", "I001"]
+# setuptools-scm regenerates this version file on every build; don't lint auto-generated code
+"kairos/_version.py" = ["RUF022"]

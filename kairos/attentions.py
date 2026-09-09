@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-
 from transformers.models.qwen3_next.modeling_qwen3_next import (
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
@@ -36,16 +35,17 @@ def _can_fuse_flex():
     return cap >= _FLEX_MIN_COMPUTE_CAPABILITY
 
 
-if _ATTN_BACKEND == "flex":
-    # explicit opt-in; fail loudly if flex_attention cannot be imported
-    if not _FLEX_IMPORT_OK:
-        raise ImportError("KAIROS_ATTN_BACKEND=flex requested but flex_attention is unavailable")
-    ATTN_IMPL = "flex"
-elif _ATTN_BACKEND == "eager":
-    # windowed bidirectional SWA is O(L*W) with the eager unfold path
-    ATTN_IMPL = "eager"
-else:  # "auto" (default): flex on a fused-capable GPU, eager otherwise
-    ATTN_IMPL = "flex" if _FLEX_IMPORT_OK and _can_fuse_flex() else "eager"
+def _resolve_attn_impl(backend: str, flex_import_ok: bool, can_fuse: bool) -> str:
+    if backend == "flex":
+        if not flex_import_ok:
+            raise ImportError("KAIROS_ATTN_BACKEND=flex requested but flex_attention is unavailable")
+        return "flex"
+    if backend == "eager":
+        return "eager"
+    return "flex" if flex_import_ok and can_fuse else "eager"
+
+
+ATTN_IMPL = _resolve_attn_impl(_ATTN_BACKEND, _FLEX_IMPORT_OK, _can_fuse_flex())
 
 try:
     from fla.ops.gated_delta_rule import (
@@ -76,8 +76,7 @@ except ImportError:
         )
 
 
-# DeltaNet runs on every layer alongside SWA (see KairosLiZAttention2); without fla/causal-conv1d
-# it silently falls back to slow pure-PyTorch kernels - warn loudly on CUDA
+# without fla/causal-conv1d, DeltaNet silently falls back to slow pure-PyTorch kernels.
 def _warn_if_missing_fast_kernels(cuda_available: bool, delta_backend: str, conv_backend: str) -> None:
     """Pure function (no CUDA/import side effects), directly unit-testable without reloading."""
     if not cuda_available or (delta_backend == "fla" and conv_backend == "causal_conv1d"):
@@ -229,6 +228,18 @@ def build_flex_mask_bucketed(window, q_mask, kv_mask, device=None):
     return create_block_mask(bidir_window_bucketed, B=B, H=None, Q_LEN=bq, KV_LEN=bq, device=device)
 
 
+def build_backbone_flex_block_mask(window, q_len, batch_size, attention_mask, device=None):
+    """Block mask shared by every attention layer in one backbone's forward pass, built once here."""
+    bq = _round_up(q_len, _FLEX_BLOCK_SIZE)
+    has_padding = attention_mask is not None and not bool(attention_mask.all())
+    if has_padding:
+        padded = F.pad(attention_mask.bool(), (0, bq - q_len), value=False)
+        return build_flex_mask_bucketed(window, padded, padded.clone(), device=device)
+    q_mask = torch.ones(batch_size, bq, dtype=torch.bool, device=device)
+    q_mask[:, q_len:] = False
+    return build_flex_mask_bucketed(window, q_mask, q_mask.clone(), device=device)
+
+
 # Kairos Attention (SWA bidirectional)
 class KairosAttention(nn.Module):
     def __init__(self, config, layer_idx=None):
@@ -274,11 +285,11 @@ class KairosAttention(nn.Module):
 
     def _flex_mask_bucketed_padded(self, bq, attention_mask, device):
         # per-row pad_mask (gather_active); rebuilt per step (content varies), block fixed.
-        B, kv_len = attention_mask.shape
+        _, kv_len = attention_mask.shape
         padded = F.pad(attention_mask.bool(), (0, bq - kv_len), value=False)
         return build_flex_mask_bucketed(self.window, padded, padded.clone(), device=device)
 
-    def _flex_train(self, q, k, v, q_len, attention_mask):
+    def _flex_train(self, q, k, v, q_len, attention_mask, attn_block_mask=None):
         # round up to flex block so mask shape (and compiled kernel) is stable per length.
         bq = _round_up(q_len, _FLEX_BLOCK_SIZE)
         if bq > q_len:
@@ -286,11 +297,15 @@ class KairosAttention(nn.Module):
             q = F.pad(q, (0, 0, 0, 0, 0, pad_n))
             k = F.pad(k, (0, 0, 0, 0, 0, pad_n))
             v = F.pad(v, (0, 0, 0, 0, 0, pad_n))
-        has_padding = attention_mask is not None and not bool(attention_mask.all())
-        if has_padding:
-            block_mask = self._flex_mask_bucketed_padded(bq, attention_mask, q.device)
+        if attn_block_mask is not None:
+            # pre-built once by the caller (shared across every layer in the backbone this step)
+            block_mask = attn_block_mask
         else:
-            block_mask = self._flex_mask_bucketed(bq, q_len, q.size(0), q.device)
+            has_padding = attention_mask is not None and not bool(attention_mask.all())
+            if has_padding:
+                block_mask = self._flex_mask_bucketed_padded(bq, attention_mask, q.device)
+            else:
+                block_mask = self._flex_mask_bucketed(bq, q_len, q.size(0), q.device)
         out = flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -316,7 +331,15 @@ class KairosAttention(nn.Module):
         )
         return out.transpose(1, 2)
 
-    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        cache_params=None,
+        attention_mask=None,
+        position_ids=None,
+        attn_block_mask=None,
+    ):
         B, L, _ = x.shape
         if cache_params is not None and self.layer_idx is not None:
             offset = cache_params.get_total_seen(self.layer_idx)
@@ -343,7 +366,7 @@ class KairosAttention(nn.Module):
         if ATTN_IMPL == "flex":
             q_len, kv_len = q.size(1), k.size(1)
             if q_len == kv_len and q_len > 0:
-                out = self._flex_train(q, k, v, q_len, attention_mask)
+                out = self._flex_train(q, k, v, q_len, attention_mask, attn_block_mask=attn_block_mask)
             else:
                 out = self._flex_cached(q, k, v, attention_mask)
         else:
@@ -409,7 +432,7 @@ class KairosGatedDeltaNet(nn.Module):
         self.out_left_right = nn.Linear(2 * self.value_dim, self.hidden_size, bias=False)
         self.out_proj = nn.Linear(self.hidden_size, config.hidden_size, bias=False)
 
-    def process(self, hidden_states, cache_params=None, attention_mask=None):
+    def process(self, hidden_states, cache_params=None, attention_mask=None, full_seq_len=None):
         B, L, _ = hidden_states.shape
         has_previous_state = cache_params is not None and cache_params.conv_caches[self.layer_idx] is not None
         has_ssm_state = cache_params is not None and cache_params.ssm_caches[self.layer_idx] is not None
@@ -486,6 +509,21 @@ class KairosGatedDeltaNet(nn.Module):
             v_p = v[bi, li].unsqueeze(0)
             g_p = g[bi, li].unsqueeze(0)
             beta_p = beta[bi, li].unsqueeze(0)
+            total = q_p.shape[1]
+            if cache_params is None:
+                if full_seq_len is not None:
+                    # static per-scale bound: same shape every step, autotuned once and cached.
+                    bt = attention_mask.shape[0] * full_seq_len
+                else:
+                    bt = _round_up(total, _FLEX_BLOCK_SIZE)
+                pad_n = bt - total
+                if pad_n > 0:
+                    q_p = F.pad(q_p, (0, 0, 0, 0, 0, pad_n))
+                    k_p = F.pad(k_p, (0, 0, 0, 0, 0, pad_n))
+                    v_p = F.pad(v_p, (0, 0, 0, 0, 0, pad_n))
+                    g_p = F.pad(g_p, (0, 0, 0, pad_n))
+                    beta_p = F.pad(beta_p, (0, 0, 0, pad_n))
+                    cu_seqlens = F.pad(cu_seqlens, (0, 1), value=bt)
             o_p, ssm_cache = self.chunk_gated_delta_rule(
                 q_p,
                 k_p,
@@ -499,7 +537,7 @@ class KairosGatedDeltaNet(nn.Module):
                 cu_seqlens=cu_seqlens,
             )
             o = v.new_zeros(v.shape)
-            o[bi, li] = o_p.squeeze(0)
+            o[bi, li] = o_p.squeeze(0)[:total]
         else:
             if has_padding:
                 m = attention_mask.to(beta.dtype).unsqueeze(-1)
@@ -533,11 +571,11 @@ class KairosGatedDeltaNet(nn.Module):
         o = o * F.silu(g_out)
         return o
 
-    def forward(self, hidden_states, cache_params=None, attention_mask=None):
-        out_f = self.process(hidden_states, cache_params, attention_mask=attention_mask)
+    def forward(self, hidden_states, cache_params=None, attention_mask=None, full_seq_len=None):
+        out_f = self.process(hidden_states, cache_params, attention_mask=attention_mask, full_seq_len=full_seq_len)
         x_rev = torch.flip(hidden_states, dims=[1])
         mask_rev = torch.flip(attention_mask, dims=[1]) if attention_mask is not None else None
-        out_b = self.process(x_rev, cache_params=None, attention_mask=mask_rev)
+        out_b = self.process(x_rev, cache_params=None, attention_mask=mask_rev, full_seq_len=full_seq_len)
         out_b = torch.flip(out_b, dims=[1])
         B, L = out_f.shape[:2]
         out = torch.cat([out_f, out_b], dim=-1)
@@ -564,15 +602,25 @@ class KairosLiZAttention2(nn.Module):
         self.norm = KairosNorm(2 * self.hidden_size)
         self.out_proj = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
 
-    def forward(self, x, position_embeddings=None, cache_params=None, attention_mask=None, position_ids=None):
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        cache_params=None,
+        attention_mask=None,
+        position_ids=None,
+        attn_block_mask=None,
+        full_seq_len=None,
+    ):
         swa_out = self.swa(
             x,
             position_embeddings=position_embeddings,
             cache_params=cache_params,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            attn_block_mask=attn_block_mask,
         )
-        delta_out = self.delta(x, cache_params=cache_params, attention_mask=attention_mask)
+        delta_out = self.delta(x, cache_params=cache_params, attention_mask=attention_mask, full_seq_len=full_seq_len)
         out = torch.cat([swa_out, delta_out], dim=-1)
         out = self.norm(out)
         out = self.out_proj(out)
