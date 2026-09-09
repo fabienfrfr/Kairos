@@ -478,8 +478,9 @@ class _AutotuneRelay:
         pass
 
 
-def _run_step_with_heartbeat(step_fn, relay: _AutotuneRelay) -> None:
-    """Runs step_fn(), ticking relay with elapsed time while nothing real has printed yet."""
+@contextlib.contextmanager
+def _heartbeat_and_redirect(relay: "_AutotuneRelay"):
+    """Ticks relay with elapsed time on a background thread while stdout is captured."""
     stop = threading.Event()
     start = time.perf_counter()
 
@@ -491,10 +492,27 @@ def _run_step_with_heartbeat(step_fn, relay: _AutotuneRelay) -> None:
     ticker.start()
     try:
         with contextlib.redirect_stdout(relay):
-            step_fn()
+            yield
     finally:
         stop.set()
         ticker.join()
+
+
+def _run_step_with_heartbeat(step_fn, relay: "_AutotuneRelay") -> None:
+    """Runs step_fn(), ticking relay with elapsed time while nothing real has printed yet."""
+    with _heartbeat_and_redirect(relay):
+        step_fn()
+
+
+@contextlib.contextmanager
+def relay_autotune_output(desc: str = "compiling"):
+    """Wraps a block of code: relays Triton's real autotuning stdout into a live tqdm status."""
+    from tqdm.auto import tqdm
+
+    with tqdm(total=0, desc=desc, bar_format="{desc}: {postfix}", leave=False) as bar:
+        relay = _AutotuneRelay(bar)
+        with _heartbeat_and_redirect(relay):
+            yield
 
 
 def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | None:

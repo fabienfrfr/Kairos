@@ -55,6 +55,7 @@ from .utils import (
     locate_first_nonfinite_module,
     parse_autotune_line,
     profile_module_time,
+    relay_autotune_output,
     training_summary,
 )
 
@@ -503,14 +504,15 @@ class KairosMultimodalPipeline:
                 def loss_fn():
                     return self.hf_trainer.compute_loss(self.model, batch)
 
-                mem_report = detailed_memory_report(
-                    self.model,
-                    self.optimizer,
-                    loss_fn,
-                    self.device,
-                    autocast_ctx=self._autocast,
-                    scaler=self.scaler,
-                )
+                with relay_autotune_output("memory measurement"):
+                    mem_report = detailed_memory_report(
+                        self.model,
+                        self.optimizer,
+                        loss_fn,
+                        self.device,
+                        autocast_ctx=self._autocast,
+                        scaler=self.scaler,
+                    )
 
                 # generous warmup so varied bucket sizes/grad_mode stabilize before timing
                 warmup = max(2 * n_bench_steps, 10) if self.compiled else 0

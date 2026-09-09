@@ -18,6 +18,7 @@ from kairos.utils import (
     locate_first_nonfinite_module,
     make_progress_callback,
     parse_autotune_line,
+    relay_autotune_output,
     training_summary,
 )
 
@@ -102,6 +103,29 @@ def test_parse_autotune_line_extracts_done_line_verbatim():
 
 def test_parse_autotune_line_ignores_unrelated_lines():
     assert parse_autotune_line("some unrelated log output") is None
+
+
+# ------------------------------------------------------------- relay_autotune_output
+def test_relay_autotune_output_relays_real_lines_for_arbitrary_code(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    with relay_autotune_output("memory measurement"):
+        print("Autotuning kernel l2norm_fwd_kernel with config BT: 8")
+
+    assert "l2norm_fwd_kernel" in fake.created[0].desc
+
+
+def test_relay_autotune_output_restores_stdout_even_on_exception(monkeypatch, capsys):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    with pytest.raises(RuntimeError):
+        with relay_autotune_output("memory measurement"):
+            raise RuntimeError("boom")
+
+    print("back to normal")
+    assert "back to normal" in capsys.readouterr().out
 
 
 # ------------------------------------------------------------- benchmark_step_time
@@ -438,7 +462,7 @@ def test_training_summary_includes_active_params_for_moe():
 
 # ------------------------------------------------------------- make_progress_callback
 class _FakeBar:
-    def __init__(self, total, desc, leave=True):
+    def __init__(self, total, desc, leave=True, bar_format=None):
         self.total = total
         self.desc = desc
         self.n = 0
