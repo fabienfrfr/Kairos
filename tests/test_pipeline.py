@@ -1232,7 +1232,7 @@ def test_train_auto_launch_passes_phase_callback_to_run_via_ddp(built_pipeline, 
         return {"log_rows": ["fake_row"]}
 
     monkeypatch.setattr(built_pipeline, "_run_via_ddp", _fake_run_via_ddp)
-    _phase_cb = lambda name: None  # noqa: E731
+    _phase_cb = lambda name: None
 
     logs = built_pipeline.train(phase_callback=_phase_cb, resume=False)
 

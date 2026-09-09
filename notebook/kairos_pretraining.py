@@ -12,7 +12,7 @@ def _():
     try:
         from kaggle_secrets import UserSecretsClient
         HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
-    except Exception:
+    except ImportError:
         HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
 
     login(token=HF_TOKEN, add_to_git_credential=False)
@@ -583,7 +583,7 @@ def _(
     if OVERFIT_RUN:
         if mo.running_in_notebook():
             with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
-                overfit_logs = pipe.overfit_test(
+                pipe.overfit_test(
                     n_examples=OVERFIT_EXAMPLES,
                     steps=OVERFIT_STEPS,
                     progress_callback=lambda step, total, loss_val: _bar.update(
@@ -591,14 +591,13 @@ def _(
                     ),
                 )
         else:
-            overfit_logs = pipe.overfit_test(
+            pipe.overfit_test(
                 n_examples=OVERFIT_EXAMPLES,
                 steps=OVERFIT_STEPS,
                 progress_callback=make_progress_callback(desc="overfit_test"),
             )
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
-        overfit_logs = []
     return
 
 

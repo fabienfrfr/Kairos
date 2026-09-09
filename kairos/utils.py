@@ -447,7 +447,7 @@ class _AutotuneRelay:
             line, self._buf = self._buf.split("\n", 1)
             try:
                 self._handle_line(line.strip())
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass  # a display hiccup must never break the real step_fn() call underway
 
     def _handle_line(self, line: str) -> None:
@@ -471,7 +471,7 @@ class _AutotuneRelay:
                 if not self._seen_any:
                     self._bar.set_postfix_str(f"loading triton / compiling... {elapsed:.0f}s")
                     self._bar.refresh()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass  # a display hiccup in the background ticker must never crash the thread
 
     def flush(self) -> None:
@@ -479,7 +479,7 @@ class _AutotuneRelay:
 
 
 @contextlib.contextmanager
-def _heartbeat_and_redirect(relay: "_AutotuneRelay"):
+def _heartbeat_and_redirect(relay: _AutotuneRelay):
     """Ticks relay with elapsed time on a background thread while stdout is captured."""
     stop = threading.Event()
     start = time.perf_counter()
@@ -498,7 +498,7 @@ def _heartbeat_and_redirect(relay: "_AutotuneRelay"):
         ticker.join()
 
 
-def _run_step_with_heartbeat(step_fn, relay: "_AutotuneRelay") -> None:
+def _run_step_with_heartbeat(step_fn, relay: _AutotuneRelay) -> None:
     """Runs step_fn(), ticking relay with elapsed time while nothing real has printed yet."""
     with _heartbeat_and_redirect(relay):
         step_fn()

@@ -120,9 +120,8 @@ def test_relay_autotune_output_restores_stdout_even_on_exception(monkeypatch, ca
     fake = _FakeTqdmFactory()
     monkeypatch.setattr("tqdm.auto.tqdm", fake)
 
-    with pytest.raises(RuntimeError):
-        with relay_autotune_output("memory measurement"):
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), relay_autotune_output("memory measurement"):
+        raise RuntimeError("boom")
 
     print("back to normal")
     assert "back to normal" in capsys.readouterr().out
