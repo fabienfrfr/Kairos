@@ -45,6 +45,7 @@ from .trainer import (
     compute_masked_diffusion_losses,
     make_diffusion_mask,
     stage_mask_schedule,
+    update_moe_bias,
 )
 from .utils import (
     DetailedMemoryReport,
@@ -99,6 +100,7 @@ class TrainConfig:
     mask_mae_p_max: float = 0.3  # MAE-stage fixed-ish corruption ceiling (cheap/stable to optimize)
     mask_mae_reweight: bool = False  # MAE-stage: plain CE, no 1/p variance blowup
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
+    moe_bias_update_rate: float = 1e-3  # DeepSeek-V3-style aux-loss-free MoE balancing step; 0 disables
     # train-time self-conditioning rate; 0.0 disables it (generate() then sees OOD input).
     self_conditioning_prob: float = 0.5
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
@@ -788,6 +790,8 @@ class KairosMultimodalPipeline:
         self.scaler.step(optimizer)
         self.scaler.update()
         scheduler.step()
+        if self.model_config.use_moe and self.train_config.moe_bias_update_rate:
+            update_moe_bias(self.model, self.train_config.moe_bias_update_rate)
 
     def overfit_test(
         self,

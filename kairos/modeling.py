@@ -7,7 +7,7 @@ from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE, DeepseekV3TopkRouter
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 
 from .attentions import (
@@ -253,6 +253,27 @@ class KairosFFN(Qwen2MoeMLP):
     pass
 
 
+class KairosTopkRouter(DeepseekV3TopkRouter):
+    """Tracks per-expert token load so update_bias() can drive DeepSeek-V3-style aux-loss-free balancing."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.load_count = nn.Buffer(torch.zeros(self.num_experts), persistent=False)
+
+    def forward(self, hidden_states):
+        router_logits, topk_weights, topk_indices = super().forward(hidden_states)
+        if self.training:
+            with torch.no_grad():
+                self.load_count += torch.bincount(topk_indices.reshape(-1), minlength=self.num_experts).float()
+        return router_logits, topk_weights, topk_indices
+
+    def update_bias(self, update_rate: float) -> None:
+        with torch.no_grad():
+            target = self.load_count.mean()
+            self.e_score_correction_bias += update_rate * torch.sign(target - self.load_count)
+            self.load_count.zero_()
+
+
 class KairosMoE(DeepseekV3MoE):
     """DeepseekV3MoE's expert weights are raw torch.empty(), never initialized; fixed here."""
 
@@ -261,7 +282,8 @@ class KairosMoE(DeepseekV3MoE):
         std = getattr(config, "initializer_range", 0.02)
         self.experts.gate_up_proj.data.normal_(mean=0.0, std=std)
         self.experts.down_proj.data.normal_(mean=0.0, std=std)
-        self.gate.weight.data.normal_(mean=0.0, std=std)  # was torch.zeros() at construction; fine
+        self.gate = KairosTopkRouter(config)
+        self.gate.weight.data.normal_(mean=0.0, std=std)
 
 
 class DiffusionBlock(nn.Module):

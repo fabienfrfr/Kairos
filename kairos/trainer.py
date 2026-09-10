@@ -4,6 +4,16 @@ import torch
 import torch.nn.functional as F
 from transformers import Trainer
 
+from .modeling import KairosTopkRouter
+
+
+def update_moe_bias(model, update_rate: float) -> None:
+    """Nudges every KairosTopkRouter's correction bias toward equal expert load."""
+    inner = model.module if hasattr(model, "module") else model
+    for module in inner.modules():
+        if isinstance(module, KairosTopkRouter):
+            module.update_bias(update_rate)
+
 
 def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0):
     """Random per-token mask + per-row rate p for the masked-diffusion objective.

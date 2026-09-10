@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
-from kairos.modeling import KairosConfig, KairosDiffusionFM
+from kairos.modeling import KairosConfig, KairosDiffusionFM, KairosTopkRouter
 from kairos.pipeline import TrainConfig
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import (
@@ -12,6 +12,7 @@ from kairos.trainer import (
     compute_masked_diffusion_losses,
     make_diffusion_mask,
     stage_mask_schedule,
+    update_moe_bias,
 )
 
 
@@ -499,6 +500,48 @@ def test_trainer_mae_mode_runs_end_to_end(dense_model, tokenizer):
     assert torch.is_tensor(loss) and not torch.isnan(loss)
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in dense_model.parameters())
+
+
+# ----------------------------------------------------------- aux-loss-free MoE balancing
+def test_moe_gate_load_count_accumulates_only_while_training(model, tokenizer):
+    router = next(m for m in model.modules() if isinstance(m, KairosTopkRouter))
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+
+    model.eval()
+    trainer.compute_loss(model, batch)
+    assert router.load_count.sum() == 0
+
+    model.train()
+    trainer.compute_loss(model, batch)
+    assert router.load_count.sum() > 0
+
+
+def test_moe_router_bias_update_favors_underloaded_experts(config):
+    router = KairosTopkRouter(config)
+    router.load_count = torch.tensor([10.0, 0.0, 5.0, 5.0, 5.0, 5.0, 5.0])
+    bias_before = router.e_score_correction_bias.clone()
+    router.update_bias(update_rate=0.1)
+    assert router.e_score_correction_bias[0] < bias_before[0]  # overloaded -> bias goes down
+    assert router.e_score_correction_bias[1] > bias_before[1]  # underloaded -> bias goes up
+    assert torch.equal(router.load_count, torch.zeros_like(router.load_count))
+
+
+def test_update_moe_bias_touches_every_gate_in_the_model(model):
+    routers = [m for m in model.modules() if isinstance(m, KairosTopkRouter)]
+    assert routers, "fixture must build at least one MoE layer"
+    for r in routers:
+        r.load_count = torch.tensor([3.0] + [0.0] * (r.num_experts - 1))
+
+    update_moe_bias(model, update_rate=0.05)
+
+    for r in routers:
+        assert r.load_count.sum() == 0
+        assert r.e_score_correction_bias[0] < 0
+
+
+def test_update_moe_bias_is_noop_on_dense_model(dense_model):
+    update_moe_bias(dense_model, update_rate=0.05)  # no MoE gates at all: must not raise
 
 
 def test_trainer_mae_mode_never_exceeds_p_max(dense_model, tokenizer, monkeypatch):
