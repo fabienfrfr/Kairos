@@ -12,7 +12,7 @@ def _():
     try:
         from kaggle_secrets import UserSecretsClient
         HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
-    except ImportError:
+    except Exception:  # noqa: BLE001 – kaggle fallback
         HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
 
     login(token=HF_TOKEN, add_to_git_credential=False)
@@ -608,38 +608,10 @@ def _():
 
 
 @app.cell
-def _(FORCE_RESTART, make_progress_callback, mo, pipe):
-    _resumed = not FORCE_RESTART and (pipe.ckpt_dir / "last.pt").exists()
-    if _resumed:
-        print(f"found last.pt in {pipe.ckpt_dir} - resuming")
-    elif FORCE_RESTART:
-        print("FORCE_RESTART is True - ignoring any existing checkpoint")
+def _(FORCE_RESTART, mo, pipe):
+    from kairos.notebook import train_with_progress
 
-    # on multi-GPU, pipe.train itself spawns a torchrun job (flex + memory gate per rank)
-    # and replays its steps into the progress_callback; results come back into this pipe.
-    _total_steps = pipe.train_config.epochs * len(pipe.loader)
-
-    if mo.running_in_notebook():
-        with mo.status.progress_bar(total=_total_steps, title="training") as _bar:
-            _state = {"last_step": 0}
-
-            def _on_step(step, total, loss_val):
-                _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                _state["last_step"] = step
-
-            def _on_phase(name):
-                _bar.update(increment=0, subtitle=name)
-
-            logs = pipe.train(progress_callback=_on_step, phase_callback=_on_phase, resume=not FORCE_RESTART)
-    else:
-        _cb = make_progress_callback()
-        logs = pipe.train(progress_callback=_cb, phase_callback=_cb.phase, resume=not FORCE_RESTART)
-
-    print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
-    print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
-    if pipe.eval_log_rows:
-        print(f"eval points: {len(pipe.eval_log_rows)}  best eval loss: {pipe.best_eval_loss:.4f}")
-    print(f"checkpoints: {pipe.ckpt_dir}")
+    logs = train_with_progress(pipe, force_restart=FORCE_RESTART, mo=mo)
     return (logs,)
 
 

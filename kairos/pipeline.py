@@ -1179,7 +1179,7 @@ class KairosMultimodalPipeline:
         """A broken progress/phase callback must never derail monitoring of the real DDP job."""
         try:
             callback(*args)
-        except Exception:  # noqa: BLE001, S110
+        except Exception:  # noqa: BLE001, S110 – intentionally swallowed
             pass
 
     @staticmethod

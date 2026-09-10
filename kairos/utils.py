@@ -447,8 +447,8 @@ class _AutotuneRelay:
             line, self._buf = self._buf.split("\n", 1)
             try:
                 self._handle_line(line.strip())
-            except Exception:  # noqa: BLE001, S110
-                pass  # a display hiccup must never break the real step_fn() call underway
+            except Exception:  # noqa: BLE001, S110 – display hiccup must never break the real step_fn()
+                pass
 
     def _handle_line(self, line: str) -> None:
         parsed = parse_autotune_line(line)
@@ -471,8 +471,8 @@ class _AutotuneRelay:
                 if not self._seen_any:
                     self._bar.set_postfix_str(f"loading triton / compiling... {elapsed:.0f}s")
                     self._bar.refresh()
-        except Exception:  # noqa: BLE001, S110
-            pass  # a display hiccup in the background ticker must never crash the thread
+        except Exception:  # noqa: BLE001, S110 – display hiccup must never crash the thread
+            pass
 
     def flush(self) -> None:
         pass
@@ -509,7 +509,7 @@ def relay_autotune_output(desc: str = "compiling"):
     """Wraps a block of code: relays Triton's real autotuning stdout into a live tqdm status."""
     from tqdm.auto import tqdm
 
-    with tqdm(total=0, desc=desc, bar_format="{desc}: {postfix}", leave=False) as bar:
+    with tqdm(total=0, desc=desc, bar_format="{desc}: {postfix}", leave=True) as bar:
         relay = _AutotuneRelay(bar)
         with _heartbeat_and_redirect(relay):
             yield
@@ -522,7 +522,7 @@ def benchmark_step_time(step_fn, n_steps: int = 5, warmup: int = 1) -> float | N
     from tqdm.auto import tqdm
 
     try:
-        with tqdm(total=warmup + n_steps, desc="benchmark", leave=False) as bar:
+        with tqdm(total=warmup + n_steps, desc="benchmark", leave=True) as bar:
             relay = _AutotuneRelay(bar)
             for _ in range(warmup):
                 _run_step_with_heartbeat(step_fn, relay)
@@ -543,17 +543,25 @@ def make_progress_callback(desc: str = "training"):
 
     state = {"bar": None}
 
-    def _callback(step: int, total: int, loss_val: float) -> None:
+    def _ensure_bar(total=None):
         if state["bar"] is None:
-            state["bar"] = tqdm(total=total, desc=desc)
-        state["bar"].n = step
-        state["bar"].set_postfix(loss=f"{loss_val:.4f}")
-        state["bar"].refresh()
+            state["bar"] = tqdm(total=total, desc=desc, leave=True)
+        elif total is not None and state["bar"].total != total:
+            state["bar"].total = total
+        return state["bar"]
+
+    def _callback(step: int, total: int, loss_val: float) -> None:
+        bar = _ensure_bar(total)
+        bar.n = step
+        bar.set_postfix(loss=f"{loss_val:.4f}")
+        bar.refresh()
         if step >= total:
-            state["bar"].close()
+            bar.close()
 
     def _phase(name: str) -> None:
-        tqdm.write(f"[{desc}] {name}")
+        bar = _ensure_bar()
+        bar.set_description(f"{desc} ({name})")
+        bar.refresh()
 
     _callback.phase = _phase
     return _callback

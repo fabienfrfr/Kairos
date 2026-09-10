@@ -495,14 +495,14 @@ class _FakeBar:
 
 
 def test_make_progress_callback_updates_bar(monkeypatch):
-    created = []
-    monkeypatch.setattr("tqdm.auto.tqdm", lambda total, desc: created.append(_FakeBar(total, desc)) or created[-1])
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
 
     callback = make_progress_callback(desc="training")
     callback(1, 10, 0.5)
     callback(5, 10, 0.3)
 
-    bar = created[0]
+    bar = fake.created[0]
     assert bar.total == 10
     assert bar.n == 5
     assert bar.postfix == {"loss": "0.3000"}
@@ -510,14 +510,14 @@ def test_make_progress_callback_updates_bar(monkeypatch):
 
 
 def test_make_progress_callback_closes_bar_at_last_step(monkeypatch):
-    created = []
-    monkeypatch.setattr("tqdm.auto.tqdm", lambda total, desc: created.append(_FakeBar(total, desc)) or created[-1])
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
 
     callback = make_progress_callback()
     callback(1, 3, 1.0)
     callback(3, 3, 0.1)
 
-    assert created[0].closed
+    assert fake.created[0].closed
 
 
 class _FakeTqdmFactory:
@@ -534,14 +534,29 @@ class _FakeTqdmFactory:
         self.written.append(msg)
 
 
-def test_make_progress_callback_phase_writes_a_subtle_status_line(monkeypatch):
+def test_make_progress_callback_phase_updates_the_same_bar_description(monkeypatch):
     fake = _FakeTqdmFactory()
     monkeypatch.setattr("tqdm.auto.tqdm", fake)
 
     callback = make_progress_callback(desc="training")
     callback.phase("compiling")
 
-    assert fake.written == ["[training] compiling"]
+    assert len(fake.created) == 1  # one bar, updated in place - no new line printed
+    assert fake.created[0].desc == "training (compiling)"
+    assert fake.written == []
+
+
+def test_make_progress_callback_phase_before_any_step_then_step_reuses_same_bar(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    callback = make_progress_callback(desc="training")
+    callback.phase("build")
+    callback(1, 10, 0.5)
+
+    assert len(fake.created) == 1
+    assert fake.created[0].n == 1
+    assert fake.created[0].total == 10
 
 
 # ------------------------------------------------------------- detailed_memory_report
