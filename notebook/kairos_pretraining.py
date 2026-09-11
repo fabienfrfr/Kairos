@@ -582,10 +582,11 @@ def _(
     pipe,
 ):
     # walks whichever of the MAE / transition / diffusion stages are configured, proportionally
+    overfit_logs = None
     if OVERFIT_RUN:
         if mo.running_in_notebook():
             with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
-                pipe.overfit_test(
+                overfit_logs = pipe.overfit_test(
                     n_examples=OVERFIT_EXAMPLES,
                     steps=OVERFIT_STEPS,
                     log_every=OVERFIT_LOG_EVERY,
@@ -594,15 +595,17 @@ def _(
                     ),
                 )
         else:
-            pipe.overfit_test(
+            overfit_logs = pipe.overfit_test(
                 n_examples=OVERFIT_EXAMPLES,
                 steps=OVERFIT_STEPS,
                 log_every=OVERFIT_LOG_EVERY,
                 progress_callback=make_progress_callback(desc="overfit_test"),
             )
+        # printed again here (outside the progress-bar context) so it survives in the cell's own output
+        print(f"overfit_test done: loss {overfit_logs[0]['loss']:.4f} -> {overfit_logs[-1]['loss']:.4f}")
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
-    return
+    return (overfit_logs,)
 
 
 @app.cell
