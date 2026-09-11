@@ -258,6 +258,40 @@ def test_compute_masked_diffusion_losses_reweight_false_is_plain_ce(dense_model)
     assert plain.max() < 50  # sane CE range for a small vocab, no 1/p blowup
 
 
+def test_compute_masked_diffusion_losses_reweight_clip_bounds_extreme_weight(dense_model):
+    """A tiny p (~1e-3) gives a ~1000x /p weight uncapped; reweight_clip must bound it."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=1e-3, dtype=torch.float)
+
+    torch.manual_seed(0)
+    uncapped, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    torch.manual_seed(0)
+    capped, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True, reweight_clip=10.0)
+    torch.manual_seed(0)
+    plain, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+
+    assert uncapped.max() > capped.max()
+    assert torch.allclose(capped, plain * 10, atol=1e-4)
+
+
+def test_compute_masked_diffusion_losses_reweight_clip_none_matches_unbounded_default(dense_model):
+    """reweight_clip defaults to None: identical to the pre-clip unbounded behaviour."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=5, dtype=torch.float)
+
+    torch.manual_seed(0)
+    a, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    torch.manual_seed(0)
+    b, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True, reweight_clip=None)
+    assert torch.equal(a, b)
+
+
 def test_compute_masked_diffusion_losses_with_data_parallel_wrapper(dense_model):
     """Regression for wrapped (DataParallel/multi-GPU) models; .module resolution."""
     torch.manual_seed(0)
@@ -278,6 +312,7 @@ def test_trainer_mask_p_max_and_reweight_default_to_full_diffusion(dense_model):
     trainer = KairosDiffusionTrainer(model=dense_model)
     assert trainer.mask_p_max == 1.0
     assert trainer.mask_reweight is True
+    assert trainer.mask_reweight_clip == 3.0
 
 
 # ----------------------------------------------------------------- self-conditioning

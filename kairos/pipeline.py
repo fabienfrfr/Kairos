@@ -97,6 +97,7 @@ class TrainConfig:
     mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows as this shrinks
     mask_p_max: float = 1.0  # diffusion-stage (target) ceiling of p
     mask_reweight: bool = True  # diffusion-stage (target): divide CE by p
+    mask_reweight_clip: float | None = 3.0  # caps 1/p weight; bounds variance from rare low-p rows
     mask_mae_p_max: float = 0.3  # MAE-stage fixed-ish corruption ceiling (cheap/stable to optimize)
     mask_mae_reweight: bool = False  # MAE-stage: plain CE, no 1/p variance blowup
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
@@ -452,6 +453,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_eps = tc.mask_eps
         self.hf_trainer.mask_p_max = tc.mask_p_max
         self.hf_trainer.mask_reweight = tc.mask_reweight
+        self.hf_trainer.mask_reweight_clip = tc.mask_reweight_clip
         self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
         self.hf_trainer.self_conditioning_prob = tc.self_conditioning_prob
         self.writer = SummaryWriter(str(self.tb_dir)) if self.is_main_process else None
@@ -802,8 +804,9 @@ class KairosMultimodalPipeline:
         progress_callback=None,
         mask_p_max: float | None = None,
         mask_reweight: bool | None = None,
+        log_every: int = 0,
     ) -> list[dict]:
-        """Trains on a tiny subset to check memorization; walks the active curriculum stages."""
+        """Trains on a tiny subset to check memorization, walking the active curriculum stages; log_every>0 also prints the loss every N steps live."""
         self._require_built()
         if not self.is_main_process:
             return []
@@ -889,6 +892,8 @@ class KairosMultimodalPipeline:
 
                 self.global_step += 1
                 logs.append({"step": step, "loss": loss_val})
+                if log_every and (step % log_every == 0 or step == steps - 1):
+                    print(f"  step {step + 1}/{steps}  loss={loss_val:.4f}")
                 if progress_callback is not None:
                     progress_callback(self.global_step, steps, loss_val)
 

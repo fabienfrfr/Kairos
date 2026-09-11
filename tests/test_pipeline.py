@@ -89,6 +89,23 @@ def test_build_wires_mask_curriculum_config_to_trainer(tmp_path, model_config, t
     assert pipe.hf_trainer.mask_reweight is False
 
 
+def test_build_wires_mask_reweight_clip_to_trainer(tmp_path, model_config, text_examples):
+    """TrainConfig.mask_reweight_clip must reach the underlying trainer, default and override alike."""
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    default_pipe = KairosMultimodalPipeline(
+        model_config, data_config, TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run_default"))
+    )
+    default_pipe.build()
+    assert default_pipe.hf_trainer.mask_reweight_clip == 3.0
+
+    train_config = TrainConfig(
+        epochs=1, save_every=3, run_dir=str(tmp_path / "run_override"), mask_reweight_clip=None
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    assert pipe.hf_trainer.mask_reweight_clip is None
+
+
 def test_build_wires_self_conditioning_prob_to_trainer(tmp_path, model_config, text_examples):
     data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
     train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"), self_conditioning_prob=0.75)
@@ -2035,6 +2052,36 @@ def test_eval_every_steps_overrides_eval_every_epochs(tmp_path, model_config, te
     pipe.train(resume=False)
 
     assert [row["step"] for row in pipe.eval_log_rows] == list(range(1, pipe.global_step + 1))
+
+
+def test_overfit_test_log_every_prints_step_loss_lines(tmp_path, model_config, capsys):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.overfit_test(n_examples=16, steps=10, lr=1e-2, log_every=5)
+
+    out = capsys.readouterr().out
+    assert "step 1/10" in out  # first step always printed
+    assert "step 6/10" in out  # every log_every-th step printed (0-indexed step 5)
+    assert "step 10/10" in out  # final step always printed, even off the log_every cadence
+    assert "step 2/10" not in out
+    assert len(logs) == 10
+
+
+def test_overfit_test_log_every_zero_stays_silent(tmp_path, model_config, capsys):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    pipe.overfit_test(n_examples=16, steps=10, lr=1e-2)  # log_every defaults to 0
+
+    out = capsys.readouterr().out
+    assert "step " not in out  # only the final one-line summary should print, not per-step lines
 
 
 def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config):

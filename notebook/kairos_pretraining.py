@@ -567,12 +567,14 @@ def _():
     OVERFIT_RUN = True  # sanity-check the model can memorize before the real run
     OVERFIT_EXAMPLES = 16  # tiny subset, repeated each epoch
     OVERFIT_STEPS = 200  # steps on that subset; loss should crash toward 0
-    return OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS
+    OVERFIT_LOG_EVERY = max(1, OVERFIT_STEPS // 20)  # print the loss this often, in addition to the progress bar
+    return OVERFIT_EXAMPLES, OVERFIT_LOG_EVERY, OVERFIT_RUN, OVERFIT_STEPS
 
 
 @app.cell
 def _(
     OVERFIT_EXAMPLES,
+    OVERFIT_LOG_EVERY,
     OVERFIT_RUN,
     OVERFIT_STEPS,
     make_progress_callback,
@@ -586,6 +588,7 @@ def _(
                 pipe.overfit_test(
                     n_examples=OVERFIT_EXAMPLES,
                     steps=OVERFIT_STEPS,
+                    log_every=OVERFIT_LOG_EVERY,
                     progress_callback=lambda step, total, loss_val: _bar.update(
                         increment=1, subtitle=f"loss={loss_val:.4f}"
                     ),
@@ -594,6 +597,7 @@ def _(
             pipe.overfit_test(
                 n_examples=OVERFIT_EXAMPLES,
                 steps=OVERFIT_STEPS,
+                log_every=OVERFIT_LOG_EVERY,
                 progress_callback=make_progress_callback(desc="overfit_test"),
             )
     else:

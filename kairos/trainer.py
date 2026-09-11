@@ -41,6 +41,7 @@ def compute_masked_diffusion_losses(
     cache_params=None,
     reweight=True,
     self_conditioning_prob=0.0,
+    reweight_clip=None,
 ):
     """Noises ``x0`` on ``noise_mask``. With self_conditioning_prob>0, warms up with a no-grad
     pass and feeds its detached logits back in, matching generate()'s inference-time usage."""
@@ -88,6 +89,8 @@ def compute_masked_diffusion_losses(
     alpha = float(reweight)
     if alpha:
         weight = 1.0 + alpha * (1.0 / p[noise_mask] - 1.0)
+        if reweight_clip is not None:
+            weight = weight.clamp(max=reweight_clip)  # bounds gradient variance from rare low-p rows
         per_token_loss = per_token_loss * weight
     return per_token_loss, out.logits, out.octet_logits, octet_targets
 
@@ -137,6 +140,7 @@ class KairosDiffusionTrainer(Trainer):
     mask_eps: float = 1e-3  # floor of p ~ U(eps, p_max); CE/p makes rare low-p rows dominate
     mask_p_max: float = 1.0  # ceiling of p; 1.0 = full diffusion, cap for MAE-style corruption
     mask_reweight: bool = True  # divide CE by p; False for plain CE
+    mask_reweight_clip: float | None = 3.0  # caps 1/p weight; bounds variance from rare low-p rows
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
     # train-time self-conditioning rate; keep >0 so generate()'s usage isn't out-of-distribution.
     self_conditioning_prob: float = 0.5
@@ -167,6 +171,7 @@ class KairosDiffusionTrainer(Trainer):
             cache_params,
             reweight=self.mask_reweight,
             self_conditioning_prob=self.self_conditioning_prob,
+            reweight_clip=self.mask_reweight_clip,
         )
         loss = per_token_loss.mean()
         if octet_logits is not None and octet_targets is not None:
