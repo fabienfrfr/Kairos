@@ -7,6 +7,13 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import os
+    # auto: fused flex_attention on SM>=7.0 GPUs (T4); multi-GPU (T4x2) needs torchrun for DDP.
+    os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
+    return (os,)
+
+
+@app.cell
+def _(os):
     from huggingface_hub import login
 
     try:
@@ -16,7 +23,7 @@ def _():
         HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
 
     login(token=HF_TOKEN, add_to_git_credential=False)
-    return (os,)
+    return
 
 
 @app.cell
@@ -45,11 +52,8 @@ def _():
 
 
 @app.cell
-def _(os):
+def _():
     from pathlib import Path
-
-    # auto: fused flex_attention on SM>=7.0 GPUs (T4); multi-GPU (T4x2) needs torchrun for DDP.
-    os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
 
     import torch
     import pandas as pd
@@ -605,7 +609,7 @@ def _(
         print(f"overfit_test done: loss {overfit_logs[0]['loss']:.4f} -> {overfit_logs[-1]['loss']:.4f}")
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
-    return (overfit_logs,)
+    return
 
 
 @app.cell
