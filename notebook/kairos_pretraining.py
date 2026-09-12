@@ -61,7 +61,6 @@ def _():
     from kairos.modeling import KairosConfig
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
-    from kairos.utils import make_progress_callback
     from kairos.dataset import (
         diagnose_raw_control_balance,
         modality_counts,
@@ -86,7 +85,6 @@ def _():
         Path,
         TrainConfig,
         diagnose_raw_control_balance,
-        make_progress_callback,
         modality_counts,
         pd,
         preview_multimodal_examples,
@@ -581,32 +579,14 @@ def _(
     OVERFIT_LOG_EVERY,
     OVERFIT_RUN,
     OVERFIT_STEPS,
-    make_progress_callback,
     mo,
     pipe,
 ):
+    from kairos.runners import overfit_with_progress
+
     # walks whichever of the MAE / transition / diffusion stages are configured, proportionally
-    overfit_logs = None
     if OVERFIT_RUN:
-        if mo.running_in_notebook():
-            with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
-                overfit_logs = pipe.overfit_test(
-                    n_examples=OVERFIT_EXAMPLES,
-                    steps=OVERFIT_STEPS,
-                    log_every=OVERFIT_LOG_EVERY,
-                    progress_callback=lambda step, total, loss_val: _bar.update(
-                        increment=1, subtitle=f"loss={loss_val:.4f}"
-                    ),
-                )
-        else:
-            overfit_logs = pipe.overfit_test(
-                n_examples=OVERFIT_EXAMPLES,
-                steps=OVERFIT_STEPS,
-                log_every=OVERFIT_LOG_EVERY,
-                progress_callback=make_progress_callback(desc="overfit_test"),
-            )
-        # printed again here (outside the progress-bar context) so it survives in the cell's own output
-        print(f"overfit_test done: loss {overfit_logs[0]['loss']:.4f} -> {overfit_logs[-1]['loss']:.4f}")
+        overfit_with_progress(pipe, OVERFIT_EXAMPLES, OVERFIT_STEPS, OVERFIT_LOG_EVERY, mo=mo)
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
     return
@@ -620,39 +600,17 @@ def _():
 
 @app.cell
 def _(FORCE_RESTART, mo, pipe):
-    from kairos.notebook import train_with_progress
+    from kairos.runners import train_with_progress
 
     logs = train_with_progress(pipe, force_restart=FORCE_RESTART, mo=mo)
     return (logs,)
 
 
 @app.cell
-def _(eval_data_config, pipe, torch):
-    from kairos.dataset import KairosPretrainingDataset
-    from torch.utils.data import DataLoader
+def _(eval_data_config, pipe):
+    from kairos.runners import evaluate_and_log
 
-    if len(eval_data_config.multimodal_examples) == 0:
-        print("no eval examples - skipping")
-    else:
-        eval_dataset = KairosPretrainingDataset(
-            multimodal_examples=eval_data_config.multimodal_examples,
-            tokenizer=pipe.tokenizer,
-            max_len=eval_data_config.max_len,
-            stride=eval_data_config.stride,
-        )
-        eval_loader = DataLoader(eval_dataset, batch_size=eval_data_config.batch_size, shuffle=False)
-
-        pipe.model.eval()
-        losses = []
-        with torch.no_grad():
-            for batch in eval_loader:
-                batch = {k: v.to(pipe.device) for k, v in batch.items()}
-                with pipe._autocast():
-                    losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
-        pipe.model.train()
-        eval_loss = sum(losses) / len(losses)
-        pipe.writer.add_scalar("eval/loss", eval_loss, pipe.global_step)
-        print(f"eval loss: {eval_loss:.4f} on {len(eval_dataset)} samples")
+    eval_loss = evaluate_and_log(pipe, eval_data_config)
     return
 
 
@@ -694,40 +652,23 @@ def _(
     text_examples,
     tokenizer,
 ):
-    # diffusion generation via KairosDiffusionGenerationMixin (HF EntropyBoundSampler + adaptive)
-    _rows = [
-        ex
-        for ex in eval_examples
-        if ex.get("modality") == "text"
-        and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
-    ]
-    if len(_rows) < GEN_N_EXAMPLES:
-        _rows = [
-            ex
-            for ex in text_examples
-            if ex.get("modality") == "text"
-            and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
-        ]
-    _rows = _rows[:GEN_N_EXAMPLES]
+    from kairos.runners import run_generation_demo
 
-    for _i, _ex in enumerate(_rows, 1):
-        _ids = tokenizer.encode(_ex["text"], add_special_tokens=False)
-        _prompt = _ids[:GEN_PROMPT_TOKENS]
-        _full = pipe.generate(
-            _prompt,
-            max_new_tokens=GEN_MAX_NEW_TOKENS,
-            max_denoising_steps=GEN_DENOISING_STEPS,
-            entropy_bound=GEN_ENTROPY_BOUND,
-            t_min=GEN_T_MIN,
-            t_max=GEN_T_MAX,
-            seed=GEN_SEED + _i,
-        )
-        _gen = _full[GEN_PROMPT_TOKENS:]
-        _reference = _ids[GEN_PROMPT_TOKENS : GEN_PROMPT_TOKENS + GEN_MAX_NEW_TOKENS]
-        print(f"--- example {_i} ---")
-        print("prompt:    ", tokenizer.decode(_prompt, skip_special_tokens=True))
-        print("generated: ", tokenizer.decode(_gen, skip_special_tokens=True))
-        print("reference: ", tokenizer.decode(_reference, skip_special_tokens=True))
+    # diffusion generation via KairosDiffusionGenerationMixin (HF EntropyBoundSampler + adaptive)
+    generation_results = run_generation_demo(
+        pipe,
+        tokenizer,
+        eval_examples,
+        text_examples,
+        GEN_PROMPT_TOKENS,
+        GEN_MAX_NEW_TOKENS,
+        GEN_DENOISING_STEPS,
+        GEN_ENTROPY_BOUND,
+        GEN_T_MIN,
+        GEN_T_MAX,
+        GEN_SEED,
+        GEN_N_EXAMPLES,
+    )
     return
 
 
