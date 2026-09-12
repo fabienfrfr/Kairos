@@ -520,6 +520,17 @@ def test_make_progress_callback_closes_bar_at_last_step(monkeypatch):
     assert fake.created[0].closed
 
 
+def test_make_progress_callback_includes_stage_in_postfix_when_stage_fn_given(monkeypatch):
+    fake = _FakeTqdmFactory()
+    monkeypatch.setattr("tqdm.auto.tqdm", fake)
+
+    callback = make_progress_callback(stage_fn=lambda step: "mae" if step < 5 else "diffusion")
+    callback(1, 10, 0.5)
+    callback(7, 10, 0.3)
+
+    assert fake.created[0].postfix == {"loss": "0.3000", "stage": "diffusion"}
+
+
 class _FakeTqdmFactory:
     def __init__(self):
         self.created = []

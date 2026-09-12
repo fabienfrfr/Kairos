@@ -278,6 +278,7 @@ class KairosMultimodalPipeline:
         self.skipped_nonfinite_steps: int = 0
         self.nan_log: list[dict] = []
         self._last_nonfinite_batch: dict | None = None
+        self.curriculum_bounds: tuple[int, int] | None = None  # (mae_steps, transition_steps), set below
 
         # background disk writes for the frequent resumable checkpoint; see _save()/_flush_checkpoint_writes()
         self._ckpt_executor = ThreadPoolExecutor(max_workers=1)
@@ -285,7 +286,7 @@ class KairosMultimodalPipeline:
 
     @classmethod
     def from_configs(cls, model_config, data_config, train_config, eval_data_config=None, tokenizer=None):
-        """Constructs the pipeline from configs and calls build() once; the single shared entry point for CLI/notebook/scripts."""
+        """Constructs the pipeline from configs and builds it once: the shared entry point."""
         pipe = cls(model_config, data_config, train_config, eval_data_config, tokenizer)
         pipe.build()
         return pipe
@@ -835,6 +836,7 @@ class KairosMultimodalPipeline:
             # single fixed regime for the whole call, explicitly requested
             fixed_p_max = mask_p_max if mask_p_max is not None else saved_mask_p_max
             fixed_reweight = mask_reweight if mask_reweight is not None else saved_mask_reweight
+            self.curriculum_bounds = None
 
             def stage_at(_step: int) -> tuple[float, float]:
                 return fixed_p_max, float(fixed_reweight)
@@ -842,6 +844,7 @@ class KairosMultimodalPipeline:
             # same curriculum as train(), proportionally compressed into `steps` total steps
             mae_steps = round(steps * tc.mae_epochs / tc.epochs)
             transition_steps = round(steps * tc.transition_epochs / tc.epochs)
+            self.curriculum_bounds = (mae_steps, transition_steps)
 
             def stage_at(_step: int) -> tuple[float, float]:
                 return stage_mask_schedule(
@@ -977,6 +980,7 @@ class KairosMultimodalPipeline:
         total_steps = tc.epochs * len(self.loader)
         mae_steps = tc.mae_epochs * len(self.loader)
         transition_steps = tc.transition_epochs * len(self.loader)
+        self.curriculum_bounds = (mae_steps, transition_steps)
         # eval_every (steps) wins if set explicitly; else derive from eval_every_epochs
         if tc.eval_every > 0:
             eval_every_steps = tc.eval_every

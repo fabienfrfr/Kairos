@@ -23,6 +23,7 @@ class _FakePipe:
         self.skipped_nonfinite_steps = 0
         self.eval_log_rows = []
         self.best_eval_loss = None
+        self.curriculum_bounds = None
 
     def train(self, **kwargs):
         self.train_calls.append(kwargs)
@@ -138,9 +139,13 @@ def test_train_with_progress_returns_the_training_logs(tmp_path):
 class _FakeOverfitPipe:
     def __init__(self):
         self.overfit_calls = []
+        self.curriculum_bounds = None
 
     def overfit_test(self, **kwargs):
         self.overfit_calls.append(kwargs)
+        if kwargs.get("progress_callback") is not None:
+            kwargs["progress_callback"](1, kwargs["steps"], 1.0)
+            kwargs["progress_callback"](2, kwargs["steps"], 0.1)
         return [{"loss": 1.0}, {"loss": 0.1}]
 
 
@@ -167,6 +172,26 @@ def test_overfit_with_progress_returns_the_logs():
     logs = overfit_with_progress(pipe, n_examples=16, steps=200, log_every=10, mo=None)
 
     assert logs == [{"loss": 1.0}, {"loss": 0.1}]
+
+
+def test_overfit_with_progress_announces_curriculum_stage_changes(capsys):
+    pipe = _FakeOverfitPipe()
+    pipe.curriculum_bounds = (1, 0)  # step 0 is 'mae', step >= 1 is 'diffusion' (no transition)
+
+    overfit_with_progress(pipe, n_examples=16, steps=200, log_every=10, mo=None)
+
+    out = capsys.readouterr().out
+    assert "entering 'mae' stage" not in out  # first callback call is at step=1, already past mae_steps
+    assert "entering 'diffusion' stage" in out
+
+
+def test_overfit_with_progress_reports_fixed_regime_when_no_curriculum_bounds(capsys):
+    pipe = _FakeOverfitPipe()
+    pipe.curriculum_bounds = None
+
+    overfit_with_progress(pipe, n_examples=16, steps=200, log_every=10, mo=None)
+
+    assert "entering 'fixed regime' stage" in capsys.readouterr().out
 
 
 class _FakeEvalDataConfig:

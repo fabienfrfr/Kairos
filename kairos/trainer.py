@@ -133,6 +133,15 @@ def stage_mask_schedule(
     return p_max, reweight
 
 
+def stage_name_at(global_step: int, mae_steps: int, transition_steps: int) -> str:
+    """Names the curriculum stage `stage_mask_schedule` is in at `global_step`: mae/transition/diffusion."""
+    if global_step < mae_steps:
+        return "mae"
+    if global_step < mae_steps + transition_steps:
+        return "transition"
+    return "diffusion"
+
+
 class KairosDiffusionTrainer(Trainer):
     """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and."""
 

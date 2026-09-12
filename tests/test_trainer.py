@@ -12,6 +12,7 @@ from kairos.trainer import (
     compute_masked_diffusion_losses,
     make_diffusion_mask,
     stage_mask_schedule,
+    stage_name_at,
     update_moe_bias,
 )
 
@@ -449,6 +450,15 @@ def test_stage_mask_schedule_flat_at_target_during_diffusion_phase():
     p_max, reweight = stage_mask_schedule(10_000, 100, 50, 0.3, False, 1.0, True)
     assert p_max == pytest.approx(1.0)
     assert reweight == pytest.approx(1.0)
+
+
+def test_stage_name_at_matches_stage_mask_schedule_boundaries():
+    assert stage_name_at(0, mae_steps=100, transition_steps=50) == "mae"
+    assert stage_name_at(99, mae_steps=100, transition_steps=50) == "mae"
+    assert stage_name_at(100, mae_steps=100, transition_steps=50) == "transition"
+    assert stage_name_at(149, mae_steps=100, transition_steps=50) == "transition"
+    assert stage_name_at(150, mae_steps=100, transition_steps=50) == "diffusion"
+    assert stage_name_at(10_000, mae_steps=100, transition_steps=50) == "diffusion"
 
 
 def test_stage_mask_schedule_zero_transition_jumps_straight_to_target():

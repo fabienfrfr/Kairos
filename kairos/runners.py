@@ -6,39 +6,60 @@ import torch
 from torch.utils.data import DataLoader
 
 from .dataset import KairosPretrainingDataset
+from .trainer import stage_name_at
 from .utils import make_progress_callback
 
 
-def train_with_progress(pipe, force_restart: bool = False, mo=None) -> list[dict]:
-    """Runs pipe.train() with resume-aware logging and a live progress display.
+def _uses_marimo_bar(mo) -> bool:
+    return mo is not None and mo.running_in_notebook()
 
-    Pass the marimo module as `mo` to get a native marimo progress bar when running
-    inside marimo's own runtime; otherwise (or if mo.running_in_notebook() is False,
-    e.g. a plain Jupyter/Kaggle kernel), a tqdm bar via make_progress_callback is used.
-    """
+
+def _print_progress_mode(desc: str, mo) -> None:
+    mode = "marimo progress bar" if _uses_marimo_bar(mo) else "tqdm (mo not passed or not in marimo runtime)"
+    print(f"{desc}: using {mode}")
+
+
+def _stage_watcher(pipe):
+    """Returns stage_at(step) -> current curriculum stage; prints once whenever it changes."""
+    seen = {"stage": None}
+
+    def stage_at(step: int) -> str:
+        bounds = pipe.curriculum_bounds
+        stage = stage_name_at(step, *bounds) if bounds is not None else "fixed regime"
+        if stage != seen["stage"]:
+            print(f"step {step}: entering '{stage}' stage")
+            seen["stage"] = stage
+        return stage
+
+    return stage_at
+
+
+def train_with_progress(pipe, force_restart: bool = False, mo=None) -> list[dict]:
+    """Runs pipe.train() with resume-aware logging; a marimo bar if `mo` is given, else tqdm."""
     resumed = not force_restart and (pipe.ckpt_dir / "last.pt").exists()
     if resumed:
         print(f"found last.pt in {pipe.ckpt_dir} - resuming")
     elif force_restart:
         print("FORCE_RESTART is True - ignoring any existing checkpoint")
-    if mo is not None and mo.running_in_notebook():
+    _print_progress_mode("train", mo)
+    if _uses_marimo_bar(mo):
         logs = _train_with_marimo_bar(pipe, force_restart, mo)
     else:
-        cb = make_progress_callback()
+        cb = make_progress_callback(stage_fn=_stage_watcher(pipe))
         logs = pipe.train(progress_callback=cb, phase_callback=cb.phase, resume=not force_restart)
     _print_training_summary(pipe, logs)
     return logs
 
 
 def _train_with_marimo_bar(pipe, force_restart: bool, mo) -> list[dict]:
-    # on multi-GPU, pipe.train itself spawns a torchrun job (flex + memory gate per rank)
-    # and replays its steps into the progress_callback; results come back into this pipe.
+    # on multi-GPU, pipe.train spawns a torchrun job and replays its steps into this callback
     total_steps = pipe.train_config.epochs * len(pipe.loader)
+    stage_at = _stage_watcher(pipe)
     with mo.status.progress_bar(total=total_steps, title="training") as bar:
         state = {"last_step": 0}
 
         def _on_step(step, total, loss_val):
-            bar.update(increment=step - state["last_step"], subtitle=f"loss={loss_val:.4f}")
+            bar.update(increment=step - state["last_step"], subtitle=f"loss={loss_val:.4f} stage={stage_at(step)}")
             state["last_step"] = step
 
         def _on_phase(name):
@@ -57,18 +78,20 @@ def _print_training_summary(pipe, logs: list[dict]) -> None:
 
 def overfit_with_progress(pipe, n_examples: int, steps: int, log_every: int, mo=None) -> list[dict] | None:
     """Runs pipe.overfit_test() with a marimo bar when available, else a plain call."""
-    if mo is not None and mo.running_in_notebook():
+    _print_progress_mode("overfit_test", mo)
+    stage_at = _stage_watcher(pipe)
+    if _uses_marimo_bar(mo):
         with mo.status.progress_bar(total=steps, title="overfit_test") as bar:
             logs = pipe.overfit_test(
                 n_examples=n_examples,
                 steps=steps,
                 log_every=log_every,
                 progress_callback=lambda step, total, loss_val: bar.update(
-                    increment=1, subtitle=f"loss={loss_val:.4f}"
+                    increment=1, subtitle=f"loss={loss_val:.4f} stage={stage_at(step)}"
                 ),
             )
     else:
-        cb = make_progress_callback(desc="overfit_test")
+        cb = make_progress_callback(desc="overfit_test", stage_fn=stage_at)
         logs = pipe.overfit_test(n_examples=n_examples, steps=steps, log_every=log_every, progress_callback=cb)
     print(f"overfit_test done: loss {logs[0]['loss']:.4f} -> {logs[-1]['loss']:.4f}")
     return logs

@@ -1,4 +1,4 @@
-"""Diagnostic checks for the pipeline: currently a MoE-bias A/B regime check; add more here as needed."""
+"""Diagnostic checks for the pipeline: currently a MoE-bias A/B regime check."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def run(
     seed: int = 0,
     num_local_experts: int = 7,
 ) -> tuple[list[float], list[float]]:
-    """Runs a tiny MoE overfit_test under `regime` and returns (per-step losses, per-expert usage counts)."""
+    """Runs a tiny MoE overfit_test under `regime`; returns (per-step losses, per-expert usage)."""
     torch.manual_seed(seed)
     model_config = KairosConfig(
         d_model=64, n_heads=4, n_layers=4, use_moe=True, num_local_experts=num_local_experts, num_experts_per_tok=1
