@@ -52,6 +52,14 @@ fast-attn = [
     "flash-linear-attention[cuda]>=0.5.1",
     "causal-conv1d>=1.4.0",
 ]
+# `pip install -e ".[cli]"` — everything the `kairos` command-line entry point needs
+cli = [
+    "typer>=0.15",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+kairos = "kairos.cli:app"
 
 
 

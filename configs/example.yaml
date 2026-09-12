@@ -1,0 +1,26 @@
+# kairos train configs/example.yaml
+# kairos overfit configs/example.yaml --steps 200
+# kairos evaluate configs/example.yaml
+# kairos generate configs/example.yaml --n-examples 3
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 6
+
+data:
+  multimodal_path: data/train.pt
+  max_len: 1024
+  batch_size: 8
+
+train:
+  lr: 3.0e-4
+  run_dir: checkpoints/kairos-multimodal/run_01
+  mae_epochs: 1
+  transition_epochs: 1
+  diffusion_epochs: 1
+
+# optional: omit this section to skip evaluate/eval-at-start
+eval_data:
+  multimodal_path: data/eval.pt
+  max_len: 1024
+  batch_size: 8

@@ -226,7 +226,6 @@ class KairosMultimodalPipeline:
         self.eval_data_config = eval_data_config
         self.train_config = train_config
         self.tokenizer = tokenizer or KairosTokenizer()
-
         # build() empties data_config in place, so snapshot pre-build configs for a DDP-launched job.
         self._ddp_snapshot = (
             copy.deepcopy(model_config),
@@ -283,6 +282,13 @@ class KairosMultimodalPipeline:
         # background disk writes for the frequent resumable checkpoint; see _save()/_flush_checkpoint_writes()
         self._ckpt_executor = ThreadPoolExecutor(max_workers=1)
         self._pending_ckpt_futures: list[Future] = []
+
+    @classmethod
+    def from_configs(cls, model_config, data_config, train_config, eval_data_config=None, tokenizer=None):
+        """Constructs the pipeline from configs and calls build() once; the single shared entry point for CLI/notebook/scripts."""
+        pipe = cls(model_config, data_config, train_config, eval_data_config, tokenizer)
+        pipe.build()
+        return pipe
 
     @property
     def is_main_process(self) -> bool:

@@ -462,10 +462,9 @@ def _(
 ):
     from kairos.utils import count_active_parameters
 
-    pipe = KairosMultimodalPipeline(
+    pipe = KairosMultimodalPipeline.from_configs(
         model_config, data_config, train_config, eval_data_config=eval_data_config, tokenizer=tokenizer
     )
-    pipe.build()
 
     total_params = sum(p.numel() for p in pipe.model.parameters())
     active_params = count_active_parameters(

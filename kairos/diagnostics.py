@@ -1,14 +1,15 @@
-"""A/B check per regime: does update_moe_bias help a tiny 7-expert top-1 MoE overfit-test converge?"""
+"""Diagnostic checks for the pipeline: currently a MoE-bias A/B regime check; add more here as needed."""
+
+from __future__ import annotations
 
 import math
-import sys
 
 import torch
 
-from kairos.modeling import KairosConfig, KairosTopkRouter
-from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
+from .modeling import KairosConfig, KairosTopkRouter
+from .pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 
-texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+DEFAULT_TEXTS = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
 
 REGIMES = {
     "mae": {"mask_p_max": 0.3, "mask_reweight": False},  # matches notebook TRAIN_MAE_P_MAX/TRAIN_MAE_REWEIGHT
@@ -23,15 +24,17 @@ def run(
     regime: str,
     bias_update_rate: float,
     mask_eps: float = 1e-3,
-    mask_reweight_clip=10.0,
+    mask_reweight_clip: float | None = 10.0,
     steps: int = 200,
     seed: int = 0,
+    num_local_experts: int = 7,
 ) -> tuple[list[float], list[float]]:
+    """Runs a tiny MoE overfit_test under `regime` and returns (per-step losses, per-expert usage counts)."""
     torch.manual_seed(seed)
     model_config = KairosConfig(
-        d_model=64, n_heads=4, n_layers=4, use_moe=True, num_local_experts=7, num_experts_per_tok=1
+        d_model=64, n_heads=4, n_layers=4, use_moe=True, num_local_experts=num_local_experts, num_experts_per_tok=1
     )
-    data_config = DataConfig(text_examples=texts, max_len=128, batch_size=4)
+    data_config = DataConfig(text_examples=DEFAULT_TEXTS, max_len=128, batch_size=4)
     train_config = TrainConfig(
         save_every=10_000,
         run_dir="/tmp/ab_run",
@@ -39,10 +42,9 @@ def run(
         mask_eps=mask_eps,
         mask_reweight_clip=mask_reweight_clip,
     )
-    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
-    pipe.build()
+    pipe = KairosMultimodalPipeline.from_configs(model_config, data_config, train_config)
 
-    usage_totals = torch.zeros(7)
+    usage_totals = torch.zeros(num_local_experts)
     routers = [m for m in pipe.model.modules() if isinstance(m, KairosTopkRouter)]
 
     def _record(_module, _inputs, output):
@@ -54,7 +56,7 @@ def run(
     for r in routers:
         r.register_forward_hook(_record)
 
-    losses = []
+    losses: list[float] = []
     pipe.overfit_test(
         n_examples=16,
         steps=steps,
@@ -65,17 +67,14 @@ def run(
     return losses, usage_totals.tolist()
 
 
-if __name__ == "__main__":
-    regime = sys.argv[1]
-    rate = float(sys.argv[2])
-    eps = float(sys.argv[3]) if len(sys.argv) > 3 else 1e-3
-    clip = float(sys.argv[4]) if len(sys.argv) > 4 else 10.0
-    n_steps = int(sys.argv[5]) if len(sys.argv) > 5 else 200
-    losses, usage = run(regime, rate, mask_eps=eps, mask_reweight_clip=clip, steps=n_steps)
-    chunk = max(1, n_steps // 8)
-    for start in range(0, n_steps, chunk):
+def format_report(losses: list[float], usage: list[float], n_chunks: int = 8) -> str:
+    """Renders the same windowed-average report the original script printed to stdout."""
+    chunk = max(1, len(losses) // n_chunks)
+    lines = []
+    for start in range(0, len(losses), chunk):
         window = losses[start : start + chunk]
-        print(f"steps {start}-{start + len(window)}: moyenne={sum(window) / len(window):.4f}")
-    print(f"loss finale: {losses[-1]:.4f}")
-    print(f"tous finis: {all(math.isfinite(x) for x in losses)}")
-    print(f"usage par expert (cumulé, tous layers): {usage}")
+        lines.append(f"steps {start}-{start + len(window)}: moyenne={sum(window) / len(window):.4f}")
+    lines.append(f"loss finale: {losses[-1]:.4f}")
+    lines.append(f"tous finis: {all(math.isfinite(x) for x in losses)}")
+    lines.append(f"usage par expert (cumulé, tous layers): {usage}")
+    return "\n".join(lines)
