@@ -167,6 +167,43 @@ def test_diffusion_block_vanilla_attn_type_runs_and_shapes_match():
     assert out.shape == (2, 8, 32)
 
 
+def test_diffusion_block_delta_only_attn_type_runs_and_shapes_match():
+    from kairos.attentions import KairosDeltaOnlyAttention
+
+    config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, attn_type="delta_only")
+    block = DiffusionBlock(config, 0)
+
+    assert isinstance(block.attn, KairosDeltaOnlyAttention)
+    out = block(torch.randn(2, 8, 32))
+    assert out.shape == (2, 8, 32)
+
+
+def test_kairos_config_rejects_unknown_attn_type_includes_delta_only_in_message():
+    with pytest.raises(ValueError, match="delta_only"):
+        KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, attn_type="nope")
+
+
+def test_liz2_share_qkv_defaults_to_shared_projections():
+    config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, attn_type="liz2")
+    block = DiffusionBlock(config, 0)
+
+    assert block.attn.share_qkv is True
+    assert block.attn.delta.q_proj is block.attn.swa.q_proj
+    assert block.attn.delta.out_proj is block.attn.swa.out
+
+
+def test_liz2_share_qkv_false_gives_independent_projections():
+    config = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, attn_type="liz2", liz2_share_qkv=False
+    )
+    block = DiffusionBlock(config, 0)
+
+    assert block.attn.share_qkv is False
+    assert block.attn.delta.q_proj is not block.attn.swa.q_proj
+    out = block(torch.randn(2, 8, 32))
+    assert out.shape == (2, 8, 32)
+
+
 def test_backbone(config):
     model = KairosDiffusionBackbone(config)
     x = torch.randn(2, 8, 32)

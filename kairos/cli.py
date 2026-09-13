@@ -76,6 +76,7 @@ def overfit(
     mask_reweight: Annotated[
         bool | None, typer.Option("--mask-reweight/--no-mask-reweight", help="Fix mask_reweight, paired with p_max.")
     ] = None,
+    seed: Annotated[int, typer.Option(help="RNG seed for init, masking and step order.")] = 0,
     set_: OverrideOpt = None,
 ) -> None:
     """Runs pipe.overfit_test() to sanity-check that the model can memorize a tiny subset."""
@@ -88,6 +89,7 @@ def overfit(
         mo=None,
         mask_p_max=mask_p_max,
         mask_reweight=mask_reweight,
+        seed=seed,
     )
 
 

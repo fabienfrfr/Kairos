@@ -595,11 +595,13 @@ class KairosLiZAttention2(nn.Module):
         self.hidden_size = config.hidden_size
         self.swa = KairosAttention(config, layer_idx)
         self.delta = KairosGatedDeltaNet(config, layer_idx)
-        del self.delta.q_proj, self.delta.k_proj, self.delta.v_proj, self.delta.out_proj
-        self.delta.q_proj = self.swa.q_proj
-        self.delta.k_proj = self.swa.k_proj
-        self.delta.v_proj = self.swa.v_proj
-        self.delta.out_proj = self.swa.out
+        self.share_qkv = getattr(config, "liz2_share_qkv", True)
+        if self.share_qkv:
+            del self.delta.q_proj, self.delta.k_proj, self.delta.v_proj, self.delta.out_proj
+            self.delta.q_proj = self.swa.q_proj
+            self.delta.k_proj = self.swa.k_proj
+            self.delta.v_proj = self.swa.v_proj
+            self.delta.out_proj = self.swa.out
         self.norm = KairosNorm(2 * self.hidden_size)
         self.out_proj = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
 
@@ -626,3 +628,23 @@ class KairosLiZAttention2(nn.Module):
         out = self.norm(out)
         out = self.out_proj(out)
         return out
+
+
+class KairosDeltaOnlyAttention(nn.Module):
+    """DeltaNet branch of KairosLiZAttention2 alone, for ablating the SWA branch's contribution."""
+
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.delta = KairosGatedDeltaNet(config, layer_idx)
+
+    def forward(
+        self,
+        x,
+        position_embeddings=None,
+        cache_params=None,
+        attention_mask=None,
+        position_ids=None,
+        attn_block_mask=None,
+        full_seq_len=None,
+    ):
+        return self.delta(x, cache_params=cache_params, attention_mask=attention_mask, full_seq_len=full_seq_len)

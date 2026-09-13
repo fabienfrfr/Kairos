@@ -13,6 +13,7 @@ from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 from .attentions import (
     ATTN_IMPL,
     KairosAttention,
+    KairosDeltaOnlyAttention,
     KairosLiZAttention2,
     KairosNorm,
     KairosRotaryEmbedding,
@@ -91,8 +92,9 @@ class KairosConfig(PretrainedConfig):
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
         # "liz2" (default, real architecture) or "vanilla" (plain SWA, no DeltaNet); ablation-only
         self.attn_type = kwargs.get("attn_type", "liz2")
-        if self.attn_type not in ("liz2", "vanilla"):
-            raise ValueError(f"attn_type must be 'liz2' or 'vanilla', got {self.attn_type!r}")
+        if self.attn_type not in ("liz2", "vanilla", "delta_only"):
+            raise ValueError(f"attn_type must be 'liz2', 'vanilla' or 'delta_only', got {self.attn_type!r}")
+        self.liz2_share_qkv = kwargs.get("liz2_share_qkv", True)  # liz2 only; False = separate QKV/O
 
         self.time_step_min = 0.001
         self.time_step_max = 0.1
@@ -293,12 +295,15 @@ class KairosMoE(DeepseekV3MoE):
         self.gate.weight.data.normal_(mean=0.0, std=std)
 
 
+ATTN_TYPES = {"vanilla": KairosAttention, "liz2": KairosLiZAttention2, "delta_only": KairosDeltaOnlyAttention}
+
+
 class DiffusionBlock(nn.Module):
     def __init__(self, config, layer_idx, use_moe=False):
         super().__init__()
         self.norm1 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm2 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
-        attn_cls = KairosAttention if getattr(config, "attn_type", "liz2") == "vanilla" else KairosLiZAttention2
+        attn_cls = ATTN_TYPES.get(getattr(config, "attn_type", "liz2"), KairosLiZAttention2)
         self.attn = attn_cls(config, layer_idx)
         self.ffn = KairosMoE(config) if use_moe else KairosFFN(config)
 
