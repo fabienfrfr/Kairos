@@ -339,6 +339,7 @@ class KairosAttention(nn.Module):
         attention_mask=None,
         position_ids=None,
         attn_block_mask=None,
+        full_seq_len=None,  # unused; accepted for call-compatibility with KairosLiZAttention2
     ):
         B, L, _ = x.shape
         if cache_params is not None and self.layer_idx is not None:

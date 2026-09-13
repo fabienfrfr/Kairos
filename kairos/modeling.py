@@ -12,6 +12,7 @@ from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 
 from .attentions import (
     ATTN_IMPL,
+    KairosAttention,
     KairosLiZAttention2,
     KairosNorm,
     KairosRotaryEmbedding,
@@ -65,6 +66,8 @@ class KairosConfig(PretrainedConfig):
         self.codec_mode = kwargs.get("codec_mode", "conv")
         # rank of the conv-mode codec's mixer bottleneck; None -> PyramidalCodec default
         self.codec_mixer_rank = kwargs.get("codec_mixer_rank", None)
+        # ratio-based, scales with d_model; None -> 1 (depthwise, current default)
+        self.codec_conv_channels_per_group = kwargs.get("codec_conv_channels_per_group", None)
         self.predict_octet_family = kwargs.get("predict_octet_family", True)
         self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
@@ -86,6 +89,10 @@ class KairosConfig(PretrainedConfig):
         self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4)
         self.hidden_act = kwargs.get("hidden_act", "silu")
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        # "liz2" (default, real architecture) or "vanilla" (plain SWA, no DeltaNet); ablation-only
+        self.attn_type = kwargs.get("attn_type", "liz2")
+        if self.attn_type not in ("liz2", "vanilla"):
+            raise ValueError(f"attn_type must be 'liz2' or 'vanilla', got {self.attn_type!r}")
 
         self.time_step_min = 0.001
         self.time_step_max = 0.1
@@ -291,7 +298,8 @@ class DiffusionBlock(nn.Module):
         super().__init__()
         self.norm1 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm2 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = KairosLiZAttention2(config, layer_idx)
+        attn_cls = KairosAttention if getattr(config, "attn_type", "liz2") == "vanilla" else KairosLiZAttention2
+        self.attn = attn_cls(config, layer_idx)
         self.ffn = KairosMoE(config) if use_moe else KairosFFN(config)
 
     def forward(
@@ -479,7 +487,16 @@ class CodecOutput:
 class PyramidalCodec(nn.Module):
     """Multi-scale encode/decode: mode='patch' (nn.Linear per scale) or 'conv' (cuDNN, faster)."""
 
-    def __init__(self, d_model, stride=5, num_scales=4, mode="patch", norm_eps=1e-6, mixer_rank=None):
+    def __init__(
+        self,
+        d_model,
+        stride=5,
+        num_scales=4,
+        mode="patch",
+        norm_eps=1e-6,
+        mixer_rank=None,
+        conv_channels_per_group=None,
+    ):
         super().__init__()
         assert mode in ("patch", "conv"), f"mode must be 'patch' or 'conv', got {mode!r}"
         self.stride = stride
@@ -488,6 +505,12 @@ class PyramidalCodec(nn.Module):
         self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
         # bottleneck mixer: O(2*r*d) instead of a dense 1x1 conv's O(d^2), same full mixing
         self.mixer_rank = mixer_rank if mixer_rank is not None else max(8, d_model // 4)
+        # channels mixed per conv group: 1 (default) = depthwise/cheapest; d_model = fully dense
+        self.conv_channels_per_group = conv_channels_per_group if conv_channels_per_group is not None else 1
+        assert d_model % self.conv_channels_per_group == 0, (
+            f"d_model ({d_model}) must be divisible by conv_channels_per_group"
+        )
+        self.conv_groups = d_model // self.conv_channels_per_group
 
         if mode == "patch":
             self._init_patch(d_model)
@@ -512,7 +535,7 @@ class PyramidalCodec(nn.Module):
         )
 
     def _init_conv(self, d_model):
-        """Depthwise conv encoder/decoder; one shared pre-mixer feeds context to every scale."""
+        """Depthwise (or grouped) conv encoder/decoder; one shared pre-mixer feeds every scale."""
         self.pre_mixer = self._make_bottleneck_mixer(d_model)
         self.encoders = nn.ModuleList()
         self.mixers = nn.ModuleList()
@@ -520,12 +543,14 @@ class PyramidalCodec(nn.Module):
         self.decode_mixers = nn.ModuleList()
         for patch in self.patch_sizes:
             self.encoders.append(
-                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
+                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch, groups=self.conv_groups, bias=True)
             )
             self.mixers.append(self._make_bottleneck_mixer(d_model))
-            # depthwise transpose conv: O(patch*d_model), not O(patch*d_model^2) for a dense decoder
+            # grouped transpose conv: O(patch*d^2/groups); groups=d_model (default) is depthwise-cheap
             self.decoders.append(
-                nn.ConvTranspose1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
+                nn.ConvTranspose1d(
+                    d_model, d_model, kernel_size=patch, stride=patch, groups=self.conv_groups, bias=True
+                )
             )
             self.decode_mixers.append(self._make_bottleneck_mixer(d_model))
 
@@ -610,6 +635,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
             mode=config.codec_mode,
             norm_eps=config.rms_norm_eps,
             mixer_rank=getattr(config, "codec_mixer_rank", None),
+            conv_channels_per_group=getattr(config, "codec_conv_channels_per_group", None),
         )
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:

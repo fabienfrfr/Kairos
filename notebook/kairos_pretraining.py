@@ -226,9 +226,11 @@ def _():
     CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
     CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     CFG_SHARE_BACKBONES = True  # share one backbone across all scales (saves ~75% params)
-    CFG_CODEC_MODE = "patch"  # "conv" (fast, cuDNN) or "patch" (nn.Linear per scale)
+    CFG_CODEC_MODE = "conv"  # "conv" (fast, cuDNN) or "patch" (nn.Linear per scale)
+    CFG_CODEC_CONV_CHANNELS_PER_GROUP = 8  # 1=depthwise/cheapest (default); d_model=dense/patch-like
     return (
         CFG_ATTNRES_BLOCK,
+        CFG_CODEC_CONV_CHANNELS_PER_GROUP,
         CFG_CODEC_MODE,
         CFG_D_MODEL,
         CFG_EXPERTS,
@@ -276,6 +278,7 @@ def _():
 @app.cell
 def _(
     CFG_ATTNRES_BLOCK,
+    CFG_CODEC_CONV_CHANNELS_PER_GROUP,
     CFG_CODEC_MODE,
     CFG_D_MODEL,
     CFG_EXPERTS,
@@ -314,9 +317,10 @@ def _(
         use_memory_gate=CFG_USE_MEMORY_BANK,
         share_backbones=CFG_SHARE_BACKBONES,
         codec_mode=CFG_CODEC_MODE,
+        codec_conv_channels_per_group=CFG_CODEC_CONV_CHANNELS_PER_GROUP,
     )
     print(
-        f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE}"
+        f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE} (channels_per_group={CFG_CODEC_CONV_CHANNELS_PER_GROUP})"
     )
     return (model_config,)
 

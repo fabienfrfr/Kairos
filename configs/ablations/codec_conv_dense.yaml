@@ -1,0 +1,41 @@
+# tiny-scale ablation config; see docs/experiments/ablations_codec_attention.md
+model:
+  d_model: 64
+  n_heads: 4
+  n_layers: 1
+  use_moe: false
+  attn_type: vanilla
+  codec_mode: conv
+  codec_conv_channels_per_group: 64
+data:
+  text_examples:
+  - &id001
+    modality: text
+    text: 'the quick brown fox jumps over the lazy dog the quick brown fox jumps over
+      the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox
+      jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick
+      brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog
+      the quick brown fox jumps over the lazy dog the quick brown fox jumps over the
+      lazy dog the quick brown fox jumps over the lazy dog '
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  - *id001
+  max_len: 128
+  batch_size: 4
+train:
+  save_every: 10000
+  run_dir: /tmp/ablations/codec_conv_dense
+  mask_eps: 0.001
+  mask_reweight_clip: 10.0

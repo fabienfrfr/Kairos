@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -76,8 +78,23 @@ def _print_training_summary(pipe, logs: list[dict]) -> None:
     print(f"checkpoints: {pipe.ckpt_dir}")
 
 
-def overfit_with_progress(pipe, n_examples: int, steps: int, log_every: int, mo=None) -> list[dict] | None:
+_overfit_call_count = 0  # persists across marimo cell reruns in the same kernel; helps spot duplicate runs
+
+
+def overfit_with_progress(
+    pipe,
+    n_examples: int,
+    steps: int,
+    log_every: int,
+    mo=None,
+    mask_p_max: float | None = None,
+    mask_reweight: bool | None = None,
+) -> list[dict] | None:
     """Runs pipe.overfit_test() with a marimo bar when available, else a plain call."""
+    global _overfit_call_count
+    _overfit_call_count += 1
+    call_id = _overfit_call_count
+    print(f"[overfit_test call #{call_id}] starting at {time.strftime('%H:%M:%S')}")
     _print_progress_mode("overfit_test", mo)
     stage_at = _stage_watcher(pipe)
     if _uses_marimo_bar(mo):
@@ -86,14 +103,24 @@ def overfit_with_progress(pipe, n_examples: int, steps: int, log_every: int, mo=
                 n_examples=n_examples,
                 steps=steps,
                 log_every=log_every,
+                mask_p_max=mask_p_max,
+                mask_reweight=mask_reweight,
                 progress_callback=lambda step, total, loss_val: bar.update(
                     increment=1, subtitle=f"loss={loss_val:.4f} stage={stage_at(step)}"
                 ),
             )
     else:
         cb = make_progress_callback(desc="overfit_test", stage_fn=stage_at)
-        logs = pipe.overfit_test(n_examples=n_examples, steps=steps, log_every=log_every, progress_callback=cb)
+        logs = pipe.overfit_test(
+            n_examples=n_examples,
+            steps=steps,
+            log_every=log_every,
+            mask_p_max=mask_p_max,
+            mask_reweight=mask_reweight,
+            progress_callback=cb,
+        )
     print(f"overfit_test done: loss {logs[0]['loss']:.4f} -> {logs[-1]['loss']:.4f}")
+    print(f"[overfit_test call #{call_id}] finished at {time.strftime('%H:%M:%S')}")
     return logs
 
 

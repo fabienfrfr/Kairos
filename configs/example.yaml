@@ -6,6 +6,8 @@ model:
   d_model: 256
   n_heads: 8
   n_layers: 6
+  # attn_type: vanilla  # ablation only: plain SWA instead of the default liz2 hybrid; NOT the default
+  # codec_conv_channels_per_group: 8  # ablation: more expressive conv codec; ratio to d_model, NOT the default
 
 data:
   multimodal_path: data/train.pt

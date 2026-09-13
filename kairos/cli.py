@@ -72,11 +72,23 @@ def overfit(
     n_examples: Annotated[int, typer.Option(help="Number of examples in the tiny memorization subset.")] = 16,
     steps: Annotated[int, typer.Option(help="Number of optimizer steps to run.")] = 200,
     log_every: Annotated[int, typer.Option(help="Print the running loss every N steps (0 disables).")] = 20,
+    mask_p_max: Annotated[float | None, typer.Option(help="Fix p_max; skips the MAE/transition curriculum.")] = None,
+    mask_reweight: Annotated[
+        bool | None, typer.Option("--mask-reweight/--no-mask-reweight", help="Fix mask_reweight, paired with p_max.")
+    ] = None,
     set_: OverrideOpt = None,
 ) -> None:
     """Runs pipe.overfit_test() to sanity-check that the model can memorize a tiny subset."""
     pipe = build_pipeline(config, set_ or [])
-    overfit_with_progress(pipe, n_examples=n_examples, steps=steps, log_every=log_every, mo=None)
+    overfit_with_progress(
+        pipe,
+        n_examples=n_examples,
+        steps=steps,
+        log_every=log_every,
+        mo=None,
+        mask_p_max=mask_p_max,
+        mask_reweight=mask_reweight,
+    )
 
 
 @app.command()
