@@ -73,3 +73,40 @@ def test_moe_bias_check_wires_run_and_report(monkeypatch):
 
     assert result.exit_code == 0
     assert "report:[1.0, 0.5]:[3.0]" in result.stdout
+
+
+def test_overfit_forwards_mask_and_seed_flags(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    config = tmp_path / "cfg.yaml"
+    config.write_text("model: {}\ndata: {}\ntrain: {}\n")
+    calls = {}
+    monkeypatch.setattr(cli_mod, "build_pipeline", lambda *a, **k: "FAKE_PIPE")
+    monkeypatch.setattr(cli_mod, "overfit_with_progress", lambda pipe, **kwargs: calls.update(kwargs))
+
+    result = CliRunner().invoke(
+        cli_mod.app,
+        ["overfit", str(config), "--mask-p-max", "0.3", "--no-mask-reweight", "--seed", "7"],
+    )
+
+    assert result.exit_code == 0
+    assert calls["mask_p_max"] == 0.3
+    assert calls["mask_reweight"] is False
+    assert calls["seed"] == 7
+
+
+def test_overfit_defaults_mask_flags_to_none_and_seed_to_zero(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    config = tmp_path / "cfg.yaml"
+    config.write_text("model: {}\ndata: {}\ntrain: {}\n")
+    calls = {}
+    monkeypatch.setattr(cli_mod, "build_pipeline", lambda *a, **k: "FAKE_PIPE")
+    monkeypatch.setattr(cli_mod, "overfit_with_progress", lambda pipe, **kwargs: calls.update(kwargs))
+
+    result = CliRunner().invoke(cli_mod.app, ["overfit", str(config)])
+
+    assert result.exit_code == 0
+    assert calls["mask_p_max"] is None
+    assert calls["mask_reweight"] is None
+    assert calls["seed"] == 0

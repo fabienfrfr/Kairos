@@ -174,6 +174,44 @@ def test_overfit_with_progress_returns_the_logs():
     assert logs == [{"loss": 1.0}, {"loss": 0.1}]
 
 
+def test_overfit_with_progress_forwards_mask_overrides_and_seed():
+    pipe = _FakeOverfitPipe()
+
+    overfit_with_progress(
+        pipe, n_examples=16, steps=200, log_every=0, mo=None, mask_p_max=0.3, mask_reweight=False, seed=7
+    )
+
+    call = pipe.overfit_calls[0]
+    assert call["mask_p_max"] == 0.3
+    assert call["mask_reweight"] is False
+    assert call["seed"] == 7
+
+
+def test_overfit_with_progress_defaults_mask_overrides_to_none_and_seed_to_zero():
+    pipe = _FakeOverfitPipe()
+
+    overfit_with_progress(pipe, n_examples=16, steps=200, log_every=0, mo=None)
+
+    call = pipe.overfit_calls[0]
+    assert call["mask_p_max"] is None
+    assert call["mask_reweight"] is None
+    assert call["seed"] == 0
+
+
+def test_overfit_with_progress_forwards_mask_overrides_and_seed_via_marimo_bar():
+    pipe = _FakeOverfitPipe()
+    mo = _FakeMarimo(running_in_notebook=True)
+
+    overfit_with_progress(
+        pipe, n_examples=16, steps=200, log_every=0, mo=mo, mask_p_max=0.3, mask_reweight=True, seed=3
+    )
+
+    call = pipe.overfit_calls[0]
+    assert call["mask_p_max"] == 0.3
+    assert call["mask_reweight"] is True
+    assert call["seed"] == 3
+
+
 def test_overfit_with_progress_announces_curriculum_stage_changes(capsys):
     pipe = _FakeOverfitPipe()
     pipe.curriculum_bounds = (1, 0)  # step 0 is 'mae', step >= 1 is 'diffusion' (no transition)
