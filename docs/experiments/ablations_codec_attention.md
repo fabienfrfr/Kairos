@@ -91,16 +91,31 @@ being wasted capacity here.
 
 ## 7. Attention: shared vs. separate QKV, and DeltaNet alone
 
-| Variant | min loss |
+| Variant | min loss (600 steps, 16 sentences) |
 |---|---:|
-| `liz2` (shared QKV, default) | 0.227 |
-| `liz2`, `liz2_share_qkv=False` (separate) | 0.858 |
+| `liz2` (shared QKV, default) | 0.227-0.369 (run-to-run noise, see §1) |
+| `liz2`, `liz2_share_qkv=False` (separate) | 0.610-0.858 |
 | `delta_only` (DeltaNet branch alone) | 0.400 |
 | `vanilla` (SWA branch alone) | 0.596 |
 
-**Sharing wins clearly** (0.227 vs. 0.858) — not a neutral design choice, an actively
-useful one. Neither branch alone matches the shared hybrid; DeltaNet alone beats SWA
-alone, but both lose to the shared combination.
+At first glance, sharing looks like a clear win. **It isn't — this was a correlation,
+not a causal architectural effect**, confirmed by 4 follow-up checks
+(`liz2_shared_vs_separate_followup_raw.jsonl`, full per-step curves, not just
+min/final):
+
+| Check | Shared | Separate | Verdict |
+|---|---:|---:|---|
+| 600 steps, 16 identical sentences (as above) | 0.369 | 0.610 | shared ahead |
+| **3000 steps**, same data | **0.0011** | **0.0011** | **gap gone** - separate was only slower |
+| **63 distinct real sentences**, 600 steps | **2.269** | **2.285** | **gap gone** on real data |
+| **QKV frozen after step 100** (removes the shared path's double gradient signal) | 0.705 | **0.521** | **reversed** - separate wins |
+
+The apparent advantage was a convergence-speed artifact of a too-easy, too-short toy
+setup (shared QKV gets gradient signal from both the SWA and DeltaNet branches every
+step, an effective higher learning rate early on) - not evidence that sharing is
+architecturally better. With enough steps, diverse data, or the gradient-count confound
+controlled for, the gap closes or reverses. Neither branch alone matches the shared
+hybrid at 600 steps either, but that comparison inherits the same caveat.
 
 ## 8. Sequence length (`max_len`, on `baseline`)
 
@@ -139,11 +154,13 @@ need many more steps/epochs to say whether the memory gate's content matters.
 
 ## Takeaways
 
-- **Codec and attention-sharing choices dominate**; depth and MoE top-k barely move the
-  needle at this scale.
-- **The `liz2` shared-QKV design is a genuine win**, confirmed across 3 seeds and
-  isolated directly against a separate-QKV variant (§7) - not an artifact of a lucky
-  init.
+- **Codec choice dominates**; depth, MoE top-k, and QKV-sharing barely move the needle
+  once enough steps or real data are used (§2, §3, §7).
+- **§7 is a worked example of correlation vs. causation**: a striking single-run,
+  single-config result (shared QKV converging faster) did not survive 3 independent
+  controls (more steps, more diverse data, a gradient-signal control) - it reversed
+  under the strictest one. Treat any single-run architecture claim from this sandbox as
+  a hypothesis to check, not a conclusion.
 - **None of this changes production defaults** (`codec_mode="conv"`, `attn_type="liz2"`,
   `codec_conv_channels_per_group=None`). These are tiny memorization sanity checks, not
   generalization benchmarks - `max_len`/`batch_size`/depth results in particular may not

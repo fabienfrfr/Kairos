@@ -2197,6 +2197,36 @@ def test_overfit_test_mask_override_is_applied_and_restored(tmp_path, model_conf
     assert pipe.hf_trainer.mask_reweight is True
 
 
+def test_overfit_test_freeze_callback_runs_once_per_step_before_the_step(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    seen_steps = []
+    pipe.overfit_test(n_examples=16, steps=4, mask_p_max=0.3, mask_reweight=False, freeze_callback=seen_steps.append)
+
+    assert seen_steps == [0, 1, 2, 3]
+
+
+def test_overfit_test_freeze_callback_can_freeze_a_parameter_mid_run(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    target = next(iter(pipe.model.parameters()))
+
+    def freeze_at_step_2(step):
+        if step == 2:
+            target.requires_grad_(False)
+
+    pipe.overfit_test(n_examples=16, steps=4, mask_p_max=0.3, mask_reweight=False, freeze_callback=freeze_at_step_2)
+
+    assert target.requires_grad is False
+
+
 def test_train_without_eval_config_skips_eval(tmp_path, model_config, text_examples):
     data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
     train_config = TrainConfig(epochs=1, save_every=1000, eval_every=1, run_dir=str(tmp_path / "run"))

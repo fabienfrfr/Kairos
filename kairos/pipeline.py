@@ -812,8 +812,9 @@ class KairosMultimodalPipeline:
         mask_p_max: float | None = None,
         mask_reweight: bool | None = None,
         log_every: int = 0,
+        freeze_callback=None,
     ) -> list[dict]:
-        """Trains on a tiny subset to check memorization, walking the active curriculum stages; log_every>0 also prints the loss every N steps live."""
+        """Trains on a tiny subset to check memorization, walking the active curriculum stages."""
         self._require_built()
         if not self.is_main_process:
             return []
@@ -878,6 +879,8 @@ class KairosMultimodalPipeline:
             self.model.train()
             it = iter(loader)
             for step in range(steps):
+                if freeze_callback is not None:
+                    freeze_callback(step)
                 try:
                     batch = next(it)
                 except StopIteration:

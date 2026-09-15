@@ -25,3 +25,26 @@ future sweeps.
   at this scale is large enough (+/-0.03 to +/-0.19 depending on config) that any of
   these could shift with a different seed. Worth a 3-seed rerun before citing precise
   numbers.
+
+## Not yet covered by the ablation study (from the paper's old "Anticipated Results")
+
+These three were specified in an earlier draft of `docs/paper/kairos_paper.tex` before
+any experiment had been run. They are real gaps, not covered by the tiny-scale ablation
+study above, and still worth running:
+
+11. **Per-modality loss** (`pipe.check_per_modality_loss()`) - mean masked CE loss
+    broken down by modality (text/image/audio/video/lidar/control). Needs real
+    multimodal data; every ablation config so far is text-only. A large, isolated gap
+    on one modality would flag a codec-scale or tokenizer mismatch for that stream
+    specifically.
+12. **Instrumented compute report** (`pipe.summary(benchmark=True)`,
+    `pipe.memory_report()`, `pipe.profile()`) - measured tok/s, peak memory, and
+    per-module step time on real hardware, as opposed to the roofline model's
+    theoretical upper bounds (`docs/paper/kairos_paper.tex`, \S\ref{sec:compute}). This
+    is the only way to check how close the target design point's real throughput comes
+    to the theoretical figures.
+13. **Per-stage overfit breakdown** - first-loss and tail-mean loss reported separately
+    for the MAE / transition / diffusion stages of a single `overfit_test` run (rather
+    than only min/final over the whole run, as in the ablation study above). Partially
+    observable already via `overfit_with_progress`'s stage-change announcements
+    (`kairos/runners.py`), but never tabulated as its own result.

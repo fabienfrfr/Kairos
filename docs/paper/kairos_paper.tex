@@ -1,5 +1,31 @@
 \documentclass[11pt]{article}
 
+% =============================================================================
+% WRITING PRINCIPLES FOR THIS PAPER (keep this comment; check against it on
+% every edit)
+%
+% - IMRAD: Introduction, Methods, Results, And Discussion. Related Work is a
+%   subsection of the Introduction, not a separate section -- it motivates the
+%   problem, it isn't the problem. Compute-budget methodology lives in
+%   Methods; the numbers it produces live in Results.
+% - Less is more: every sentence must earn its place. If a claim is stated
+%   once, do not restate it in the abstract, the section, and the conclusion.
+%   Cut adjectives that don't carry information. Prefer one precise number to
+%   three qualitative claims.
+% - Report what was measured, not what would be interesting if measured.
+%   TBD placeholders and "anticipated" tables are not results -- either run
+%   the experiment first, or say plainly in Discussion that it's future work,
+%   once, and move on.
+% - One idea per paragraph, one contribution per bullet, one takeaway per
+%   figure/table caption. A caption states what the reader should conclude
+%   from the figure, not just what axes it has.
+% - State limitations plainly and once, in Discussion. Do not hedge every
+%   claim individually throughout the text.
+% - Every number in a table must be traceable to a script/config in the repo
+%   (this is a lean-research paper, not a position paper) -- prefer citing
+%   the exact config path over re-describing the setup in prose.
+% =============================================================================
+
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage[margin=2.5cm]{geometry}
@@ -30,35 +56,32 @@ for Multimodal Edge Foundation Models\\
 \begin{abstract}
 Sparse Mixture-of-Experts (MoE) routing is usually sold as an
 almost-free lunch: keep the total parameter count high, activate only
-a small fraction per token, and pay only for what you use. We show
-this promise quietly breaks down during \emph{training} on
-memory-bandwidth-limited hardware. Kairos is a proof-of-concept
-multimodal model combining bidirectional gated DeltaNet linear
-attention with bidirectional sliding-window attention through shared
-projections (LiZAttention2, TPTT-inspired), a block-wise
-Attention-Residual aggregator, a sparse MoE feed-forward layer, and a
-masked-diffusion training objective over a shared byte-level latent
-space spanning text, image, audio, video, lidar and robot-control
-modalities. The current, runnable configuration is a $\sim$14M-parameter
-sanity-check network (4 layers, $d_{\text{model}}=64$, 7 experts,
-top-1 routing) used to validate the pipeline end-to-end via
-overfitting and per-modality loss checks; a separate,
-not-yet-trained 200M-total/25M-active design point is used only to
-size the target compute budget. Using a roofline model, we show that
-this target design point sits deep in the memory-bound regime
+a small fraction per token, and pay only for what you use. This
+promise breaks down during \emph{training} on memory-bandwidth-limited
+hardware: Kairos's MoE backward pass is bandwidth-gated by the
+\emph{total} parameter count, not the \emph{active} one, a distinction
+FLOP-centric treatments of MoE efficiency omit. Kairos is a
+proof-of-concept multimodal model combining bidirectional gated
+DeltaNet linear attention with bidirectional sliding-window attention
+through shared projections (LiZAttention2, TPTT-inspired), a
+block-wise Attention-Residual aggregator, a sparse MoE feed-forward
+layer, and a masked-diffusion training objective over a shared
+byte-level latent space spanning text, image, audio, video, lidar and
+robot-control modalities. We give code-derived algorithms for the
+hybrid attention block, the Block-AttnRes aggregator, and the
+masked-diffusion curriculum, a roofline analysis of a
+200M-total/25M-active target design point
 ($\mathcal{I}_{\text{train}}=1.5$ FLOP/byte against ridge points of
-156--295 FLOP/byte on A100/H100-class hardware), and that its MoE
-backward pass is bandwidth-gated by the \emph{total} parameter count
-rather than the \emph{active} one -- a distinction absent from
-FLOP-centric treatments of MoE efficiency. We give the exact,
-code-derived algorithms for the hybrid attention block, the
-Block-AttnRes aggregator, and the masked-diffusion curriculum, and we
-specify -- ahead of running them -- the tables the codebase's own
-instrumentation (\texttt{summary}, \texttt{memory\_report},
-\texttt{profile}, \texttt{overfit\_test},
-\texttt{check\_per\_modality\_loss}) is built to produce. No full
-training run has been performed; this report is a design and
-compute-budget document, not a benchmark paper.
+156--295 FLOP/byte on A100/H100-class hardware), and a tiny-scale
+ablation study (39 runs, 3-seed statistics) on the running
+$\sim$2--8M-parameter sanity-check network. The ablation study
+doubles as a methodological case: a striking single-run result --
+shared vs.\ separate attention projections -- is shown, via three
+independent controls, to be a convergence-speed artifact rather than
+an architectural effect, reversing under the strictest control. No
+training run at target scale has been performed; the target-scale
+analysis is a compute-budget sizing exercise, and the ablation study
+is a memorization sanity check, not a generalization benchmark.
 \end{abstract}
 
 \section{Introduction}
@@ -111,22 +134,24 @@ reduce?
         Block-AttnRes (Algorithm~\ref{alg:attnres}), sparse MoE
         (\S\ref{sec:moe}), and the masked-diffusion curriculum
         (Algorithm~\ref{alg:diffusion}).
-  \item An explicit split between the \emph{running} proof-of-concept
-        configuration ($\sim$14M parameters, used for pipeline
-        sanity checks) and the \emph{target} design point
-        (200M total / 25M active, used only for compute-budget sizing)
-        -- Table~\ref{tab:configs}.
-  \item A roofline-based compute analysis of the target design point
-        (\S\ref{sec:compute}) showing it is memory-bound and that its
-        MoE backward pass scales with total, not active, parameters.
-  \item Result tables the codebase's instrumentation is built to fill
-        (\S\ref{sec:results}), reported here as structure, not
-        numbers, since no full run has been executed.
+  \item A roofline-based compute analysis (\S\ref{sec:compute}) of a
+        200M-total/25M-active target design point, showing it is
+        memory-bound and that its MoE backward pass scales with total,
+        not active, parameters.
+  \item A tiny-scale ablation study (\S\ref{sec:ablations}, 39 runs,
+        3-seed statistics) isolating the effect of codec design,
+        attention sharing, depth, and MoE routing on the running
+        sanity-check network.
+  \item A worked correlation-vs-causation case within that study
+        (\S\ref{sec:qkv-sharing}): a clear single-run effect that does
+        not survive three independent controls, offered as a
+        methodological cautionary example alongside the architecture.
 \end{enumerate}
 
-\section{Related Work}
+\subsection{Related work}
 
-\paragraph{Efficient attention.} The delta
+\paragraph{Efficient attention.} Full self-attention~\citep{vaswani2017attention}
+scales quadratically in sequence length; the delta
 rule~\citep{yang2024deltanet,yang2024gateddeltanet} improves on plain
 linear attention with an error-correcting state update; Kairos runs it
 \emph{bidirectionally} (forward pass plus a time-reversed pass,
@@ -150,6 +175,12 @@ the router's backward pass on bandwidth-starved hardware -- central to
 \S\ref{sec:compute} -- is not, to our knowledge, separately quantified
 in this literature.
 
+\paragraph{Cross-layer residual aggregation.} Kairos's Block-AttnRes
+replaces the fixed, unit-weight residual sum standard since
+ResNet~\citep{he2015resnet}/Transformer stacks with the learned, block-windowed attention
+over prior layer outputs of \citet{kimiteam2026attnres}, used here
+as-is rather than re-derived (\S\ref{sec:attnres}).
+
 \paragraph{Diffusion-style language modeling.} Kairos follows the
 MDLM~\citep{sahoo2024mdlm} masking/reweighting formulation but adds a
 three-stage MAE~$\to$~transition~$\to$~diffusion curriculum
@@ -169,7 +200,7 @@ FLOPs-vs-sparsity trade-off directly~\citep{abnar2025parameters}; we
 build on it to isolate the total-vs-active distinction specifically in
 the backward pass.
 
-\section{Architecture}
+\section{Methods}
 
 \subsection{Two configurations, not one}
 
@@ -178,9 +209,11 @@ not to conflate. The \textbf{PoC configuration} is the default in the
 project's marimo notebook (\texttt{notebook/kairos\_pretraining.py}):
 a $\sim$14--15M-parameter network used to sanity-check the pipeline via
 memorization (\texttt{overfit\_test}) and per-modality loss checks. Its
-7-expert, top-1 MoE is deliberately small -- the notebook notes that
-top-1 routing converges slowly on tiny overfit runs, so the expert
-count is kept low to make the sanity check tractable at all. The
+7-expert, top-1 MoE is small; the notebook's own comment claims top-1
+routing converges too slowly for a fast sanity check, but
+\S\ref{sec:ablations}'s controlled top-1-vs-top-2 comparison does not
+support this ($0.281$ vs.\ $0.272$ min.\ loss) -- the claim predates
+this report and should not be taken as settled. The
 \textbf{target configuration} is the 200M-total / 25M-active design
 point used in \S\ref{sec:compute} purely to size a future training
 run; it has not been instantiated or trained. Table~\ref{tab:configs}
@@ -202,7 +235,7 @@ Routed experts $E$ / active $k$ & 7 / 1 & 32 / 4 \\
 Shared experts & 1 & -- \\
 FFN intermediate size & 544 & -- \\
 Backbone sharing across scales & yes ($\sim$75\% param saving) & -- \\
-Codec mode & \texttt{patch} (dense per-scale) & -- \\
+Codec mode & \texttt{conv} (\texttt{channels\_per\_group=8}) & -- \\
 Cross-session memory bank & enabled & -- \\
 $N_{\text{total}}$ & $\sim$14--15M & 200M \\
 $N_{\text{act}}$ & not yet logged (\S\ref{sec:results}) & 25M (4M for \S\ref{sec:compute}) \\
@@ -216,7 +249,11 @@ the parameter/token budget that drives \S\ref{sec:compute} has been
 specified. $N_{\text{act}}$ for the PoC config is computed by the same
 routine used at target scale (Eq.~\ref{eq:active}) but has not yet been
 logged from an instantiated model; it is listed as a pending
-measurement, not estimated here, to avoid quoting an unverified number.}
+measurement, not estimated here, to avoid quoting an unverified number.
+The PoC's codec mode (\texttt{conv}) is chosen for training-time
+efficiency at real scale, not because it wins on the tiny memorization
+task in Table~\ref{tab:ablation-codec} -- there, \texttt{patch} does;
+see \S\ref{sec:ablations} for why the two do not agree.}
 \label{tab:configs}
 \end{table}
 
@@ -264,14 +301,17 @@ Block-AttnRes aggregator determines what each layer actually reads.}
 \end{figure}
 
 \subsection{LiZAttention2: shared-basis bidirectional hybrid attention}
+\label{sec:liz}
 
 Each layer runs a bidirectional sliding-window branch
 (\texttt{KairosAttention}, window mask $|q-k|\le w$ in both
 directions) and a bidirectional gated-DeltaNet branch
 (\texttt{KairosGatedDeltaNet}, run once forward and once on the
 time-reversed sequence, then flipped back and concatenated) over the
-\emph{same} input. The DeltaNet branch's Q/K/V/output projections are
-deleted and replaced by references to the SWA branch's, so both
+\emph{same} input; the two branches' outputs are concatenated,
+normalized with RMSNorm~\citep{zhang2019rmsnorm}, and projected back to
+$d$ (Algorithm~\ref{alg:liz}). The DeltaNet branch's Q/K/V/output
+projections are deleted and replaced by references to the SWA branch's, so both
 mixers read the same linear projections of $x$; only their mixing
 rule differs.
 
@@ -292,14 +332,17 @@ rule differs.
 \end{algorithm}
 
 \subsection{Block-AttnRes aggregation}
+\label{sec:attnres}
 
-Rather than a plain residual $x_{i+1}=x_i+f_i(x_i)$, each layer's
+Rather than a plain residual $x_{i+1}=x_i+f_i(x_i)$, Kairos follows
+the block-windowed Attention Residuals construction of
+\citet{kimiteam2026attnres}: each layer's
 \emph{input} is a learned, softmax-weighted mix of the embedding,
 finalized block-sums of earlier layers, and a running partial sum of
 the current block (Algorithm~\ref{alg:attnres}); the layer's own
 attention/FFN sublayers still use ordinary residual connections around
 $h$. With \texttt{attnres\_block\_size}~$=1$ this degenerates to a
-DenseNet-style sum over all prior individual layer outputs; with block
+DenseNet-style~\citep{huang2016densenet} sum over all prior individual layer outputs; with block
 size~$=$~\texttt{n\_layers} it degenerates to a single running sum
 (closer to a plain residual stream). The PoC configuration uses block
 size~$4$ over $4$ layers, i.e.\ one block covering the whole network.
@@ -334,10 +377,9 @@ initialization is patched, since the upstream implementation leaves
 expert weights uninitialized); \texttt{KairosFFN}, used when MoE is
 disabled, subclasses Qwen2's dense MLP~\citep{qwen2techreport}. Each
 token is routed to $k$ of $E$ routed experts plus $1$ or more always-on
-shared experts. The PoC configuration ($E=7$, $k=1$) is deliberately
-under-sparse relative to the target ($E=32$, $k=4$): the notebook
-records that top-1 routing on a wide expert bank converges too slowly
-to be useful as a fast sanity check.
+shared experts. The PoC configuration ($E=7$, $k=1$) is under-sparse
+relative to the target ($E=32$, $k=4$); see \S\ref{sec:ablations} for
+why this was chosen and why the choice does not hold up under test.
 
 The active-parameter count used throughout this report is computed
 directly, not estimated after the fact:
@@ -362,7 +404,8 @@ predicts $x_0$ at masked positions from $x_t$; the loss is
 cross-entropy, optionally reweighted by a continuous blend factor
 $\alpha\in[0,1]$ between plain CE ($\alpha=0$) and full $1/p$
 reweighting ($\alpha=1$), following the MDLM
-formulation~\citep{sahoo2024mdlm}. Self-conditioning (probability
+formulation~\citep{sahoo2024mdlm}. Self-conditioning~\citep{chen2022analogbits}
+(probability
 $0.5$ in the current config) occasionally feeds a detached, no-grad
 warm-up prediction back in as extra context, matching how
 \texttt{generate()} uses it at inference time.
@@ -390,14 +433,17 @@ flat at the diffusion target -- chosen so that resuming from a
 checkpoint depends only on the persisted step count, not on which
 pipeline call produced it.
 
-\section{Compute Budget Analysis (Target Design Point)}
+\section{Results}
+\label{sec:results}
+
+\subsection{Compute budget analysis (target design point)}
 \label{sec:compute}
 
 This section applies only to the 200M/25M \textbf{target} design point
 of Table~\ref{tab:configs}; it is a sizing exercise for a training run
 that has not been executed, not a measurement of the running PoC.
 
-\subsection{Total training FLOPs}
+\subsubsection{Total training FLOPs}
 
 For a dense transformer, $C\approx6ND$~\citep{kaplan2020scaling}; for
 MoE, compute scales with active, not total,
@@ -411,7 +457,7 @@ Gemma-3~270M~\citep{gemma3} run ($\sim5\times10^{20}$ FLOPs). This
 comparison alone overstates the win, as the roofline analysis below
 shows.
 
-\subsection{Roofline model}
+\subsubsection{Roofline model}
 
 Achievable throughput is $\min(\pi,\ \mathcal{I}\cdot b_s)$, with ridge
 point $\mathcal{I}^\ast=\pi/b_s$~\citep{williams2009roofline}
@@ -459,7 +505,7 @@ points -- deep in the memory-bound regime on both.}
 \label{fig:roofline}
 \end{figure}
 
-\subsection{The MoE bandwidth bottleneck}
+\subsubsection{The MoE bandwidth bottleneck}
 
 \begin{table}[h]
 \centering
@@ -488,7 +534,7 @@ The backward-pass bandwidth cost of a MoE model is governed by its
 training-time speedup from sparsity even though it is fully realized
 at inference time.
 
-\subsection{Throughput and wall-clock estimates}
+\subsubsection{Throughput and wall-clock estimates}
 
 \begin{table}[h]
 \centering
@@ -505,8 +551,9 @@ H100 SXM5 & 3\,350 & 4\,188 & $\sim$1\,047 & $\sim$332 \\
 \end{tabular}%
 }
 \caption{Theoretical-upper-bound throughput at $N_{\text{total}}=200$M.
-Not measured: no run has reached this scale. \S\ref{sec:results}
-specifies the benchmark that would replace this table with real
+Not measured: no run has reached this scale. See
+\texttt{docs/experiments/planned\_experiments.md} (item 12) for the
+instrumented benchmark that would replace this table with real
 numbers.}
 \label{tab:throughput}
 \end{table}
@@ -518,7 +565,7 @@ fastest lever is reducing $N_{\text{total}}$ (e.g.\ to $\sim$50M) at
 fixed $N_{\text{act}}$, a $4\times$ cut in backward-pass bytes, before
 any kernel-level work.
 
-\subsection{Scaling-law context}
+\subsubsection{Scaling-law context}
 
 Chinchilla~\citep{hoffmann2022chinchilla}'s fit is out of range for a
 4M-active-parameter model; joint MoE scaling
@@ -551,94 +598,98 @@ Kairos target (design) & 200M & 4M & 30B & 7{,}500$\times$ & MoE, multimodal, un
 \label{tab:precedents}
 \end{table}
 
-\section{Anticipated Results}
-\label{sec:results}
+\subsection{Tiny-scale ablation study}
+\label{sec:ablations}
 
-No training run backs this report. What follows is the exact
-structure the codebase's own instrumentation is built to fill --
-specified here so the eventual results have a pre-committed table to
-land in, rather than being chosen post hoc.
-
-\subsection{Pipeline sanity check (\texttt{overfit\_test})}
-
-\texttt{overfit\_test} trains the PoC network on 16 held-in examples
-for 200 steps through the compressed MAE~$\to$~transition~$\to$~diffusion
-curriculum and reports first/last/tail-mean loss. A working pipeline
-should show near-monotonic decrease within the MAE stage, a visible
-bump when reweighting switches on during the transition, and
-convergence toward a low tail loss during diffusion; a pipeline bug
-typically shows as a plateau at the random-guess cross-entropy
-($\ln|\mathcal{V}|$) or a non-finite loss (caught and logged by the
-circuit breaker in \texttt{KairosDiffusionTrainer}).
+The PoC network ($d_{\text{model}}=64$, MoE off unless noted) was used
+to run 39 controlled sanity-check experiments via
+\texttt{kairos overfit} (\texttt{kairos==0.4.1.dev46}), memorizing 16
+repeated sentences under a fixed mask regime
+($p_{\max}=0.3$, no reweighting) for 600 steps unless noted. Every
+config is versioned under \texttt{configs/ablations/}; full results,
+raw per-step curves, and single-run vs.\ 3-seed methodology notes are
+in \texttt{docs/experiments/} in the repository. This is a
+memorization sanity check, not a generalization benchmark; effect
+directions should not be assumed to transfer to real, diverse data
+without re-testing (\S\ref{sec:qkv-sharing} shows exactly this can
+fail).
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lrrrl}
+\begin{tabular}{lrr}
 \toprule
-Stage & Steps & First loss & Tail-mean loss & Status \\
+Configuration & Min.\ loss (mean $\pm$ std, 3 seeds) & Params \\
 \midrule
-MAE ($p_{\max}=0.3$, $\alpha=0$) & TBD & TBD & TBD & TBD \\
-Transition (ramp) & TBD & TBD & TBD & TBD \\
-Diffusion ($p_{\max}=1.0$, $\alpha=1$) & TBD & TBD & TBD & TBD \\
+\texttt{liz2} attention, depthwise codec (\texttt{channels\_per\_group=1}) & $0.354 \pm 0.193$ & 1.98M \\
+\texttt{vanilla} (SWA-only) attention, depthwise codec & $0.707 \pm 0.103$ & 1.81M \\
+\texttt{conv} codec, \texttt{channels\_per\_group=8} (PoC's actual setting) & $0.075 \pm 0.031$ & 2.50M \\
+\texttt{conv} codec, dense (\texttt{channels\_per\_group=64}) & $0.028 \pm 0.007$ & 8.10M \\
+\texttt{patch} codec (dense \texttt{nn.Linear} per scale) & $0.018 \pm 0.002$ & 4.93M \\
 \bottomrule
 \end{tabular}
-\caption{Overfit sanity-check table, to be filled from
-\texttt{pipe.overfit\_test(n\_examples=16, steps=200)}.}
-\label{tab:overfit}
+\caption{Codec and attention choice under 3-seed statistics.
+\texttt{channels\_per\_group=1} (architectural default when
+unspecified) trades memorization speed for a $2.7\times$ parameter
+saving over \texttt{patch}; the PoC's actual setting
+(\texttt{channels\_per\_group=8}, Table~\ref{tab:configs}) recovers
+most of that gap at under half \texttt{patch}'s cost.
+\texttt{liz2} beats \texttt{vanilla} on every individual seed despite
+overlapping mean$\pm$std ranges.}
+\label{tab:ablation-codec}
 \end{table}
 
-\subsection{Per-modality loss (\texttt{check\_per\_modality\_loss})}
+A single-run sweep (one seed; read as indicative, not exact --
+Table~\ref{tab:ablation-codec}'s spread sets the noise floor) covered
+six further factors: network depth (1--8 layers, non-monotonic, no
+benefit past 1 layer at this scale), MoE routing (top-1 vs.\ top-2:
+$0.281$ vs.\ $0.272$, indistinguishable -- the notebook's claim that
+top-1 is "slow to converge" is not supported here), the attention
+window (\texttt{attnres\_block\_size}: no effect below \texttt{n\_layers},
+saturates at or above it), codec scale count (monotonic: 4 scales beat
+3 beat 2), sequence length (monotonic: longer context helps), and
+batch size (monotonic: larger batches converge faster in step count,
+as expected when they approach full-batch on 16 examples). Full tables
+are in \texttt{docs/experiments/ablations\_codec\_attention.md}.
+
+\subsubsection{A correlation-vs-causation case: shared vs.\ separate QKV}
+\label{sec:qkv-sharing}
+
+LiZAttention2's shared Q/K/V/O projections (\S\ref{sec:liz}) initially
+looked like a clear architectural win: with sharing disabled
+(independent projections per branch, otherwise identical), min.\ loss
+rose from $0.227$--$0.369$ to $0.610$--$0.858$ across repeated 600-step
+runs. Three independent controls were run before accepting this as an
+architectural effect, rather than a run-specific artifact of a
+too-easy, too-short setup:
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lrl}
+\begin{tabular}{lrrl}
 \toprule
-Modality & Mean masked CE loss & \# batches \\
+Control & Shared & Separate & Outcome \\
 \midrule
-Text & TBD & TBD \\
-Image & TBD & TBD \\
-Audio & TBD & TBD \\
-Video & TBD & TBD \\
-Lidar & TBD & TBD \\
-Control (state/action) & TBD & TBD \\
+More steps (3\,000 vs.\ 600) & $0.0011$ & $0.0011$ & gap closes \\
+Diverse data (63 distinct sentences) & $2.269$ & $2.285$ & gap closes \\
+QKV frozen after step 100 & $0.705$ & $0.521$ & \textbf{gap reverses} \\
 \bottomrule
 \end{tabular}
-\caption{Per-modality loss breakdown, to be filled from
-\texttt{pipe.check\_per\_modality\_loss()}. A large, isolated gap on
-one modality would flag a codec-scale or tokenizer mismatch for that
-stream rather than a global optimization problem.}
-\label{tab:permod}
+\caption{Three controls on the shared-vs-separate-QKV effect
+(\texttt{docs/experiments/liz2\_shared\_vs\_separate\_followup\_raw.jsonl}
+holds the full per-step curves). Sharing's apparent advantage was
+faster early convergence -- shared projections receive a gradient
+signal from both attention branches every step, an effective higher
+early learning rate -- not higher achievable capacity: given enough
+steps or diverse data both variants reach the same floor, and
+removing the extra gradient signal (freezing QKV after step 100)
+reverses the ranking.}
+\label{tab:qkv-sharing}
 \end{table}
 
-\subsection{Instrumented compute report (\texttt{summary}, \texttt{memory\_report}, \texttt{profile})}
-
-The pipeline already measures, rather than estimates, step time and
-memory: \texttt{summary(benchmark=True)} runs $n$ real forward +
-backward + optimizer steps and reports mean step time and derived
-tokens/s; \texttt{memory\_report()} reports unique parameter bytes,
-optimizer-state bytes, and process RSS before/after a step;
-\texttt{profile()} reports per-module wall time. Table~\ref{tab:bench}
-is the structure these calls fill; Table~\ref{tab:throughput}'s
-theoretical figures are what this table would need to approach for the
-target design point to be trainable in practice.
-
-\begin{table}[h]
-\centering
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{lrrrl}
-\toprule
-Config & Measured tok/s & Peak mem (GB) & Step time (ms) & Hardware \\
-\midrule
-PoC ($\sim$14--15M) & TBD & TBD & TBD & TBD \\
-Target (200M, projected) & TBD & TBD & TBD & not yet instantiated \\
-\bottomrule
-\end{tabular}%
-}
-\caption{Real, instrumented benchmark table, to be filled from
-\texttt{pipe.summary(benchmark=True)} and \texttt{pipe.memory\_report()}
-once the PoC has run on target hardware.}
-\label{tab:bench}
-\end{table}
+The lesson generalizes beyond this one comparison: a single-run,
+single-config result on a tiny memorization task is a hypothesis, not
+a finding, until checked against a step-budget control, a data-scale
+control, and (where a mechanism is suspected) a control that isolates
+it directly.
 
 \section{Discussion}
 
@@ -649,36 +700,43 @@ drives the backward pass's byte traffic. MoE efficiency claims
 reported on data-center hardware, where bandwidth is generous relative
 to $N_{\text{total}}$, do not transfer cleanly to bandwidth-starved
 edge hardware for this reason. Separately, the PoC's under-sparse
-routing ($E=7$, $k=1$, versus a $E=32$, $k=4$ target) is itself a
-data point for \S\ref{sec:compute}: it was chosen specifically because
-wider top-1 routing failed to converge fast enough for a sanity check,
-which is a qualitative, code-level echo of the router-optimization
-difficulty discussed in the MoE literature, not yet a quantitative one.
+routing (\S\ref{sec:moe}) should be re-examined given
+\S\ref{sec:ablations}'s top-1-vs-top-2 result, rather than left as
+originally chosen.
 
 \subsection{Limitations}
 
-This is a design and compute-budget report, not a benchmark paper: the
-PoC has not been run to produce Tables~\ref{tab:overfit}--\ref{tab:bench},
-and Table~\ref{tab:throughput}'s figures are theoretical upper bounds
-for an untrained, uninstantiated target configuration. The Chinchilla
-extrapolation is out of its fitted range. The roofline model ignores
-kernel launch overhead, activation recomputation, and multi-GPU
-communication, all of which would lower real throughput further.
-Readers are encouraged to check any figure or citation here against
-its primary source; this analysis is a planning tool for the project,
-not a peer-reviewed benchmark.
+The target-scale analysis (\S\ref{sec:compute}) is a compute-budget
+sizing exercise for a run that has not been performed: its throughput
+figures are theoretical upper bounds, the Chinchilla extrapolation is
+out of its fitted range, and the roofline model ignores kernel launch
+overhead, activation recomputation, and multi-GPU communication, all
+of which would lower real throughput further. The ablation study
+(\S\ref{sec:ablations}) is a memorization sanity check on 16--63
+repeated or near-duplicate sentences at $d_{\text{model}}=64$; only
+the codec/attention comparison in Table~\ref{tab:ablation-codec} and
+the QKV-sharing case (\S\ref{sec:qkv-sharing}) carry 3-seed or
+multi-control statistics -- the other six factors are single-run and
+should be read as indicative. The memory gate and 8-layer depth point
+were both compute-budget-limited to inconclusive step counts and are
+flagged as open, not resolved.
 
 \section{Conclusion}
 
-Kairos is currently a $\sim$14--15M-parameter proof of concept
+Kairos is currently a $\sim$2--8M-parameter proof of concept
 exercising a hybrid bidirectional DeltaNet/SWA, MoE, masked-diffusion
 architecture end-to-end, with a separate 200M/25M design point used
 only to size a future run. The code-derived algorithms
-(\ref{alg:liz}--\ref{alg:diffusion}) and the roofline analysis together
-give a falsifiable next step ahead of that run: reduce
-$N_{\text{total}}$ at fixed $N_{\text{act}}$, then fill
-Tables~\ref{tab:overfit}--\ref{tab:bench} with real, instrumented
-numbers from the PoC before committing to the target scale.
+(\ref{alg:liz}--\ref{alg:diffusion}), the roofline analysis, and the
+39-run ablation study together give two falsifiable next steps: reduce
+$N_{\text{total}}$ at fixed $N_{\text{act}}$ before scaling up, and
+re-run the single-run ablation factors (\S\ref{sec:ablations}) under
+the same 3-seed protocol as Table~\ref{tab:ablation-codec} before
+citing them individually. The QKV-sharing case
+(\S\ref{sec:qkv-sharing}) is offered as a standing reminder, for this
+project and others, that a single striking result on an easy proxy
+task is a hypothesis until it survives a step-budget, a data-scale,
+and a mechanism-isolating control.
 
 \bibliographystyle{plainnat}
 \bibliography{kairos_references}

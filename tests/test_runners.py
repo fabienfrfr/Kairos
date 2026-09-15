@@ -212,6 +212,15 @@ def test_overfit_with_progress_forwards_mask_overrides_and_seed_via_marimo_bar()
     assert call["seed"] == 3
 
 
+def test_overfit_with_progress_forwards_freeze_callback():
+    pipe = _FakeOverfitPipe()
+    sentinel = object()
+
+    overfit_with_progress(pipe, n_examples=16, steps=200, log_every=0, mo=None, freeze_callback=sentinel)
+
+    assert pipe.overfit_calls[0]["freeze_callback"] is sentinel
+
+
 def test_overfit_with_progress_announces_curriculum_stage_changes(capsys):
     pipe = _FakeOverfitPipe()
     pipe.curriculum_bounds = (1, 0)  # step 0 is 'mae', step >= 1 is 'diffusion' (no transition)
