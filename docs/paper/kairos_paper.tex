@@ -634,7 +634,10 @@ saving over \texttt{patch}; the PoC's actual setting
 (\texttt{channels\_per\_group=8}, Table~\ref{tab:configs}) recovers
 most of that gap at under half \texttt{patch}'s cost.
 \texttt{liz2} beats \texttt{vanilla} on every individual seed despite
-overlapping mean$\pm$std ranges.}
+overlapping mean$\pm$std ranges -- but, like \S\ref{sec:qkv-sharing}'s
+shared-vs-separate result, this gap is a convergence-speed effect, not
+a capacity one: at 3\,000 steps \texttt{vanilla} alone reaches $0.0014$,
+matching \texttt{liz2}'s $0.0011$ (Table~\ref{tab:qkv-sharing}).}
 \label{tab:ablation-codec}
 \end{table}
 

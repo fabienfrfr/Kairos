@@ -117,6 +117,12 @@ architecturally better. With enough steps, diverse data, or the gradient-count c
 controlled for, the gap closes or reverses. Neither branch alone matches the shared
 hybrid at 600 steps either, but that comparison inherits the same caveat.
 
+**The same check extends to `liz2` vs. `attn_vanilla` from §1.** At 3000 steps,
+`attn_vanilla` alone reaches `min_loss=0.0014`, matching `liz2`'s `0.0011` from the
+shared-QKV long run above - the "liz2 beats vanilla" result in §1's table is the same
+convergence-speed artifact, not evidence the hybrid has more capacity than SWA alone at
+this scale.
+
 ## 8. Sequence length (`max_len`, on `baseline`)
 
 | max_len | min loss |
