@@ -12,7 +12,13 @@ import torch
 import kairos.pipeline as pipeline_module
 from kairos.dataset import pack_multimodal_data
 from kairos.modeling import KairosConfig, KairosDiffusionFM
-from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig, _resolve_amp_dtype
+from kairos.pipeline import (
+    DataConfig,
+    KairosMultimodalPipeline,
+    TrainConfig,
+    _bf16_hardware_available,
+    _resolve_amp_dtype,
+)
 from kairos.tokenizer import Modality
 from kairos.utils import TrainingSummary, count_parameters
 
@@ -126,6 +132,26 @@ def test_resolve_amp_dtype_falls_back_to_fp16_when_bf16_unsupported():
 
 def test_resolve_amp_dtype_explicit_bf16_override_wins_even_if_unsupported():
     assert _resolve_amp_dtype("bf16", bf16_supported=False) == torch.bfloat16
+
+
+def test_bf16_hardware_available_false_without_cuda(monkeypatch):
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_available", lambda: False)
+    assert _bf16_hardware_available() is False
+
+
+def test_bf16_hardware_available_trusts_is_bf16_supported_alone_on_rocm(monkeypatch):
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.version, "hip", "5.7.0")
+    assert _bf16_hardware_available() is True
+
+
+def test_bf16_hardware_available_requires_ampere_on_cuda(monkeypatch):
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.version, "hip", None)
+    monkeypatch.setattr(pipeline_module.torch.cuda, "get_device_capability", lambda: (7, 5))
+    assert _bf16_hardware_available() is False
 
 
 def test_resolve_amp_dtype_explicit_fp16_override_wins_even_if_bf16_supported():

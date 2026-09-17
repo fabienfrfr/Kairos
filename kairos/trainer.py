@@ -15,6 +15,17 @@ def update_moe_bias(model, update_rate: float) -> None:
             module.update_bias(update_rate)
 
 
+def collect_moe_aux_loss(model) -> torch.Tensor:
+    """Sums the Switch-style load-balancing term across all routers; 0 if none ran."""
+    inner = model.module if hasattr(model, "module") else model
+    losses = [
+        m.last_aux_loss for m in inner.modules() if isinstance(m, KairosTopkRouter) and m.last_aux_loss is not None
+    ]
+    if not losses:
+        return torch.tensor(0.0)
+    return torch.stack(losses).sum()
+
+
 def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0):
     """Random per-token mask + per-row rate p for the masked-diffusion objective.
 
@@ -153,6 +164,7 @@ class KairosDiffusionTrainer(Trainer):
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
     # train-time self-conditioning rate; keep >0 so generate()'s usage isn't out-of-distribution.
     self_conditioning_prob: float = 0.5
+    moe_aux_loss_weight: float = 0.0  # classic Switch-style load-balancing loss weight; 0 disables
 
     def compute_loss(self, model, inputs, return_outputs=False, cache_params=None):
         x0 = inputs["input_ids"]
@@ -185,6 +197,8 @@ class KairosDiffusionTrainer(Trainer):
         loss = per_token_loss.mean()
         if octet_logits is not None and octet_targets is not None:
             loss = loss + self.octet_loss_weight * F.cross_entropy(octet_logits, octet_targets)
+        if self.moe_aux_loss_weight:
+            loss = loss + self.moe_aux_loss_weight * collect_moe_aux_loss(model)
 
         if not torch.isfinite(loss):
             # capture context here (access to logits/inputs)

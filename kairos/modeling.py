@@ -268,12 +268,19 @@ class KairosTopkRouter(DeepseekV3TopkRouter):
     def __init__(self, config):
         super().__init__(config)
         self.load_count = nn.Buffer(torch.zeros(self.num_experts), persistent=False)
+        self.last_aux_loss = None  # Switch-style load-balancing term; set when training
 
     def forward(self, hidden_states):
         router_logits, topk_weights, topk_indices = super().forward(hidden_states)
         if self.training:
             with torch.no_grad():
-                self.load_count += torch.bincount(topk_indices.reshape(-1), minlength=self.num_experts).float()
+                counts = torch.bincount(topk_indices.reshape(-1), minlength=self.num_experts).float()
+                self.load_count += counts
+                fraction_dispatched = counts / topk_indices.numel()
+            mean_router_prob = F.softmax(router_logits, dim=-1).mean(dim=0)
+            self.last_aux_loss = self.num_experts * (fraction_dispatched * mean_router_prob).sum()
+        else:
+            self.last_aux_loss = None
         return router_logits, topk_weights, topk_indices
 
     def update_bias(self, update_rate: float) -> None:

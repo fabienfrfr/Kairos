@@ -68,9 +68,10 @@ block-wise Attention-Residual aggregator, a sparse MoE feed-forward
 layer, and a masked-diffusion training objective over a shared
 byte-level latent space spanning text, image, audio, video, lidar and
 robot-control modalities. We give code-derived algorithms for the
-hybrid attention block, the Block-AttnRes aggregator, and the
-masked-diffusion curriculum, a roofline analysis of a
-200M-total/25M-active target design point
+multi-scale codec and cross-session memory gate (for which we found no
+direct literature precedent), the hybrid attention block, the
+Block-AttnRes aggregator, and the masked-diffusion curriculum, a
+roofline analysis of a 200M-total/25M-active target design point
 ($\mathcal{I}_{\text{train}}=1.5$ FLOP/byte against ridge points of
 156--295 FLOP/byte on A100/H100-class hardware), and a tiny-scale
 ablation study (39 runs, 3-seed statistics) on the running
@@ -130,10 +131,14 @@ reduce?
 
 \begin{enumerate}
   \item The Kairos architecture, specified directly from its
-        implementation: LiZAttention2 (Algorithm~\ref{alg:liz}),
-        Block-AttnRes (Algorithm~\ref{alg:attnres}), sparse MoE
-        (\S\ref{sec:moe}), and the masked-diffusion curriculum
-        (Algorithm~\ref{alg:diffusion}).
+        implementation: PyramidalCodec (Algorithm~\ref{alg:codec}) and
+        KairosMemoryGate (Algorithm~\ref{alg:memgate}), for which we
+        found no direct precedent in the literature; LiZAttention2
+        (Algorithm~\ref{alg:liz}), Block-AttnRes
+        (Algorithm~\ref{alg:attnres}), sparse MoE (\S\ref{sec:moe}),
+        and the masked-diffusion curriculum
+        (Algorithm~\ref{alg:diffusion}), each adapted from a specific
+        prior method.
   \item A roofline-based compute analysis (\S\ref{sec:compute}) of a
         200M-total/25M-active target design point, showing it is
         memory-bound and that its MoE backward pass scales with total,
@@ -300,6 +305,87 @@ Block-AttnRes aggregator determines what each layer actually reads.}
 \label{fig:architecture}
 \end{figure}
 
+\subsection{PyramidalCodec: multi-scale byte encode/decode}
+\label{sec:codec}
+
+Every modality is encoded to raw bytes/tokens, then to $S$ parallel
+scales at patch sizes $p_s = \text{stride}^s$ ($s=1{\ldots}S$; PoC:
+stride $3$, $S=4$, so $p=3,9,27,81$), fused, and decoded back the same
+way (Algorithm~\ref{alg:codec} shows \texttt{mode="conv"}, the PoC's
+setting). A shared rank-$r$ bottleneck mixer
+($\text{Conv1d}_{d\to r}\to\text{GELU}\to\text{Conv1d}_{r\to d}$, cost
+$O(rd)$ against a dense $1{\times}1$ conv's $O(d^2)$) supplies
+cross-channel context once before the per-scale grouped convolutions
+downsample; each scale gets its own such mixer again afterward. The
+grouped convolution's group count is the one knob that trades
+compute for expressiveness: \texttt{channels\_per\_group}$=1$
+(default) is depthwise -- cheapest, and the setting
+\S\ref{sec:ablations} shows is slowest to memorize; raising it toward
+$d$ recovers a dense convolution's expressiveness at proportionally
+higher cost. \texttt{mode="patch"} replaces the whole grouped-conv/mixer
+chain with a single $\text{Linear}(p_s d\to d)$ per scale, decoding
+through the \emph{same} weight matrix transposed (tied encode/decode,
+no separate decoder parameters) -- simpler, and empirically the
+fastest to memorize (\S\ref{sec:ablations}), but without the
+grouped-convolution knob's compute/expressiveness trade-off.
+
+\begin{algorithm}[h]
+\caption{PyramidalCodec encode (\texttt{mode="conv"})}
+\label{alg:codec}
+\begin{algorithmic}[1]
+\Require sequence $x \in \mathbb{R}^{B\times L\times d}$, patch sizes $p_1,\ldots,p_S$
+\State $h \gets \text{BottleneckMixer}_{\text{pre}}(x^\top)$ \Comment{shared cross-channel context, cost $O(rd)$}
+\For{$s = 1$ to $S$}
+  \State $h_s \gets \text{PadToMultiple}(h, p_s)$
+  \State $h_s \gets \text{GroupedConv1d}(h_s;\ \text{kernel}=p_s,\ \text{stride}=p_s,\ \text{groups}=d/\texttt{channels\_per\_group})$
+  \State $\text{scale}_s \gets \text{BottleneckMixer}_s(h_s)$
+\EndFor
+\State $h \gets \text{concat}(\text{scale}_1,\ldots,\text{scale}_S)$ \Comment{$Sd$-wide}
+\State $h \gets \text{RMSNorm}(h)$
+\State \Return $\text{Linear}_{Sd\to d}(h)$, $\{\text{scale}_1,\ldots,\text{scale}_S\}$ \Comment{fused repr.\ for the backbone; scales kept for decode}
+\end{algorithmic}
+\end{algorithm}
+
+Decode mirrors this with grouped transpose convolutions (upsampling
+each scale back to $L$, trimmed to the original length before the pad)
+and a second set of per-scale mixers, then the same
+concat/RMSNorm/fusion; \texttt{mode="patch"}'s decode is the tied
+transpose of its encode \texttt{Linear} plus a learned bias, per scale.
+
+\subsection{KairosMemoryGate: cross-session recurrent-state memory}
+\label{sec:memgate}
+
+Kairos optionally carries DeltaNet recurrent state across sequences
+(\texttt{use\_memory\_gate=True}): before each new sequence, every
+scale's every DeltaNet layer gets its SSM state seeded not from zero
+but from a learned blend of zero and a bank of prior states -- either
+the immediately preceding batch's own final state
+(\texttt{prev\_cache}, always available once training has taken one
+step) or an externally supplied \texttt{memory\_bank}
+(Algorithm~\ref{alg:memgate}). The blend is a single-head
+cross-attention over a rank-$r'$ bottleneck ($r' = \max(8,
+\lceil\sqrt{d}/4\rceil)$ by default), not a fixed interpolation: the
+query is the (zero) current state, the keys/values are the bank's
+states, so the gate can attend selectively to whichever prior state is
+most relevant rather than always averaging all of them equally.
+
+\begin{algorithm}[h]
+\caption{Memory-bank gating, applied per (scale, DeltaNet layer)}
+\label{alg:memgate}
+\begin{algorithmic}[1]
+\Require zero state $s_0 \in \mathbb{R}^{B\times D}$, memory bank $M \in \mathbb{R}^{M\times D}$ (stacked prior states)
+\If{$M$ is empty}
+  \State \Return $s_0$ \Comment{no-op: identical to never having enabled the gate}
+\EndIf
+\If{$M$ has exactly one row}
+  \State \Return that row, broadcast to batch size $B$ \Comment{degenerate case: nothing to attend over}
+\EndIf
+\State $q \gets \text{Linear}_{D\to r'}(s_0)$;\quad $K,V \gets \text{Linear}_{D\to r'}(M)$
+\State $\text{out} \gets \text{MultiheadAttention}_{h=1}(q, K, V)$
+\State \Return $\text{Linear}_{r'\to D}(\text{out})$
+\end{algorithmic}
+\end{algorithm}
+
 \subsection{LiZAttention2: shared-basis bidirectional hybrid attention}
 \label{sec:liz}
 
@@ -435,6 +521,14 @@ pipeline call produced it.
 
 \section{Results}
 \label{sec:results}
+
+Two unrelated kinds of result follow, at two different scales:
+\S\ref{sec:compute} is an analytical sizing exercise for the
+200M/25M \textbf{target} design point that has not been trained;
+\S\ref{sec:ablations} is real, measured data (39 runs) from the
+$\sim$2--8M-parameter \textbf{PoC} that has. Neither substitutes for
+the other, and Table~\ref{tab:ablation-codec}'s codec/attention
+findings should not be assumed to hold at the target's scale.
 
 \subsection{Compute budget analysis (target design point)}
 \label{sec:compute}

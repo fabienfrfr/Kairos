@@ -52,6 +52,11 @@ fast-attn = [
     "flash-linear-attention[cuda]>=0.5.1",
     "causal-conv1d>=1.4.0",
 ]
+# same fused kernels on AMD GPUs; causal-conv1d builds against ROCm's HIP toolchain automatically
+fast-attn-rocm = [
+    "flash-linear-attention[rocm]>=0.5.1",
+    "causal-conv1d>=1.4.0",
+]
 # `pip install -e ".[cli]"` — everything the `kairos` command-line entry point needs
 cli = [
     "typer>=0.15",

@@ -96,6 +96,10 @@ Two of the six sources are gated — accept their terms on the HF page first, th
 
 ### 2. Train
 
+For fused DeltaNet/causal-conv1d kernels (optional, falls back to slower pure-PyTorch
+without them): `pip install -e ".[fast-attn]"` on NVIDIA/CUDA GPUs,
+`pip install -e ".[fast-attn-rocm]"` on AMD/ROCm GPUs.
+
 Open `notebook/kairos_multimodal_training.py` with [marimo](https://marimo.io):
 
 ```bash

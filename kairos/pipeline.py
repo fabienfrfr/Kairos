@@ -102,6 +102,7 @@ class TrainConfig:
     mask_mae_reweight: bool = False  # MAE-stage: plain CE, no 1/p variance blowup
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
     moe_bias_update_rate: float = 1e-3  # DeepSeek-V3-style aux-loss-free MoE balancing step; 0 disables
+    moe_aux_loss_weight: float = 0.0  # classic Switch-style load-balancing loss weight; 0 disables (default)
     # train-time self-conditioning rate; 0.0 disables it (generate() then sees OOD input).
     self_conditioning_prob: float = 0.5
     max_consecutive_nan: int = 50  # abort with a diagnosis instead
@@ -148,6 +149,14 @@ def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
             current_id, current_len = v, 1
     longest[current_id] = max(longest.get(current_id, 0), current_len)
     return longest
+
+
+def _bf16_hardware_available() -> bool:
+    """True on real bf16 tensor cores: Ampere+ on CUDA, or any bf16-capable ROCm GPU."""
+    if not torch.cuda.is_available():
+        return False
+    is_rocm = torch.version.hip is not None
+    return torch.cuda.is_bf16_supported() and (is_rocm or torch.cuda.get_device_capability() >= (8, 0))
 
 
 def _resolve_amp_dtype(amp_dtype_override: str | None, bf16_supported: bool) -> torch.dtype:
@@ -254,11 +263,10 @@ class KairosMultimodalPipeline:
         self.hf_trainer: KairosDiffusionTrainer | None = None
         self.writer: SummaryWriter | None = None
 
-        # AMP: bf16 only on real tensor-core hardware (Ampere+); T4 "supports" bf16 unaccelerated.
+        # AMP: bf16 only on real tensor cores (Ampere+ CUDA, or any ROCm bf16-capable GPU)
         if torch.cuda.is_available():
             self.amp_device_type = "cuda"
-            bf16_hw = torch.cuda.is_bf16_supported() and torch.cuda.get_device_capability() >= (8, 0)
-            self.amp_dtype = _resolve_amp_dtype(train_config.amp_dtype, bf16_hw)
+            self.amp_dtype = _resolve_amp_dtype(train_config.amp_dtype, _bf16_hardware_available())
         elif torch.backends.mps.is_available():
             self.amp_device_type = "mps"
             self.amp_dtype = torch.float16
@@ -400,7 +408,9 @@ class KairosMultimodalPipeline:
             eval_dataset = self._build_dataset(self.eval_data_config)
             eval_sampler = None
             if self.distributed:
-                eval_sampler = DistributedSampler(eval_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False)
+                eval_sampler = DistributedSampler(
+                    eval_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False
+                )
             self.eval_loader = DataLoader(
                 eval_dataset,
                 batch_size=self.eval_data_config.batch_size,
@@ -463,6 +473,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_reweight_clip = tc.mask_reweight_clip
         self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
         self.hf_trainer.self_conditioning_prob = tc.self_conditioning_prob
+        self.hf_trainer.moe_aux_loss_weight = tc.moe_aux_loss_weight
         self.writer = SummaryWriter(str(self.tb_dir)) if self.is_main_process else None
 
         if tc.hub_repo_id and tc.hub_push_every_ckpt and self.is_main_process:
@@ -1075,9 +1086,7 @@ class KairosMultimodalPipeline:
                         self.writer.add_scalar("train/loss", loss_val, self.global_step)
                         self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.global_step)
                         self.writer.add_scalar("train/mask_p_max", self.hf_trainer.mask_p_max, self.global_step)
-                        self.writer.add_scalar(
-                            "train/mask_reweight", self.hf_trainer.mask_reweight, self.global_step
-                        )
+                        self.writer.add_scalar("train/mask_reweight", self.hf_trainer.mask_reweight, self.global_step)
                         self.log_rows.append({"step": self.global_step, "epoch": epoch, "loss": loss_val})
 
                         if progress_callback is not None:

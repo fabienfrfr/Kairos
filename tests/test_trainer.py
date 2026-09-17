@@ -9,6 +9,7 @@ from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import (
     KairosDiffusionTrainer,
     anneal_mask_schedule,
+    collect_moe_aux_loss,
     compute_masked_diffusion_losses,
     make_diffusion_mask,
     stage_mask_schedule,
@@ -587,6 +588,73 @@ def test_update_moe_bias_touches_every_gate_in_the_model(model):
 
 def test_update_moe_bias_is_noop_on_dense_model(dense_model):
     update_moe_bias(dense_model, update_rate=0.05)  # no MoE gates at all: must not raise
+
+
+def test_moe_router_sets_last_aux_loss_only_while_training(model, tokenizer):
+    router = next(m for m in model.modules() if isinstance(m, KairosTopkRouter))
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+
+    model.eval()
+    trainer.compute_loss(model, batch)
+    assert router.last_aux_loss is None
+
+    model.train()
+    trainer.compute_loss(model, batch)
+    assert router.last_aux_loss is not None
+    assert torch.is_tensor(router.last_aux_loss) and router.last_aux_loss.requires_grad
+
+
+def test_collect_moe_aux_loss_sums_every_router(model):
+    model.train()
+    routers = [m for m in model.modules() if isinstance(m, KairosTopkRouter)]
+    assert routers, "fixture must build at least one MoE layer"
+    for i, r in enumerate(routers):
+        r.last_aux_loss = torch.tensor(float(i + 1))
+
+    total = collect_moe_aux_loss(model)
+
+    assert total.item() == sum(i + 1 for i in range(len(routers)))
+
+
+def test_collect_moe_aux_loss_is_zero_on_dense_model(dense_model):
+    total = collect_moe_aux_loss(dense_model)
+    assert total.item() == 0.0
+
+
+def test_compute_loss_ignores_aux_loss_by_default(model, tokenizer):
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+    trainer.mask_p_max = 0.3
+    trainer.mask_reweight = False
+    model.train()
+
+    assert trainer.moe_aux_loss_weight == 0.0
+    loss_without = trainer.compute_loss(model, batch)
+
+    for m in model.modules():
+        if isinstance(m, KairosTopkRouter):
+            m.last_aux_loss = torch.tensor(1e6)  # would blow up the loss if it were being added
+    trainer.moe_aux_loss_weight = 0.0
+    loss_still_without = trainer.compute_loss(model, batch)
+
+    assert torch.isfinite(loss_without) and torch.isfinite(loss_still_without)
+
+
+def test_compute_loss_adds_weighted_aux_loss_when_enabled(model, tokenizer):
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+    trainer.mask_p_max = 0.3
+    trainer.mask_reweight = False
+    trainer.moe_aux_loss_weight = 1.0
+    model.train()
+
+    loss = trainer.compute_loss(model, batch)
+
+    assert torch.is_tensor(loss) and torch.isfinite(loss)
+    loss.backward()
+    router = next(m for m in model.modules() if isinstance(m, KairosTopkRouter))
+    assert router.weight.grad is not None and router.weight.grad.abs().sum() > 0
 
 
 def test_trainer_mae_mode_never_exceeds_p_max(dense_model, tokenizer, monkeypatch):

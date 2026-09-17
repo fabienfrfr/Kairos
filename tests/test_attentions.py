@@ -18,6 +18,7 @@ from kairos.attentions import (
     KairosGatedDeltaNet,
     KairosLiZAttention2,
     KairosRotaryEmbedding,
+    _can_fuse_flex,
     _resolve_attn_impl,
     _supports_cu_seqlens,
 )
@@ -1063,3 +1064,14 @@ def test_no_warning_on_cuda_with_both_fast_kernels_present(recwarn):
 
     _warn_if_missing_fast_kernels(cuda_available=True, delta_backend="fla", conv_backend="causal_conv1d")
     assert len(recwarn.list) == 0
+
+
+def test_can_fuse_flex_false_without_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert _can_fuse_flex() is False
+
+
+def test_can_fuse_flex_false_on_rocm_even_if_cuda_reports_available(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", "5.7.0")
+    assert _can_fuse_flex() is False

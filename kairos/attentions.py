@@ -29,8 +29,8 @@ except Exception:  # noqa: BLE001 - flex compile can fail; must not crash import
 
 
 def _can_fuse_flex():
-    if not torch.cuda.is_available():
-        return False
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return False  # FlexAttention's fused Triton path is validated on CUDA, not ROCm
     cap = torch.cuda.get_device_capability(torch.cuda.current_device())
     return cap >= _FLEX_MIN_COMPUTE_CAPABILITY
 
