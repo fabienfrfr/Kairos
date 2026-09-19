@@ -33,6 +33,7 @@ def config(tokenizer):
         num_modalities=8,
         stride=1,
         num_scales=2,
+        intermediate_size=32,
         # keep both aliases in sync; different transformers versions read different fields
         num_local_experts=7,
         n_routed_experts=7,

@@ -65,7 +65,9 @@ def multimodal_examples(rng):
 
 @pytest.fixture
 def model_config():
-    return KairosConfig(d_model=32, n_heads=4, n_layers=4, num_modalities=8, attnres_block_size=2)
+    return KairosConfig(
+        d_model=32, n_heads=4, n_layers=4, num_modalities=8, attnres_block_size=2, intermediate_size=64
+    )
 
 
 @pytest.fixture
@@ -104,9 +106,7 @@ def test_build_wires_mask_reweight_clip_to_trainer(tmp_path, model_config, text_
     default_pipe.build()
     assert default_pipe.hf_trainer.mask_reweight_clip == 3.0
 
-    train_config = TrainConfig(
-        epochs=1, save_every=3, run_dir=str(tmp_path / "run_override"), mask_reweight_clip=None
-    )
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run_override"), mask_reweight_clip=None)
     pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
     pipe.build()
     assert pipe.hf_trainer.mask_reweight_clip is None
@@ -218,6 +218,11 @@ def test_default_build_without_cuda_does_not_compile(built_pipeline):
     assert built_pipeline.model_forward is built_pipeline.model
 
 
+# needs a real CUDA device: transformers.TrainingArguments.build() calls set_device() too
+_needs_real_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a real CUDA device")
+
+
+@_needs_real_cuda
 def test_build_compiles_model_forward_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
@@ -228,6 +233,7 @@ def test_build_compiles_model_forward_when_cuda_available(tmp_path, model_config
     assert pipe.model_forward is not pipe.model
 
 
+@_needs_real_cuda
 def test_compile_model_false_skips_compile_even_with_cuda(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples, compile_model=False)
@@ -245,6 +251,7 @@ def _restore_dynamo_scalar_capture():
     torch._dynamo.config.capture_scalar_outputs = original
 
 
+@_needs_real_cuda
 def test_build_enables_capture_scalar_outputs_when_compiling(
     tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_scalar_capture
 ):
@@ -265,6 +272,7 @@ def _restore_dynamo_recompile_limit():
     torch._dynamo.config.recompile_limit = original
 
 
+@_needs_real_cuda
 def test_build_raises_recompile_limit_when_compiling(
     tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_recompile_limit
 ):
@@ -285,6 +293,7 @@ def _restore_inductor_compile_threads():
     torch._inductor.config.compile_threads = original
 
 
+@_needs_real_cuda
 def test_build_forces_single_compile_thread_when_compiling(
     tmp_path, model_config, text_examples, monkeypatch, _restore_inductor_compile_threads
 ):
@@ -331,9 +340,8 @@ def test_build_and_train_actually_compile_on_cpu_when_forced(
     assert torch.isfinite(loss)
 
 
-def test_build_gives_eval_a_separate_compiled_instance_from_train(
-    tmp_path, model_config, text_examples, monkeypatch
-):
+@_needs_real_cuda
+def test_build_gives_eval_a_separate_compiled_instance_from_train(tmp_path, model_config, text_examples, monkeypatch):
     """Separate instances keep grad_mode from becoming a recompile-triggering guard axis."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
@@ -361,6 +369,7 @@ def test_build_leaves_capture_scalar_outputs_untouched_without_cuda(
     assert torch._dynamo.config.capture_scalar_outputs is False
 
 
+@_needs_real_cuda
 def test_build_enables_tf32_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
     orig_matmul = torch.backends.cuda.matmul.allow_tf32
     orig_cudnn = torch.backends.cudnn.allow_tf32
@@ -398,6 +407,7 @@ def test_build_leaves_tf32_untouched_without_cuda(tmp_path, model_config, text_e
         torch.backends.cudnn.allow_tf32 = orig_cudnn
 
 
+@_needs_real_cuda
 def test_optimizer_uses_fused_adamw_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
@@ -1325,9 +1335,7 @@ def test_replay_ddp_log_survives_a_broken_phase_callback(tmp_path):
 def test_replay_ddp_log_relays_real_triton_autotuning_lines_as_phases(tmp_path):
     log_path = tmp_path / "train_ddp.log"
     log_path.write_text(
-        "phase run\n"
-        "Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1\n"
-        "finished after 6.31s,\n"
+        "phase run\nAutotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1\nfinished after 6.31s,\n"
     )
     phases = []
 
@@ -1472,9 +1480,11 @@ def test_async_save_does_not_block_caller(built_pipeline, tmp_path, monkeypatch)
     """Regression test: wait=False must return immediately, not block on a slow write."""
     import time
 
+    real_save = torch.save
+
     def _slow_save(payload, path):
         time.sleep(0.3)
-        torch.save(payload, path)
+        real_save(payload, path)
 
     monkeypatch.setattr(torch, "save", _slow_save)
     path = tmp_path / "slow.pt"

@@ -83,7 +83,7 @@ def mini_alpaca():
 
 @pytest.fixture
 def config():
-    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
+    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, intermediate_size=32)
 
 
 def test_kairos_config(config):

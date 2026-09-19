@@ -350,6 +350,7 @@ def test_deltanet_varlen_static_shape_is_stable_across_different_content_lengths
     assert spy.calls[0]["q_shape"] == spy.calls[1]["q_shape"]
 
 
+@pytest.mark.skipif(DELTA_RULE_BACKEND != "fla", reason="cu_seqlens varlen path needs flash-linear-attention")
 def test_deltanet_varlen_static_padding_never_goes_negative():
     """Sanity bound: total valid tokens never exceeds B*full_seq_len, so pad_n stays >= 0."""
     model = get_deltanet_model()

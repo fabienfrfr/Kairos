@@ -155,8 +155,11 @@ def _bf16_hardware_available() -> bool:
     """True on real bf16 tensor cores: Ampere+ on CUDA, or any bf16-capable ROCm GPU."""
     if not torch.cuda.is_available():
         return False
-    is_rocm = torch.version.hip is not None
-    return torch.cuda.is_bf16_supported() and (is_rocm or torch.cuda.get_device_capability() >= (8, 0))
+    try:
+        is_rocm = torch.version.hip is not None
+        return torch.cuda.is_bf16_supported() and (is_rocm or torch.cuda.get_device_capability() >= (8, 0))
+    except RuntimeError:
+        return False  # is_available() lied (broken/mismatched driver): assume no fast path
 
 
 def _resolve_amp_dtype(amp_dtype_override: str | None, bf16_supported: bool) -> torch.dtype:
