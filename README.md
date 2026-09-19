@@ -96,9 +96,22 @@ Two of the six sources are gated — accept their terms on the HF page first, th
 
 ### 2. Train
 
-For fused DeltaNet/causal-conv1d kernels (optional, falls back to slower pure-PyTorch
-without them): `pip install -e ".[fast-attn]"` on NVIDIA/CUDA GPUs,
-`pip install -e ".[fast-attn-rocm]"` on AMD/ROCm GPUs.
+Fused DeltaNet/causal-conv1d kernels are optional (the model falls back to slower
+pure-PyTorch without them):
+
+- NVIDIA/CUDA: `uv sync --extra fast-attn` (or `pip install -e ".[fast-attn]"`).
+- AMD/ROCm: `uv sync --extra rocm` installs only the PyTorch ROCm build from
+  AMD's official wheel index (matching `https://rocm.docs.amd.com/.../pytorch/install.html`,
+  e.g. `torch[device-all]==2.13.0+rocm10.0.0`), without any compiled kernels.
+  Add `--extra fast-attn-rocm` to also compile the fused fla/causal-conv1d kernels —
+  this needs the ROCm HIP toolchain (`hipcc`, e.g. the `rocm-hip-sdk` package) and a
+  few GB of disk, since neither `causal-conv1d` nor `flash-linear-attention` ships
+  prebuilt ROCm wheels.
+
+The `fast-attn` (CUDA) extra is mutually exclusive with `rocm`/`fast-attn-rocm`.
+On machines that already run `uv sync --extra rocm`, prefer `uv sync --extra rocm
+--extra fast-attn-rocm --extra cli` over the raw `pip` command from AMD's docs, so
+`uv` keeps the whole environment in sync.
 
 Open `notebook/kairos_multimodal_training.py` with [marimo](https://marimo.io):
 

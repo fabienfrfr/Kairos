@@ -47,12 +47,20 @@ notebook = [
     "pandas>=2.0",
     "tqdm>=4.67.0",
 ]
+# ROCm build of PyTorch only, from AMD's official wheel index (download docs:
+# https://rocm.docs.amd.com/en/latest/how-to/deep-learning/pytorch/install.html);
+# pair with fast-attn-rocm for the fla/causal-conv1d kernels
+rocm = [
+    "rocm[libraries]==10.0.0; sys_platform == 'linux' and python_version < '3.14'",
+    "torch[device-all]==2.13.0+rocm10.0.0; sys_platform == 'linux' and python_version < '3.14'",
+    "triton>=3.8.0; sys_platform == 'linux' and python_version < '3.14'",
+]
 # fused Triton/CUDA kernels for KairosGatedDeltaNet; without this, falls back to slow pure-PyTorch
 fast-attn = [
     "flash-linear-attention[cuda]>=0.5.1",
     "causal-conv1d>=1.4.0",
 ]
-# same fused kernels on AMD GPUs; causal-conv1d builds against ROCm's HIP toolchain automatically
+# same fused kernels on AMD GPUs; use together with the `rocm` extra and a ROCm HIP toolchain
 fast-attn-rocm = [
     "flash-linear-attention[rocm]>=0.5.1",
     "causal-conv1d>=1.4.0",
@@ -66,7 +74,34 @@ cli = [
 [project.scripts]
 kairos = "kairos.cli:app"
 
+[tool.uv]
+# AMD's ROCm wheels carry local-version tags; let the resolver pick the best
+# match across both indexes (PyPI + AMD) instead of first-index-wins
+index-strategy = "unsafe-best-match"
+conflicts = [
+    [
+        { extra = "fast-attn" },
+        { extra = "rocm" },
+    ],
+    [
+        { extra = "fast-attn" },
+        { extra = "fast-attn-rocm" },
+    ],
+]
 
+[tool.uv.sources]
+rocm = [{ index = "pytorch-rocm", extra = "rocm" }]
+torch = [{ index = "pytorch-rocm", extra = "rocm" }]
+triton = [{ index = "pytorch-rocm", extra = "rocm" }]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
+# AMD's official ROCm wheels for PyTorch; see https://rocm.docs.amd.com/en/latest/how-to/deep-learning/pytorch/
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://stable.repo.amd.com/rocm/whl-next/"
 
 [tool.setuptools]
 packages = ["kairos", "kairos.templates"]
