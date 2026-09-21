@@ -22,7 +22,10 @@ def _(os):
     except Exception:  # noqa: BLE001 – kaggle fallback
         HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
 
-    login(token=HF_TOKEN, add_to_git_credential=False)
+    try:
+        login(token=HF_TOKEN, add_to_git_credential=False)
+    except Exception:
+        print("No HF_TOKEN")
     return
 
 
@@ -70,6 +73,7 @@ def _():
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
+    print(f"build ROCm : {torch.version.hip}")   # None if build CUDA/CPU
 
     tokenizer = KairosTokenizer()
     print(f"vocab size: {len(tokenizer)}")
