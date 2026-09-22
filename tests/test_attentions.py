@@ -156,22 +156,23 @@ def test_swa_linear_complexity():
     cfg = Cfg()
     attn = KairosAttention(cfg)
     rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
+    # Fixed window => O(L); sub-ms forwards: batch 50 reps, min over trials.
     lengths = [256, 512, 1024]
-    times = []
 
-    def measure(x, cos_sin):
-        start = time.time()
-        _ = attn(x, cos_sin)
-        return time.time() - start
-
-    for L in lengths:
+    def bench(L):
         x = torch.randn(1, L, 32)
-        pos = torch.arange(L).unsqueeze(0)
-        cos_sin = rope(x, pos)
+        cos_sin = rope(x, torch.arange(L).unsqueeze(0))
+        for _ in range(10):
+            attn(x, cos_sin)
+        best = float("inf")
         for _ in range(3):
-            _ = attn(x, cos_sin)
-        times.append(sum(measure(x, cos_sin) for _ in range(3)) / 3)
+            start = time.perf_counter()
+            for _ in range(50):
+                attn(x, cos_sin)
+            best = min(best, (time.perf_counter() - start) / 50 * 1000)
+        return best
 
+    times = [bench(L) for L in lengths]
     r1 = times[1] / times[0]
     r2 = times[2] / times[1]
     assert r1 < 3.0 and r2 < 3.0

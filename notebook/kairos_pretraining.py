@@ -24,7 +24,7 @@ def _(os):
 
     try:
         login(token=HF_TOKEN, add_to_git_credential=False)
-    except Exception:
+    except Exception:  # noqa: BLE001 – missing token fallback
         print("No HF_TOKEN")
     return
 
@@ -617,7 +617,7 @@ def _(FORCE_RESTART, mo, pipe):
 def _(eval_data_config, pipe):
     from kairos.runners import evaluate_and_log
 
-    eval_loss = evaluate_and_log(pipe, eval_data_config)
+    evaluate_and_log(pipe, eval_data_config)
     return
 
 
@@ -662,7 +662,7 @@ def _(
     from kairos.runners import run_generation_demo
 
     # diffusion generation via KairosDiffusionGenerationMixin (HF EntropyBoundSampler + adaptive)
-    generation_results = run_generation_demo(
+    run_generation_demo(
         pipe,
         tokenizer,
         eval_examples,
