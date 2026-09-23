@@ -83,7 +83,7 @@ and no multimodal result is reported.
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.95\linewidth]{../architecture/kairos_architecture.pdf}
-    \caption{Kairos data and training flow, left to right. Each DiffusionBlock is a standard
+    \caption{Kairos data and training flow, left to right. Each KairosBlock is a standard
     pre-norm attention+FFN residual pair; AttnRes only re-mixes what feeds into it. Training (bottom)
     uses one masking mechanism across three curriculum stages (MAE $\to$ transition $\to$ diffusion),
     illustrated with a masked-input/denoised-output example.}

@@ -305,7 +305,7 @@ class KairosMoE(DeepseekV3MoE):
 ATTN_TYPES = {"vanilla": KairosAttention, "liz2": KairosLiZAttention2, "delta_only": KairosDeltaOnlyAttention}
 
 
-class DiffusionBlock(nn.Module):
+class KairosBlock(nn.Module):
     def __init__(self, config, layer_idx, use_moe=False):
         super().__init__()
         self.norm1 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -357,12 +357,12 @@ class KairosAttnRes(nn.Module):
         return (weights.unsqueeze(-1) * V).sum(dim=0)
 
 
-class KairosDiffusionBackbone(nn.Module):
+class KairosBackbone(nn.Module):
     """v3 Block-AttnRes: prior layer outputs are windowed into blocks before aggregation."""
 
     def __init__(self, config, use_moe=False):
         super().__init__()
-        self.layers = nn.ModuleList([DiffusionBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([KairosBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
         self.norm = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.aggregator = nn.ModuleList([KairosAttnRes(config.hidden_size) for _ in range(config.num_hidden_layers)])
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
@@ -658,11 +658,11 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         self.embedding = KairosEmbedding(vocab_size=vocab_size, d_model=config.hidden_size, num_octet_families=n_octet)
         share = getattr(config, "share_backbones", False)
         if share:
-            shared = KairosDiffusionBackbone(config=config, use_moe=use_moe)
+            shared = KairosBackbone(config=config, use_moe=use_moe)
             self.backbones = nn.ModuleList([shared] * self.codec.num_scales)
         else:
             self.backbones = nn.ModuleList(
-                [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
+                [KairosBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
             )
         if getattr(config, "use_memory_gate", False):
             head_dim = config.hidden_size // config.num_attention_heads

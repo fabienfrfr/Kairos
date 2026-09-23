@@ -65,7 +65,7 @@ spike the loss, as hypothesized when the late-run instability was first observed
 
 ## 5. Attention window (`attnres_block_size`, on `n_layers=4`)
 
-Needs `n_layers>1` to have any effect at all — `KairosDiffusionBackbone`'s block
+Needs `n_layers>1` to have any effect at all — `KairosBackbone`'s block
 aggregation windows *across layers*, so it's a structural no-op at `n_layers=1`
 (confirmed empirically: identical bit-for-bit output before this was caught).
 

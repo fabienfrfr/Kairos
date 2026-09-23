@@ -45,7 +45,7 @@ partition "2. Convolutional Codec — Encode" #E8F8F5 {
 ' ─────────────────────────────────────────
 ' 3. BACKBONE
 ' ─────────────────────────────────────────
-partition "3. KairosDiffusionBackbone" #FEF9E7 {
+partition "3. KairosBackbone" #FEF9E7 {
     note right
         **Attention Residual (AttnRes)**
         * Softmax over all prior layer outputs

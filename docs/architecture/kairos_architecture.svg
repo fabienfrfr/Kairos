@@ -1,7 +1,13 @@
-<svg viewBox="0 0 1220 300" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+<svg viewBox="0 -30 1280 412" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <marker id="arrow-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#999"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3a6fd8"/>
     </marker>
   </defs>
 
@@ -11,15 +17,26 @@
     .note { font-size:9px; fill:#666; font-style:italic; }
     .arr { stroke:#333; stroke-width:1.3; fill:none; marker-end:url(#arrow); }
     .dashed { stroke:#999; stroke-width:1; fill:none; stroke-dasharray:3,3; marker-end:url(#arrow); }
+    .dashed-light { stroke:#aaa; stroke-width:1; fill:none; stroke-dasharray:2,2; marker-end:url(#arrow-light); }
     .group-label { font-size:10.5px; font-weight:700; fill:#222; }
     .mask { fill:#c0392b; font-family:monospace; font-size:10px; }
     .clean { fill:#1e7a34; font-family:monospace; font-size:10px; }
   </style>
 
-  <!-- input -->
+  <!-- white background -->
+  <rect x="0" y="-30" width="1280" height="412" fill="#ffffff"/>
+
+  <!-- tied-weight links: two small arcs above the pipeline, not buried in prose -->
+  <path d="M163,70 Q635,-25 1108,70" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="4,3" marker-end="url(#arrow-light)"/>
+  <path d="M307,20 Q574,-9 842,20" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="4,3" marker-end="url(#arrow-light)"/>
+  <text x="640" y="2" class="note" text-anchor="middle" font-size="8">dashed arcs = tied weights, both ways: Embedding / Output Head, and Codec encode / decode</text>
+
+  <!-- ===================== ROW 1: main pipeline, all boxes at the same height, left to right ===================== -->
+
+  <!-- input: byte stream -->
   <rect class="box" x="6" y="70" width="88" height="42" fill="#eaf1fb"/>
-  <text x="50" y="88" class="sub" text-anchor="middle">bytes +</text>
-  <text x="50" y="101" class="sub" text-anchor="middle">modality_ids</text>
+  <text x="50" y="88" class="sub" text-anchor="middle" font-weight="700">byte stream</text>
+  <text x="50" y="101" class="note" text-anchor="middle">+ modality id</text>
   <path class="arr" d="M94,91 L118,91"/>
 
   <!-- embedding -->
@@ -30,8 +47,8 @@
 
   <!-- PyramidalCodec.encode -->
   <rect x="232" y="20" width="150" height="145" rx="6" fill="#f6effb" stroke="#8a6bb0" stroke-width="1.1"/>
-  <text x="307" y="34" class="group-label" text-anchor="middle">PyramidalCodec</text>
-  <text x="307" y="45" class="note" text-anchor="middle">.encode: 1 Linear/Conv per scale</text>
+  <text x="307" y="34" class="group-label" text-anchor="middle">Pyramidal Codec</text>
+  <text x="307" y="45" class="note" text-anchor="middle">one encoder per scale</text>
   <rect class="box" x="242" y="53" width="60" height="24" fill="#fff"/>
   <text x="272" y="69" class="sub" text-anchor="middle" font-size="9.5">scale 0</text>
   <rect class="box" x="312" y="53" width="60" height="24" fill="#fff"/>
@@ -40,82 +57,141 @@
   <text x="272" y="98" class="sub" text-anchor="middle" font-size="9.5">scale 2</text>
   <rect class="box" x="312" y="82" width="60" height="24" fill="#fff"/>
   <text x="342" y="98" class="sub" text-anchor="middle" font-size="9.5">scale 3</text>
-  <text x="307" y="118" class="note" text-anchor="middle">patch_size = stride^(k+1)</text>
-  <text x="307" y="130" class="note" text-anchor="middle">gather_active: modality_scales</text>
-  <text x="307" y="141" class="note" text-anchor="middle">routes each modality to its</text>
-  <text x="307" y="152" class="note" text-anchor="middle">scale(s) only</text>
+  <text x="307" y="119" class="note" text-anchor="middle">each scale = a longer run of</text>
+  <text x="307" y="130" class="note" text-anchor="middle">consecutive bytes (reshape, not pooling)</text>
+  <text x="307" y="144" class="note" text-anchor="middle">each modality is routed to</text>
+  <text x="307" y="155" class="note" text-anchor="middle">only the scale(s) it needs</text>
   <path class="arr" d="M382,91 L406,91"/>
 
-  <!-- DiffusionBackbone x num_scales -->
+  <!-- KairosBackbone x num_scales -->
   <rect x="406" y="6" width="330" height="175" rx="6" fill="#eefaf0" stroke="#4c9a5c" stroke-width="1.1"/>
-  <text x="571" y="20" class="group-label" text-anchor="middle">DiffusionBackbone &#215; num_scales (independent stacks)</text>
+  <text x="571" y="20" class="group-label" text-anchor="middle">KairosBackbone, one independent stack per scale</text>
 
   <rect class="box" x="422" y="30" width="298" height="30" fill="#fff" stroke-dasharray="2,2"/>
-  <text x="571" y="49" class="sub" text-anchor="middle" font-size="9">AttnRes: layer input = weighted_sum(embed, prior block-sums)</text>
+  <text x="571" y="49" class="note" text-anchor="middle" font-size="9.5">AttnRes: this layer's input is a weighted mix of the</text>
 
-  <rect class="box" x="470" y="72" width="200" height="86" fill="#fff"/>
-  <text x="570" y="86" class="sub" text-anchor="middle" font-weight="700" font-size="10">DiffusionBlock &#215; n_layers</text>
-  <rect class="box" x="482" y="94" width="176" height="24" fill="#dceaff"/>
-  <text x="570" y="110" class="sub" text-anchor="middle" font-size="9.5">x += LiZAttention2(norm1(h))</text>
-  <rect class="box" x="482" y="128" width="176" height="24" fill="#fff3d6"/>
-  <text x="570" y="144" class="sub" text-anchor="middle" font-size="9.5">x += FFN / MoE(norm2(x))</text>
+  <rect class="box" x="470" y="72" width="200" height="94" fill="#fff"/>
+  <text x="570" y="86" class="sub" text-anchor="middle" font-weight="700" font-size="10">KairosBlock &#215; n layers</text>
+  <rect class="box" x="482" y="94" width="176" height="30" fill="#dceaff"/>
+  <text x="570" y="105" class="note" text-anchor="middle" font-size="8.5" font-style="normal" font-weight="700">KairosLiZAttention2 (bidirectional)</text>
+  <text x="570" y="118" class="note" text-anchor="middle" font-size="8.5" font-style="normal">h + Attn(norm(h))</text>
+  <rect class="box" x="482" y="134" width="176" height="24" fill="#fff3d6"/>
+  <text x="570" y="150" class="note" text-anchor="middle" font-size="9.5" font-style="normal">x + FFN/MoE(norm(x))</text>
   <path class="arr" d="M570,60 L570,72"/>
 
-  <text x="571" y="170" class="note" text-anchor="middle">accumulate x; close block every attnres_block_size layers</text>
+  <text x="571" y="170" class="note" text-anchor="middle">embedding and the prior blocks' summed outputs</text>
   <path class="arr" d="M736,91 L750,91"/>
 
   <!-- ScaleRouter.scatter + PyramidalCodec.decode -->
   <rect x="750" y="20" width="185" height="145" rx="6" fill="#f6effb" stroke="#8a6bb0" stroke-width="1.1"/>
-  <text x="842" y="34" class="group-label" text-anchor="middle">scatter_active</text>
-  <text x="842" y="45" class="note" text-anchor="middle">write each scale's chunk back</text>
-  <text x="842" y="56" class="note" text-anchor="middle">to its positions</text>
+  <text x="842" y="34" class="group-label" text-anchor="middle">Scatter back</text>
+  <text x="842" y="45" class="note" text-anchor="middle">each scale's output returns</text>
+  <text x="842" y="56" class="note" text-anchor="middle">to its original positions</text>
   <rect class="box" x="765" y="68" width="155" height="34" fill="#fff"/>
-  <text x="842" y="82" class="sub" text-anchor="middle" font-size="9.5">PyramidalCodec.decode</text>
-  <text x="842" y="94" class="note" text-anchor="middle">concat &#8594; norm &#8594; fusion Linear</text>
+  <text x="842" y="82" class="sub" text-anchor="middle" font-size="9.5">Codec decode</text>
+  <text x="842" y="94" class="note" text-anchor="middle">concat &#8594; norm &#8594; fusion</text>
   <path class="arr" d="M842,60 L842,68"/>
-  <text x="842" y="120" class="note" text-anchor="middle">fusion tied to .encode</text>
-  <text x="842" y="131" class="note" text-anchor="middle">weights (patch mode)</text>
-  <path class="arr" d="M935,91 L959,91"/>
+  <text x="842" y="122" class="note" text-anchor="middle">fusion shares weights</text>
+  <text x="842" y="133" class="note" text-anchor="middle">with the encoder</text>
+  <path class="arr" d="M935,91 L1063,91"/>
+  <text x="999" y="83" class="note" text-anchor="middle" font-size="8">+ final KairosNorm</text>
 
-  <!-- norm / head / logits -->
-  <rect class="box" x="959" y="70" width="82" height="42" fill="#dbe7fb"/>
-  <text x="1000" y="94" class="sub" text-anchor="middle" font-size="9.5">KairosNorm</text>
-  <path class="arr" d="M1041,91 L1063,91"/>
+  <rect class="box" x="1063" y="70" width="90" height="42" fill="#dbe7fb"/>
+  <text x="1108" y="87" class="sub" text-anchor="middle" font-size="9.5">Output Head</text>
+  <text x="1108" y="99" class="note" text-anchor="middle" font-size="8.5">tied weights</text>
+  <path class="arr" d="M1153,91 L1163,91"/>
 
-  <rect class="box" x="1063" y="65" width="90" height="52" fill="#dbe7fb"/>
-  <text x="1108" y="86" class="sub" text-anchor="middle" font-size="9.5">OutputHead</text>
-  <text x="1108" y="98" class="note" text-anchor="middle">tied weights</text>
+  <!-- output: byte stream, in line with input, no detour -->
+  <rect class="box" x="1163" y="70" width="100" height="42" fill="#eaf1fb"/>
+  <text x="1213" y="88" class="sub" text-anchor="middle" font-weight="700">byte stream</text>
+  <text x="1213" y="101" class="note" text-anchor="middle" font-size="8.5">predicted, from logits</text>
 
-  <rect class="box" x="1040" y="140" width="150" height="34" fill="#eaf1fb"/>
-  <text x="1115" y="161" class="sub" text-anchor="middle" font-size="9.5">token/octet logits</text>
-  <path class="arr" d="M1108,117 L1115,140"/>
+  <!-- ===================== cache + memory gate (belongs to backbone row) ===================== -->
+  <rect x="406" y="192" width="330" height="40" rx="5" fill="#fafafa" stroke="#999" stroke-width="1"/>
+  <text x="571" y="205" class="sub" text-anchor="middle" font-weight="700" font-size="9.5">Streaming cache, per scale</text>
+  <text x="571" y="216" class="note" text-anchor="middle">conv + DeltaNet state, carried step to step;</text>
+  <text x="571" y="226" class="note" text-anchor="middle">windowed attention keeps its own, reset every batch</text>
+  <path class="dashed" d="M571,181 L571,192"/>
 
-  <!-- KairosCache -->
-  <rect x="406" y="196" width="330" height="46" rx="5" fill="#fafafa" stroke="#999" stroke-width="1"/>
-  <text x="571" y="209" class="sub" text-anchor="middle" font-weight="700" font-size="10">KairosCache (per scale)</text>
-  <text x="571" y="221" class="note" text-anchor="middle">conv_caches + ssm_caches (DeltaNet), carried across streaming steps</text>
-  <text x="571" y="232" class="note" text-anchor="middle">SWA: separate windowed K/V cache, not carried across batches</text>
-  <path class="dashed" d="M571,181 L571,196"/>
+  <rect x="760" y="192" width="175" height="40" rx="5" fill="#fdeef0" stroke="#b5566b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="847" y="205" class="sub" text-anchor="middle" font-weight="700" font-size="9.5">Memory gate</text>
+  <text x="847" y="216" class="note" text-anchor="middle">blends recurrent state across</text>
+  <text x="847" y="226" class="note" text-anchor="middle">sessions, between forward calls</text>
+  <path class="dashed" d="M760,212 L736,212"/>
 
-  <!-- Memory gate: cross-session, outside forward -->
-  <rect x="760" y="196" width="200" height="46" rx="5" fill="#fdeef0" stroke="#b5566b" stroke-width="1" stroke-dasharray="3,3"/>
-  <text x="860" y="209" class="sub" text-anchor="middle" font-weight="700" font-size="10">KairosMemoryGate</text>
-  <text x="860" y="221" class="note" text-anchor="middle">gate_memory_bank(): blends ssm_caches</text>
-  <text x="860" y="232" class="note" text-anchor="middle">across sessions, between forward calls</text>
-  <path class="dashed" d="M760,215 L736,215 L736,196"/>
+  <!-- ===================== ROW 2: what the data looks like at each stage ===================== -->
 
-  <!-- Training: curriculum + concrete example, on equal footing -->
-  <rect x="6" y="254" width="1204" height="42" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1.1"/>
+  <!-- text example under the INPUT box: the masked input -->
+  <path class="dashed-light" d="M50,112 L50,192"/>
+  <rect x="6" y="192" width="196" height="60" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1.1"/>
+  <text x="16" y="207" class="sub" font-weight="700" font-size="9.5">input example (masked)</text>
+  <text x="16" y="223" class="mask" font-size="9.5"><tspan font-weight="700">input</tspan>: The capital of</text>
+  <text x="16" y="236" class="mask" font-size="9.5">France is &#9608;&#9608;&#9608;&#9608;&#9608; .</text>
+  <text x="16" y="249" class="note" font-size="8">same mechanism at any curriculum stage</text>
 
-  <text x="16" y="268" class="sub" font-weight="700" font-size="9.5">Curriculum:</text>
-  <text x="16" y="280" class="note" font-size="8.5">stage 1 MAE (flat p_max, plain CE)</text>
-  <text x="16" y="290" class="note" font-size="8.5">&#8594; stage 2 transition (linear ramp) &#8594; stage 3 diffusion (t~U(0,1), CE/p)</text>
+  <!-- text example under the OUTPUT box: the denoised output -->
+  <path class="dashed-light" d="M1213,112 L1213,192"/>
+  <rect x="1073" y="192" width="196" height="60" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1.1"/>
+  <text x="1083" y="207" class="sub" font-weight="700" font-size="9.5">output example (denoised)</text>
+  <text x="1083" y="223" class="clean" font-size="9.5"><tspan font-weight="700">output</tspan>: The capital of</text>
+  <text x="1083" y="236" class="clean" font-size="9.5">France is Paris .</text>
+  <text x="1083" y="249" class="note" font-size="8">loss computed on masked positions only</text>
 
-  <line x1="330" y1="260" x2="330" y2="290" stroke="#c99a3d" stroke-width="1"/>
+  <!-- image example, directly under the codec: patches are contiguous runs of the FLATTENED
+       sequence, so a run can slide mid-row: it does not respect the 2D layout. -->
+  <path class="dashed-light" d="M307,165 L307,192"/>
+  <rect x="232" y="192" width="154" height="152" rx="6" fill="#fbfaf7" stroke="#ccc" stroke-width="1"/>
+  <text x="309" y="205" class="sub" text-anchor="middle" font-weight="700" font-size="9.5">image example (stride 3)</text>
+  <text x="309" y="216" class="note" text-anchor="middle" font-size="8">flattened row-major, then chunked</text>
 
-  <text x="345" y="268" class="sub" font-weight="700" font-size="9.5">Example (any stage, same mechanism):</text>
-  <text x="345" y="282" class="mask">input:  The capital of France is &#9608;&#9608;&#9608;&#9608;&#9608; .</text>
-  <text x="345" y="293" class="clean">output: The capital of France is Paris .</text>
-  <text x="700" y="282" class="note" font-size="8.5">loss on masked</text>
-  <text x="700" y="293" class="note" font-size="8.5">positions only</text>
+  <g>
+    <!-- 4 columns x 3 rows = 12 cells, native grid -->
+    <rect x="270" y="224" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="290" y="224" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="310" y="224" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="330" y="224" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="270" y="244" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="290" y="244" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="310" y="244" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="330" y="244" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="270" y="264" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="290" y="264" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="310" y="264" width="18" height="18" fill="#eee" stroke="#999"/>
+    <rect x="330" y="264" width="18" height="18" fill="#eee" stroke="#999"/>
+
+    <!-- scale 0, patch 3: one group = cells [3,4,5] = last cell of row 0 + first two of row 1.
+         it slides mid-row: shown as two separate pieces, linked by a small connector. -->
+    <rect x="328" y="222" width="22" height="22" fill="none" stroke="#3a6fd8" stroke-width="2"/>
+    <rect x="268" y="242" width="42" height="22" fill="none" stroke="#3a6fd8" stroke-width="2"/>
+    <path d="M339,244 L339,251 L279,251 L279,242" fill="none" stroke="#3a6fd8" stroke-width="1.2" stroke-dasharray="2,2" marker-end="url(#arrow-blue)"/>
+
+    <!-- scale 1, patch 9: one group = cells [0..8] = rows 0-1 in full, plus just the first
+         cell of row 2. two full rows, then a short leftover piece: still not row-aligned. -->
+    <rect x="267" y="221" width="84" height="44" fill="none" stroke="#d88a2a" stroke-width="2" stroke-dasharray="5,3"/>
+    <rect x="267" y="262" width="22" height="22" fill="none" stroke="#d88a2a" stroke-width="2" stroke-dasharray="5,3"/>
+  </g>
+
+  <text x="309" y="296" class="note" text-anchor="middle" font-size="8">a patch can end mid-row and resume</text>
+  <text x="309" y="306" class="note" text-anchor="middle" font-size="8">on the next: no notion of 2D layout</text>
+
+  <rect x="245" y="311" width="9" height="9" fill="none" stroke="#3a6fd8" stroke-width="2"/>
+  <text x="257" y="319" class="note" text-anchor="start" font-size="7.5">scale 0, patch 3</text>
+  <rect x="245" y="324" width="9" height="9" fill="none" stroke="#d88a2a" stroke-width="2" stroke-dasharray="3,2"/>
+  <text x="257" y="332" class="note" text-anchor="start" font-size="7.5">scale 1, patch 9</text>
+
+  <!-- ===================== bottom: pretraining curriculum as three small stages ===================== -->
+  <text x="6" y="349" class="sub" font-weight="700" font-size="9.5">Pretraining curriculum, same masking mechanism throughout &#8211; later stages (LoRA fine-tuning, dynamic MaG scheduling) train differently, see Training Procedure:</text>
+
+  <rect x="6" y="356" width="230" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
+  <text x="121" y="369" class="sub" text-anchor="middle" font-size="9">stage 1 &#8211; MAE: fixed mask rate, plain cross-entropy</text>
+
+  <path class="arr" d="M236,365 L256,365"/>
+
+  <rect x="256" y="356" width="380" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
+  <text x="446" y="369" class="sub" text-anchor="middle" font-size="9">stage 2 &#8211; transition: mask rate ramps linearly</text>
+
+  <path class="arr" d="M636,365 L656,365"/>
+
+  <rect x="656" y="356" width="618" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
+  <text x="965" y="369" class="sub" text-anchor="middle" font-size="9">stage 3 &#8211; diffusion: t ~ U(0,1), reweighted loss</text>
 </svg>
