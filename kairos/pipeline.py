@@ -152,14 +152,7 @@ def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
 
 
 def _bf16_hardware_available() -> bool:
-    """True on real bf16 tensor cores: Ampere+ on CUDA, or any bf16-capable ROCm GPU.
-
-    Passes an explicit device index rather than relying on the implicit current device:
-    an implicit call forces a lazy CUDA init keyed off `current_device()`, which is one
-    extra moving part a mocked/CI environment can get wrong. Broadened to `Exception`
-    (not just `RuntimeError`) because the failure mode of a fake/partial CUDA stack isn't
-    guaranteed to be a `RuntimeError` on every torch version.
-    """
+    """True on real bf16 tensor cores: Ampere+ on CUDA, or any bf16-capable ROCm GPU."""
     if not torch.cuda.is_available():
         return False
     try:

@@ -156,14 +156,7 @@ def test_swa_linear_complexity():
     cfg = Cfg()
     attn = KairosAttention(cfg)
     rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
-    # Fixed window => O(L); sub-ms forwards: batch 50 reps, median over trials.
-    #
-    # Wall-clock, not FLOP-counted: on a noisy/shared CI runner, a handful of trials can
-    # all land during a contention spike, so `min` alone doesn't protect against sustained
-    # (not just transient) noise. Median-of-9 plus a generous, still-diagnostic ratio bound
-    # (true O(L^2) would roughly double the ratio again at each step) trades a little
-    # sensitivity for not flaking under load. A real regression to quadratic/worse
-    # complexity fails this by a wide margin, not a hair.
+    # Fixed window => O(L); median-of-9 wall-clock trials, generous ratio bound (avoids CI flakiness).
     lengths = [256, 512, 1024]
     n_trials = 9
     reps = 50
@@ -180,12 +173,10 @@ def test_swa_linear_complexity():
                 attn(x, cos_sin)
             samples.append((time.perf_counter() - start) / reps * 1000)
         samples.sort()
-        return samples[len(samples) // 2]  # median: robust to both transient and sustained noise
+        return samples[len(samples) // 2]  # median: robust to noise
 
     times = [bench(length) for length in lengths]
-    # Sub-microsecond-scale absolute times are dominated by Python/GC/scheduler overhead on
-    # any machine, CI or not; the ratio is meaningless there, so floor it before comparing.
-    floor_ms = 0.05
+    floor_ms = 0.05  # floors sub-noise timings so tiny absolute values don't inflate the ratio
     times = [max(t, floor_ms) for t in times]
     r1 = times[1] / times[0]
     r2 = times[2] / times[1]

@@ -1,115 +1,113 @@
-<svg viewBox="0 0 1180 512" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+<svg viewBox="0 0 1220 330" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
   <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
     </marker>
   </defs>
 
   <style>
-    .box { stroke:#333; stroke-width:1.3; rx:6; }
-    .title { font-size:14px; font-weight:700; fill:#111; }
-    .sub { font-size:11px; fill:#444; }
-    .note { font-size:10.5px; fill:#666; font-style:italic; }
-    .arr { stroke:#333; stroke-width:1.4; fill:none; marker-end:url(#arrow); }
-    .group-label { font-size:12.5px; font-weight:700; fill:#222; }
+    .box { stroke:#333; stroke-width:1.2; rx:5; }
+    .sub { font-size:10.5px; fill:#222; }
+    .note { font-size:9px; fill:#666; font-style:italic; }
+    .arr { stroke:#333; stroke-width:1.3; fill:none; marker-end:url(#arrow); }
+    .dashed { stroke:#999; stroke-width:1; fill:none; stroke-dasharray:3,3; marker-end:url(#arrow); }
+    .group-label { font-size:10.5px; font-weight:700; fill:#222; }
   </style>
 
-  <!-- ===== Top pipeline (main flow, left to right) ===== -->
+  <!-- input -->
+  <rect class="box" x="6" y="70" width="88" height="42" fill="#eaf1fb"/>
+  <text x="50" y="88" class="sub" text-anchor="middle">bytes +</text>
+  <text x="50" y="101" class="sub" text-anchor="middle">modality_ids</text>
+  <path class="arr" d="M94,91 L118,91"/>
 
-  <!-- Input -->
-  <rect class="box" x="10" y="60" width="120" height="46" fill="#eaf1fb"/>
-  <text x="70" y="79" class="sub" text-anchor="middle">bytes +</text>
-  <text x="70" y="93" class="sub" text-anchor="middle">modality_ids</text>
+  <!-- embedding -->
+  <rect class="box" x="118" y="70" width="90" height="42" fill="#dbe7fb"/>
+  <text x="163" y="87" class="sub" text-anchor="middle" font-weight="700">Kairos</text>
+  <text x="163" y="99" class="sub" text-anchor="middle" font-weight="700">Embedding</text>
+  <path class="arr" d="M208,91 L232,91"/>
 
-  <!-- Embedding -->
-  <rect class="box" x="160" y="52" width="130" height="62" fill="#dbe7fb"/>
-  <text x="225" y="78" class="title" text-anchor="middle" font-size="12">Kairos</text>
-  <text x="225" y="93" class="title" text-anchor="middle" font-size="12">Embedding</text>
+  <!-- PyramidalCodec.encode -->
+  <rect x="232" y="20" width="150" height="145" rx="6" fill="#f6effb" stroke="#8a6bb0" stroke-width="1.1"/>
+  <text x="307" y="34" class="group-label" text-anchor="middle">PyramidalCodec</text>
+  <text x="307" y="45" class="note" text-anchor="middle">.encode: one Linear/Conv per scale</text>
+  <rect class="box" x="242" y="53" width="60" height="24" fill="#fff"/>
+  <text x="272" y="69" class="sub" text-anchor="middle" font-size="9.5">scale 0</text>
+  <rect class="box" x="312" y="53" width="60" height="24" fill="#fff"/>
+  <text x="342" y="69" class="sub" text-anchor="middle" font-size="9.5">scale 1</text>
+  <rect class="box" x="242" y="82" width="60" height="24" fill="#fff"/>
+  <text x="272" y="98" class="sub" text-anchor="middle" font-size="9.5">scale 2</text>
+  <rect class="box" x="312" y="82" width="60" height="24" fill="#fff"/>
+  <text x="342" y="98" class="sub" text-anchor="middle" font-size="9.5">scale 3</text>
+  <text x="307" y="118" class="note" text-anchor="middle">patch_size = stride^(k+1)</text>
+  <text x="307" y="130" class="note" text-anchor="middle">ScaleRouter.gather_active:</text>
+  <text x="307" y="141" class="note" text-anchor="middle">modality_scales selects tokens</text>
+  <text x="307" y="152" class="note" text-anchor="middle">routed to scale k only</text>
+  <path class="arr" d="M382,91 L406,91"/>
 
-  <path class="arr" d="M130,83 L160,83"/>
+  <!-- DiffusionBackbone x num_scales -->
+  <rect x="406" y="6" width="330" height="175" rx="6" fill="#eefaf0" stroke="#4c9a5c" stroke-width="1.1"/>
+  <text x="571" y="20" class="group-label" text-anchor="middle">DiffusionBackbone &#215; num_scales (independent stacks)</text>
 
-  <!-- PyramidalConvCodec group -->
-  <rect x="320" y="20" width="250" height="130" rx="8" fill="#f6effb" stroke="#8a6bb0" stroke-width="1.2" stroke-dasharray="4,3"/>
-  <text x="445" y="38" class="group-label" text-anchor="middle">PyramidalConvCodec</text>
-  <g font-size="10.5" fill="#333">
-    <rect class="box" x="335" y="50" width="52" height="34" fill="#fff"/>
-    <text x="361" y="70" text-anchor="middle">s0</text>
-    <rect class="box" x="393" y="50" width="52" height="34" fill="#fff"/>
-    <text x="419" y="70" text-anchor="middle">s1</text>
-    <rect class="box" x="451" y="50" width="52" height="34" fill="#fff"/>
-    <text x="477" y="70" text-anchor="middle">s2</text>
-    <rect class="box" x="509" y="50" width="52" height="34" fill="#fff"/>
-    <text x="535" y="70" text-anchor="middle">s3</text>
-  </g>
-  <text x="445" y="100" class="note" text-anchor="middle">stride^k downsampling, one branch per scale</text>
-  <text x="445" y="116" class="note" text-anchor="middle">modality_scales routes each modality to the</text>
-  <text x="445" y="130" class="note" text-anchor="middle">scales it needs</text>
+  <rect class="box" x="422" y="30" width="298" height="30" fill="#fff" stroke-dasharray="2,2"/>
+  <text x="571" y="49" class="sub" text-anchor="middle" font-size="9.5">AttnRes: h = weighted_sum(embed, completed block-sums, running partial)</text>
 
-  <path class="arr" d="M290,83 L320,83"/>
+  <rect class="box" x="470" y="72" width="200" height="86" fill="#fff"/>
+  <text x="570" y="86" class="sub" text-anchor="middle" font-weight="700" font-size="10">DiffusionBlock &#215; n_layers</text>
+  <rect class="box" x="482" y="94" width="176" height="24" fill="#dceaff"/>
+  <text x="570" y="110" class="sub" text-anchor="middle" font-size="9.5">x += LiZAttention2(norm1(h))</text>
+  <rect class="box" x="482" y="128" width="176" height="24" fill="#fff3d6"/>
+  <text x="570" y="144" class="sub" text-anchor="middle" font-size="9.5">x += FFN / MoE(norm2(x))</text>
+  <path class="arr" d="M570,60 L570,72"/>
 
-  <!-- DiffusionBackbone group -->
-  <rect x="620" y="10" width="320" height="150" rx="8" fill="#eefaf0" stroke="#4c9a5c" stroke-width="1.2" stroke-dasharray="4,3"/>
-  <text x="780" y="28" class="group-label" text-anchor="middle">DiffusionBackbone × num_scales</text>
-  <text x="780" y="42" class="note" text-anchor="middle">independent stacks, n_layers per scale</text>
+  <text x="571" y="170" class="note" text-anchor="middle">accumulate x into partial; every attnres_block_size layers, close the block</text>
+  <path class="arr" d="M736,91 L750,91"/>
 
-  <rect class="box" x="635" y="52" width="135" height="46" fill="#dceaff"/>
-  <text x="702" y="70" class="sub" text-anchor="middle" font-size="10.5">LiZAttention2</text>
-  <text x="702" y="84" class="note" text-anchor="middle" font-size="9.5">SWA + DeltaNet, shared QKVO</text>
+  <!-- ScaleRouter.scatter + PyramidalCodec.decode -->
+  <rect x="750" y="20" width="185" height="145" rx="6" fill="#f6effb" stroke="#8a6bb0" stroke-width="1.1"/>
+  <text x="842" y="34" class="group-label" text-anchor="middle">scatter_active</text>
+  <text x="842" y="45" class="note" text-anchor="middle">write each scale's chunk back</text>
+  <text x="842" y="56" class="note" text-anchor="middle">to its positions (pad kept as-is)</text>
+  <rect class="box" x="765" y="68" width="155" height="34" fill="#fff"/>
+  <text x="842" y="82" class="sub" text-anchor="middle" font-size="9.5">PyramidalCodec.decode</text>
+  <text x="842" y="94" class="note" text-anchor="middle">concat(scales) &#8594; norm &#8594; fusion Linear</text>
+  <path class="arr" d="M842,60 L842,68"/>
+  <text x="842" y="118" class="note" text-anchor="middle">tied to .encode weights</text>
+  <text x="842" y="129" class="note" text-anchor="middle">when codec_mode = "patch"</text>
+  <path class="arr" d="M935,91 L959,91"/>
 
-  <rect class="box" x="780" y="52" width="145" height="46" fill="#fff3d6"/>
-  <text x="852" y="70" class="sub" text-anchor="middle" font-size="10.5">FFN / MoE</text>
-  <text x="852" y="84" class="note" text-anchor="middle">top-k routed + shared expert</text>
+  <!-- norm / head / logits -->
+  <rect class="box" x="959" y="70" width="82" height="42" fill="#dbe7fb"/>
+  <text x="1000" y="94" class="sub" text-anchor="middle" font-size="9.5">KairosNorm</text>
+  <path class="arr" d="M1041,91 L1063,91"/>
 
-  <path class="arr" d="M702,98 L702,108"/>
-  <path class="arr" d="M852,98 L852,108"/>
-  <rect class="box" x="635" y="108" width="290" height="30" fill="#fff"/>
-  <text x="780" y="128" class="sub" text-anchor="middle" font-size="10.5">AttnRes aggregator (block-wise weighted sum)</text>
+  <rect class="box" x="1063" y="65" width="90" height="52" fill="#dbe7fb"/>
+  <text x="1108" y="86" class="sub" text-anchor="middle" font-size="9.5">OutputHead</text>
+  <text x="1108" y="98" class="note" text-anchor="middle">tied weights</text>
+  <path class="arr" d="M1108,117 L1108,140 L1108,140"/>
 
-  <path class="arr" d="M570,83 L620,83"/>
+  <rect class="box" x="1040" y="140" width="150" height="34" fill="#eaf1fb"/>
+  <text x="1115" y="161" class="sub" text-anchor="middle" font-size="9.5">token/octet logits</text>
+  <path class="arr" d="M1108,117 L1115,140"/>
 
-  <!-- Fusion -->
-  <rect class="box" x="990" y="30" width="150" height="42" fill="#f6effb"/>
-  <text x="1065" y="47" class="sub" text-anchor="middle" font-size="10.5">Fusion</text>
-  <text x="1065" y="60" class="note" text-anchor="middle">concat(scales) → Linear</text>
-  <path class="arr" d="M940,60 L990,51"/>
+  <!-- KairosCache -->
+  <rect x="406" y="196" width="330" height="52" rx="5" fill="#fafafa" stroke="#999" stroke-width="1"/>
+  <text x="571" y="210" class="sub" text-anchor="middle" font-weight="700" font-size="10">KairosCache (per scale)</text>
+  <text x="571" y="223" class="note" text-anchor="middle">conv_caches + ssm_caches (DeltaNet), carried across streaming steps</text>
+  <text x="571" y="235" class="note" text-anchor="middle">SWA: separate sliding-window K/V cache, not carried across batches</text>
+  <path class="dashed" d="M571,181 L571,196"/>
 
-  <!-- down to norm/head/logits row -->
-  <path class="arr" d="M1065,72 L1065,180 L1065,180"/>
-  <path class="arr" d="M1065,180 L900,180"/>
+  <!-- Memory gate: cross-session, outside forward -->
+  <rect x="760" y="196" width="200" height="52" rx="5" fill="#fdeef0" stroke="#b5566b" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="860" y="210" class="sub" text-anchor="middle" font-weight="700" font-size="10">KairosMemoryGate</text>
+  <text x="860" y="223" class="note" text-anchor="middle">gate_memory_bank(): blends ssm_caches</text>
+  <text x="860" y="235" class="note" text-anchor="middle">across sessions, between forward calls</text>
+  <path class="dashed" d="M760,215 L736,215 L736,196"/>
 
-  <rect class="box" x="800" y="164" width="100" height="34" fill="#dbe7fb"/>
-  <text x="850" y="185" class="sub" text-anchor="middle" font-size="10.5">KairosNorm</text>
-  <path class="arr" d="M800,181 L700,181"/>
-
-  <rect class="box" x="580" y="160" width="120" height="42" fill="#dbe7fb"/>
-  <text x="640" y="178" class="sub" text-anchor="middle" font-size="10.5">OutputHead</text>
-  <text x="640" y="192" class="note" text-anchor="middle">tied weights</text>
-  <path class="arr" d="M580,181 L460,181"/>
-
-  <rect class="box" x="330" y="164" width="130" height="34" fill="#eaf1fb"/>
-  <text x="395" y="185" class="sub" text-anchor="middle" font-size="10.5">logits (vocab × modality)</text>
-
-  <!-- ===== Cache / streaming note ===== -->
-  <rect x="620" y="215" width="420" height="70" rx="6" fill="#fafafa" stroke="#999" stroke-width="1"/>
-  <text x="830" y="232" class="sub" text-anchor="middle" font-weight="700" font-size="11">KairosCache</text>
-  <text x="830" y="248" class="note" text-anchor="middle">per-scale conv_caches + ssm_caches (DeltaNet) for state-carry</text>
-  <text x="830" y="263" class="note" text-anchor="middle">SWA layers: separate sliding-window K/V cache, not carried across batches</text>
-  <text x="830" y="278" class="note" text-anchor="middle">gather_active / scatter_active operate on the sequence dim only</text>
-
-  <!-- ===== Bottom: training objective ===== -->
-  <rect x="30" y="330" width="1010" height="130" rx="8" fill="#fff6ea" stroke="#c99a3d" stroke-width="1.2"/>
-  <text x="535" y="352" class="group-label" text-anchor="middle">Masked-diffusion training objective</text>
-  <text x="60" y="378" class="sub">1.</text>
-  <text x="85" y="378" class="sub">sample t ~ U(0,1), noise fraction p = (1-&#949;)t + &#949;</text>
-  <text x="60" y="400" class="sub">2.</text>
-  <text x="85" y="400" class="sub">mask p·L random non-prompt tokens, predict originals back through the pipeline above</text>
-  <text x="60" y="422" class="sub">3.</text>
-  <text x="85" y="422" class="sub">loss = cross_entropy(logits[mask], x0[mask]) / p, averaged over the batch</text>
-  <text x="60" y="444" class="sub">4.</text>
-  <text x="85" y="444" class="sub">non-finite batches are skipped and logged, not backpropagated</text>
-
-  <path class="arr" d="M395,198 L395,330"/>
-
-  <!-- ===== Legend ===== -->
-  <text x="10" y="500" class="note">Dashed boxes: repeated / parallel modules. Solid arrows: data flow. Grey box: cache carried across steps.</text>
+  <!-- Training objective -->
+  <rect x="6" y="266" width="1204" height="60" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1.1"/>
+  <text x="608" y="280" class="group-label" text-anchor="middle">Masked-diffusion training objective (applied on top of the forward pass above)</text>
+  <text x="20" y="296" class="sub" font-size="9.5">1. sample t~U(0,1), noise p=(1-&#949;)t+&#949;, mask p&#183;L non-prompt tokens</text>
+  <text x="20" y="310" class="sub" font-size="9.5">2. predict originals back through the pipeline; loss = cross_entropy(logits[mask], x0[mask]) / p</text>
+  <text x="640" y="296" class="sub" font-size="9.5">3. non-finite batches: skipped + logged, not backpropagated</text>
+  <path class="arr" d="M1115,174 L1115,250 L608,250 L608,266"/>
 </svg>

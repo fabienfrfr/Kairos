@@ -29,7 +29,7 @@
 
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
-\usepackage[margin=2.5cm]{geometry}
+\usepackage[margin=2cm]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{xcolor}
@@ -83,11 +83,14 @@ and no multimodal result is reported.
     \centering
     \includegraphics[width=0.95\linewidth]{../architecture/kairos_architecture.pdf}
     \caption{Kairos data and training flow. Byte-level input is embedded, split into
-    \texttt{num\_scales} branches by the pyramidal codec, processed by an independent
-    DiffusionBackbone per scale (LiZAttention2 in parallel with a routed FFN/MoE, aggregated
-    by AttnRes), fused back to $d_{\text{model}}$, and decoded to per-modality logits. Training
-    applies the masked-diffusion objective (bottom) on top of this same forward pass; the grey
-    box lists the state KairosCache carries across streaming steps.}
+    \texttt{num\_scales} branches by the pyramidal codec, and processed by an independent
+    DiffusionBackbone per scale: each of its \texttt{n\_layers} blocks is a standard pre-norm
+    residual pair (attention, then FFN/MoE, each added back to the stream), but the block's
+    \emph{input} is first re-mixed by AttnRes from the embedding and prior block outputs. Scales
+    are then written back, decoded (concat $\to$ norm $\to$ fusion), and projected to
+    per-modality logits. Training applies the masked-diffusion objective (bottom) on top of this
+    same forward pass. KairosCache carries per-scale state across streaming steps; the
+    cross-session KairosMemoryGate (dashed) runs between forward calls, not inside one.}
     \label{fig:architecture_overview}
 \end{figure}
 
