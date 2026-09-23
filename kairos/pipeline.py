@@ -152,14 +152,24 @@ def _consecutive_run_lengths(ids: torch.Tensor) -> dict[int, int]:
 
 
 def _bf16_hardware_available() -> bool:
-    """True on real bf16 tensor cores: Ampere+ on CUDA, or any bf16-capable ROCm GPU."""
+    """True on real bf16 tensor cores: Ampere+ on CUDA, or any bf16-capable ROCm GPU.
+
+    Passes an explicit device index rather than relying on the implicit current device:
+    an implicit call forces a lazy CUDA init keyed off `current_device()`, which is one
+    extra moving part a mocked/CI environment can get wrong. Broadened to `Exception`
+    (not just `RuntimeError`) because the failure mode of a fake/partial CUDA stack isn't
+    guaranteed to be a `RuntimeError` on every torch version.
+    """
     if not torch.cuda.is_available():
         return False
     try:
-        is_rocm = torch.version.hip is not None
-        return torch.cuda.is_bf16_supported() and (is_rocm or torch.cuda.get_device_capability() >= (8, 0))
-    except RuntimeError:
-        return False  # is_available() lied (broken/mismatched driver): assume no fast path
+        if not torch.cuda.is_bf16_supported():
+            return False
+        if torch.version.hip is not None:
+            return True  # ROCm: trust is_bf16_supported() alone, no SM-style capability check
+        return tuple(torch.cuda.get_device_capability(0)) >= (8, 0)
+    except Exception:  # noqa: BLE001 - any broken/mismatched/mocked CUDA stack: assume no fast path
+        return False
 
 
 def _resolve_amp_dtype(amp_dtype_override: str | None, bf16_supported: bool) -> torch.dtype:

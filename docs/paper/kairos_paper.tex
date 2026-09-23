@@ -79,6 +79,18 @@ when the suspected mechanism is controlled. No training run at target scale
 and no multimodal result is reported.
 \end{abstract}
 
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.95\linewidth]{../architecture/kairos_architecture.pdf}
+    \caption{Kairos data and training flow. Byte-level input is embedded, split into
+    \texttt{num\_scales} branches by the pyramidal codec, processed by an independent
+    DiffusionBackbone per scale (LiZAttention2 in parallel with a routed FFN/MoE, aggregated
+    by AttnRes), fused back to $d_{\text{model}}$, and decoded to per-modality logits. Training
+    applies the masked-diffusion objective (bottom) on top of this same forward pass; the grey
+    box lists the state KairosCache carries across streaming steps.}
+    \label{fig:architecture_overview}
+\end{figure}
+
 \section{Introduction}
 
 \subsection{Background and problem statement}

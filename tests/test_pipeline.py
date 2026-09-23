@@ -150,7 +150,7 @@ def test_bf16_hardware_available_requires_ampere_on_cuda(monkeypatch):
     monkeypatch.setattr(pipeline_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(pipeline_module.torch.cuda, "is_bf16_supported", lambda: True)
     monkeypatch.setattr(pipeline_module.torch.version, "hip", None)
-    monkeypatch.setattr(pipeline_module.torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(pipeline_module.torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     assert _bf16_hardware_available() is False
 
 
@@ -166,7 +166,7 @@ def test_train_config_rejects_invalid_amp_dtype(tmp_path):
 def test_pipeline_uses_bf16_when_cuda_reports_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 0))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.bfloat16
@@ -176,7 +176,7 @@ def test_pipeline_uses_bf16_when_cuda_reports_bf16_support(tmp_path, model_confi
 def test_pipeline_falls_back_to_fp16_when_cuda_lacks_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.float16
@@ -189,7 +189,7 @@ def test_pipeline_falls_back_to_fp16_on_t4_despite_is_bf16_supported_true(
     """Regression test: T4 (SM75) reports is_bf16_supported()=True but has no bf16 tensor cores."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.float16
@@ -198,7 +198,7 @@ def test_pipeline_falls_back_to_fp16_on_t4_despite_is_bf16_supported_true(
 def test_pipeline_amp_dtype_override_forces_bf16_on_old_hardware(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples, amp_dtype="bf16")
 
     assert pipe.amp_dtype == torch.bfloat16
