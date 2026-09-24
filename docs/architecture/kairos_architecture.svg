@@ -173,17 +173,25 @@
      id="rect7" />
   <text
      x="74"
-     y="88"
+     y="82"
      class="sub"
      text-anchor="middle"
      font-weight="700"
-     id="text8">byte stream</text>
+     id="text8">Kairos</text>
   <text
      x="74"
-     y="101"
-     class="note"
+     y="93"
+     class="sub"
      text-anchor="middle"
-     id="text9">+ modality id</text>
+     font-weight="700"
+     id="text8b">Tokenizer</text>
+  <text
+     x="74"
+     y="106"
+     class="note"
+     style="font-size:8.5px"
+     text-anchor="middle"
+     id="text9">bytes + modality id</text>
   <path
      class="arr"
      d="m 118,91 h 24"
@@ -849,7 +857,7 @@
      class="note"
      text-anchor="middle"
      font-size="7.5"
-     id="text66">2D image: row wraps every 4 bytes</text>
+     id="text66">2D image, flattened by tokenizer</text>
   <!-- same 12 bytes, flattened into one strip, with patch boundaries marked -->
   <g
      id="g83"

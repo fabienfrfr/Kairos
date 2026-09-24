@@ -4,10 +4,10 @@
 % WRITING PRINCIPLES FOR THIS PAPER (keep this comment; check against it on
 % every edit)
 %
-% - IMRAD: Introduction, Methods, Results, And Discussion. Related Work is a
-%   subsection of the Introduction, not a separate section -- it motivates the
-%   problem, it isn't the problem. Compute-budget methodology lives in
-%   Methods; the numbers it produces live in Results.
+% - Order follows the author's earlier article: structured abstract, overview
+%   figure, Introduction, Related Work (own section, ends with positioning),
+%   Model, Experimental Protocol, Results, Discussion. The analytical compute
+%   sizing is one Discussion paragraph: it is a design exercise, not a measured result.
 % - Less is more: every sentence must earn its place. If a claim is stated
 %   once, do not restate it in the abstract, the section, and the conclusion.
 %   Cut adjectives that don't carry information. Prefer one precise number to
@@ -35,10 +35,7 @@
 \usepackage{xcolor}
 \usepackage{natbib}
 \usepackage{float}
-\usepackage{tikz}
-\usepackage{pgfplots}
-\pgfplotsset{compat=1.18}
-\usetikzlibrary{arrows.meta,positioning,fit}
+\usepackage{graphicx}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
@@ -46,7 +43,7 @@
 
 \title{Kairos: A Hybrid Delta/Window-Attention Mixture-of-Experts\\
 Denoising Model over a Byte-Level Multimodal Latent Space\\
-\large Design, Compute Sizing and a Tiny-Scale Proof of Concept}
+\large Design and Convergence Sanity Checks at Tiny Scale}
 
 \author{Fabien Furfaro\thanks{Code and configurations:
 \url{https://github.com/fabienfrfr/Kairos}}}
@@ -56,34 +53,35 @@ Denoising Model over a Byte-Level Multimodal Latent Space\\
 \maketitle
 
 \begin{abstract}
-Kairos is a proof-of-concept multimodal denoising model that combines
-bidirectional gated-DeltaNet linear attention and bidirectional
-sliding-window attention over shared projections (LiZAttention2),
-block-wise Attention-Residual aggregation, a sparse Mixture-of-Experts
-(MoE) feed-forward layer, and a multi-scale byte-level codec, trained with a
-uniform-noise denoising objective over a shared byte-level space for text,
-image, audio, video, lidar and robot-control streams. We give code-derived
-algorithms for each component, including a cross-session recurrent-state
-memory gate. We then size a 200M-total/25M-active target with a roofline
-model of sparse training: because a microbatch touches nearly every expert,
-weight traffic scales with the \emph{total} parameter count, so the
-microbatch that makes a sparse model compute-bound is
-$N_{\text{total}}/N_{\text{act}}$ times larger than a dense model's (about
-1.6k--2.4k tokens on T4, A100 and H100 for our design point, a factor of 8).
-Past that threshold the target needs $4.5\times10^{18}$ training FLOPs for
-30B tokens; the throughput estimates are upper bounds and none is measured.
-Finally, we report a tiny-scale ablation study (1--15M parameters, text
-only) whose apparent architectural effects turn out to be
-convergence-speed effects on a memorization task: the shared-versus-separate
-attention-projection gap closes with more steps or diverse data and reverses
-when the suspected mechanism is controlled. No training run at target scale
-and no multimodal result is reported.
+\textbf{Background:} Small language models trained on a single local machine leave
+little room for architectural trial and error. Kairos is a proof of concept that
+combines bidirectional gated-DeltaNet linear attention and sliding-window attention over
+shared projections (LiZAttention2), block-wise Attention-Residual aggregation, a sparse
+Mixture-of-Experts (MoE) feed-forward layer and a multi-scale byte-level codec, trained
+with a uniform-noise denoising objective over a shared byte space meant for text, image,
+audio, video, lidar and control streams.
+\textbf{Methods:} We give code-derived algorithms for each component, including a
+cross-session recurrent-state memory gate, then run convergence sanity checks: overfitting
+a single 440-byte sentence at 1--15M parameters, text only, with three seeds for codec and
+attention choices and single-run sweeps for seven further factors.
+\textbf{Results:} The two attention variants tested at 3\,000 steps (LiZAttention2 and
+window attention alone) reach a minimum loss near $10^{-3}$. After 600 steps, the mean
+minimum loss ranges from 0.018 (patch codec) to 0.354 (depthwise convolutional codec) with
+an identical ranking on three seeds. An apparent advantage of shared over separate
+attention projections closes with more steps or more diverse data and reverses when the
+projections are frozen: it is a convergence-speed effect, not a capacity effect.
+\textbf{Conclusions:} These checks suggest that the implementation optimizes; they say
+nothing about generalization, multimodal training or comparison with existing models, which
+a planned pretraining run is meant to address. The Discussion sizes a 200M-total/25M-active
+target analytically; none of its throughput figures is measured.
 \end{abstract}
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.95\linewidth]{../architecture/kairos_architecture.pdf}
-    \caption{Kairos data and training flow, left to right. Each KairosBlock is a standard
+    \caption{Kairos data and training flow, left to right. The tokenizer (\S\ref{sec:tokenizer})
+    flattens every modality to one byte stream; the image example shows a 2D image flattened row by
+    row (its \texttt{<ENDLINE>} markers are omitted). Each KairosBlock is a standard
     pre-norm attention+FFN residual pair; AttnRes only re-mixes what feeds into it. Training (bottom)
     uses one masking mechanism across three curriculum stages (MAE $\to$ transition $\to$ diffusion),
     illustrated with a masked-input/denoised-output example.}
@@ -91,8 +89,6 @@ and no multimodal result is reported.
 \end{figure}
 
 \section{Introduction}
-
-\subsection{Background and problem statement}
 
 Small, edge-deployable language models
 (MobileLLM~\citep{liu2024mobilellm}, SmolLM2~\citep{allal2025smollm2},
@@ -115,22 +111,24 @@ orthogonal choice removes the tokenizer: byte-level
 inputs~\citep{xue2022byt5,yu2023megabyte,pagnoni2024blt} give one vocabulary
 that can cover several modalities.
 
-Each lever is usually reported in its own currency (asymptotic sequence
-complexity, FLOPs per token, or generation parallelism), and rarely against
-the memory-bandwidth limits of the GPUs that motivate combining them.
-FLOP-centric accounting of an MoE counts active parameters only, but a
-training microbatch routes tokens to many experts, so nearly every expert's
-weights are read and its gradients written at every step.
-\textbf{Research question:} for a hybrid linear-attention/MoE/denoising model
-trained on a single memory-limited GPU, at what microbatch size does sparse
-training become compute-bound, and which parameter count, active or total,
-is the right one to reduce when it does not?
+Each lever is usually reported on its own. Combining them in one model small enough to
+train on a single local machine raises a practical question before any question of
+quality: does the combination optimize at all? Hybrid attention, sparse routing, a
+multi-scale codec and a corruption-based objective each add moving parts that could
+prevent optimization, and a memorization test is the cheapest way to check.
+\textbf{Research question:} can a Kairos network drive the denoising loss of a fixed byte
+string to near zero, and which design choices change how fast?
 
-\subsection{Contributions}
+\textbf{In this paper}, we specify the Kairos architecture from its implementation
+(Figure~\ref{fig:architecture_overview}) and report convergence sanity checks at
+1--15M parameters. These checks are necessary and not sufficient: they do not measure
+generalization. Held-out training and a comparison with Pythia-14M~\citep{biderman2023pythia}
+are planned and not reported (\S\ref{sec:future}).
 
+\textbf{Our contributions are:}
 \begin{enumerate}
-  \item The Kairos architecture, specified from its implementation:
-        PyramidalCodec (Algorithm~\ref{alg:codec}), LiZAttention2
+  \item The Kairos architecture (Figure~\ref{fig:architecture_overview}), specified from its implementation:
+        the multimodal byte tokenizer (\S\ref{sec:tokenizer}), PyramidalCodec (Algorithm~\ref{alg:codec}), LiZAttention2
         (Algorithm~\ref{alg:liz}), Block-AttnRes
         (Algorithm~\ref{alg:attnres}), sparse MoE (\S\ref{sec:moe}), a
         cross-session memory gate (Algorithm~\ref{alg:memgate}) and the
@@ -138,11 +136,7 @@ is the right one to reduce when it does not?
         (Algorithm~\ref{alg:diffusion}), each adapted from a specific prior
         method or, for the codec and the memory gate, combining existing
         ideas.
-  \item A roofline model of sparse training (\S\ref{sec:sizing-model}) that
-        gives the microbatch threshold above which an MoE is compute-bound,
-        applied to a 200M-total/25M-active target
-        (\S\ref{sec:sizing-results}); the numbers come from a tested script.
-  \item A tiny-scale ablation study (\S\ref{sec:ablations}) with 3-seed
+  \item A convergence study at tiny scale (\S\ref{sec:ablations}) with 3-seed
         statistics for codec and attention choices and single-run sweeps for
         seven further factors.
   \item A worked correlation-versus-causation case
@@ -150,8 +144,10 @@ is the right one to reduce when it does not?
         survive three controls, and a recommendation to report
         steps-to-threshold rather than loss at a fixed step.
 \end{enumerate}
+The Discussion also sizes an untrained 200M-total/25M-active target with a roofline argument
+(\S\ref{sec:sizing}); it is analytical and not measured.
 
-\subsection{Related work}
+\section{Related Work}
 
 \paragraph{Efficient attention.} Full self-attention~\citep{vaswani2017attention}
 is quadratic in sequence length. The delta
@@ -177,8 +173,7 @@ stack~\citep{nawrot2022hourglass}; Perceiver~IO reads arbitrary input arrays,
 including raw bytes, through cross-attention into a fixed latent
 array~\citep{jaegle2022perceiverio}. Kairos' PyramidalCodec instead keeps
 $S$ parallel views of one sequence at geometrically growing patch sizes,
-runs a backbone on each, and fuses them after upsampling. We did not perform
-a systematic literature search and claim no novelty beyond this combination.
+runs a backbone on each, and fuses them after upsampling. 
 
 \paragraph{Sparse MoE.} MoE
 architectures~\citep{shazeer2017outrageously,fedus2021switch,dai2024deepseekmoe,deepseekv3}
@@ -212,109 +207,66 @@ pretrained transformers~\citep{furfaro2025tptt}. Kairos' gate is simpler: it
 seeds the recurrent state of each DeltaNet layer for a new sequence from a
 learned blend of states left by earlier sequences (\S\ref{sec:memgate}).
 
-\paragraph{Scaling laws and the cost of sparse training.} Chinchilla is
-fitted on dense models from 70M to over 16B
-parameters~\citep{hoffmann2022chinchilla}, so applying it to a model with 25M
-active parameters is an extrapolation. Joint MoE scaling
-laws~\citep{ludziejewski2025moe} add active parameters, tokens and expert
-count as variables, and \citet{abnar2025parameters} study the
-parameters-versus-FLOPs trade-off at optimal sparsity. These works
-parameterize loss rather than step time; we model step time with the
-roofline~\citep{williams2009roofline}.
+\paragraph{Our positioning.} Kairos assembles components from the works above and adds
+two elements: a pyramidal codec that runs the backbone on several patch scales, and a
+cross-session memory gate. We did not perform a systematic literature search and claim no novelty beyond this combination. The aim of this report is to check that the
+combination trains, not that it outperforms.
 
-\section{Methods}
+\section{Model}
 
-\subsection{Three scales, kept apart}
+Figure~\ref{fig:architecture_overview} gives the data flow. The subsections follow it from
+input bytes to output logits, then the training objective.
 
-The codebase is used at three scales that this report does not conflate
-(Table~\ref{tab:configs}). The \textbf{ablation networks} of
-\S\ref{sec:ablations} use the library defaults of
-\texttt{configs/ablations/baseline.yaml} (1 layer, dense feed-forward). The
-\textbf{PoC configuration} is the default of the project's notebook
-(\texttt{notebook/kairos\_pretraining.py}): a $\sim$14--15M-parameter network
-with a 7-expert top-1 MoE, used for pipeline sanity checks. The
-\textbf{target} is a 200M-total/25M-active design point used in
-\S\ref{sec:sizing-model} purely to size a future run; it has never been
-instantiated. Because dense parameters (attention, codec, embeddings) are
-always active, $N_{\text{act}}=N_{\text{total}}/8+\tfrac78 N_{\text{dense}}$
-for $E/k=8$, and 25M is the lower bound reached when all parameters are
-routed experts.
+\subsection{Multimodal byte tokenizer}
+\label{sec:tokenizer}
+
+The tokenizer subclasses the ByT5 tokenizer~\citep{xue2022byt5}. Text is UTF-8 and every byte is
+one id, with the same byte-to-id offset in all modalities, so one vocabulary of 290 entries (3 ByT5
+special ids, 256 byte values, 31 added markers) serves every modality. A sequence is a list of
+typed segments, each wrapped in modality delimiters (for example \texttt{<IMG>}\ldots\texttt{</IMG>})
+and optionally in channel delimiters (R, G, B, left, right). Encoding returns three aligned
+streams: the ids, a modality id per position, which drives the scale router of the codec, and an
+\emph{octet-family} id per position, which names the byte plane a byte belongs to. Families live
+in a separate stream rather than in the vocabulary, so one byte value can carry different meanings
+in different planes (18 family ids, family 0 being text and markers).
+
+Non-text values are serialized without a header (Table~\ref{tab:tokenizer}). A float
+$x\in[\ell,u]$ becomes $n$ big-endian byte planes, as the digits of a place-value number (Eq.~\ref{eq:quant}):
+\begin{equation}
+q=\Big\lfloor \text{clip}\Big(\tfrac{x-\ell}{u-\ell},0,1\Big)\,(256^{n}-1)\Big\rfloor,\qquad
+b_k=\Big\lfloor q/256^{\,n-1-k}\Big\rfloor \bmod 256,
+\label{eq:quant}
+\end{equation}
+with $n=2$ by default and fixed ranges ($[-1,1]$ for audio and control signals, $\pm100$ for lidar
+coordinates, $[0,1]$ for intensity), so the encoding needs no per-sample header. Optional
+downsampling before quantization (block mean for pixels, decimation by 4 for audio and signals by
+default, point stride for lidar) makes it lossy. Decoders recover shapes by counting markers and
+raise an error on a malformed stream, so a generated stream can be checked.
 
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{@{}lp{3.4cm}p{3.9cm}p{2.6cm}@{}}
+\begin{tabular}{p{1.7cm}p{6.2cm}p{4.3cm}r}
 \toprule
- & Ablation baseline & PoC (notebook) & Target (sizing only) \\
+Modality & Byte serialization & Markers & Families \\
 \midrule
-$d_{\text{model}}$; heads (head dim) & 64; 4 (16) & 64; 4 (16) & -- \\
-Backbone layers & 1 & 4 & -- \\
-Codec stride; scales $S$ & 5; 4 & 3; 4 & -- \\
-Codec mode & \texttt{conv}, 1 channel per group & \texttt{conv}, 8 channels per group & -- \\
-AttnRes block size & 1 & 4 & -- \\
-Feed-forward & dense, $I=2048$ & 7 routed ($k=1$) $+$ 1 shared, $I=544$ & 32 routed ($k=4$) \\
-Backbone shared across scales & no & yes & -- \\
-Memory gate & off & on & -- \\
-$N_{\text{total}}$ & 1.98M & $\sim$14--15M & 200M \\
-$N_{\text{act}}$ & $N_{\text{total}}$ & $N_{\text{total}}-2.51$M (Eq.~\ref{eq:active}) & 25M \\
-Training data & 16 identical sentences, 600 steps & sanity checks & 30B tokens (budget) \\
+Text & UTF-8 bytes & none & 1 \\
+Image & interleaved R, G, B bytes, row by row & \texttt{<ENDLINE>} per row & 3 \\
+Video & image frames in sequence & \texttt{<ENDLINE>}, \texttt{<ENDFRAME>} & 3 (shared) \\
+Audio & 2-byte planes of decimated samples & \texttt{<TICK>} every 16{,}000 samples & 2 \\
+Lidar & $(x,y,z,\text{intensity})$, 2 bytes each & \texttt{<PTSEP>} every 32 points & 8 \\
+Control & action and state, 2 bytes each, interleaved & \texttt{<OBS>} for state-only & 4 \\
 \bottomrule
 \end{tabular}
-\caption{The three scales this report distinguishes. Dashes: the target
-design point is specified only by its parameter and token budget. The PoC's
-$2.51$M is derived from its configuration
-($4\times7\times3\times64\times544=2.92$M routed-expert parameters, of which
-6/7 are inactive); the instantiated count has not been logged. The ablation
-networks are far smaller than the PoC, so ablation findings are not
-statements about the PoC.}
-\label{tab:configs}
+\caption{Every modality reduces to bytes plus at most three kinds of side information: a
+delimiter, a structural marker and a family id (\texttt{kairos/tokenizer.py}).}
+\label{tab:tokenizer}
 \end{table}
 
-Figure~\ref{fig:architecture} shows the data flow shared by all three.
+\subsection{Embedding and PyramidalCodec}
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  font=\small,
-  box/.style={draw, rounded corners=2pt, align=center, minimum height=0.75cm, text width=7.2cm, font=\scriptsize},
-  inner/.style={draw, rounded corners=2pt, align=center, minimum height=0.65cm, text width=6.2cm, font=\scriptsize, fill=white},
-  arr/.style={-{Stealth[length=2mm]}, thick},
-  node distance=5mm
-]
-\node[box, fill=blue!8] (input) {Input bytes: text, image, audio, video, lidar, control};
-\node[box, fill=blue!15, below=of input] (embed) {Embedding: byte token $+$ octet-family, fused by a linear layer\\(self-conditioning adds $\mathrm{softmax}(\hat y)\,E$)};
-\node[box, fill=purple!10, below=of embed] (enc) {PyramidalCodec encode: $S$ scales, patch sizes $p_s=\text{stride}^s$};
-\node[box, fill=gray!10, below=of enc] (route) {Scale router: each modality reads a subset of scales};
-\node[inner, fill=green!8, below=9mm of route] (attnres) {Block-AttnRes aggregator: learned mix of earlier outputs};
-\node[inner, fill=blue!10, below=of attnres] (liz) {RMSNorm $\to$ LiZAttention2 (bidirectional SWA $\parallel$ bidirectional DeltaNet) $+$ residual};
-\node[inner, fill=yellow!12, below=of liz] (moe) {RMSNorm $\to$ MoE (routed $+$ shared experts) or dense FFN $+$ residual};
-\node[draw, dashed, rounded corners=3pt, fit=(attnres)(liz)(moe), inner sep=5pt] (blk) {};
-\node[right=3mm of blk.east, text width=3.6cm, align=left, font=\scriptsize] {Backbone$_s$ for each scale $s$: $n_{\text{layers}}$ such blocks, one backbone shared across scales in the PoC};
-\node[box, fill=purple!10, below=9mm of blk] (dec) {PyramidalCodec decode: upsample each scale to $L$, concat, RMSNorm, Linear $Sd\to d$};
-\node[box, fill=blue!15, below=of dec] (head) {RMSNorm $\to$ tied head: byte logits $+$ octet-family logits};
-\draw[arr] (input) -- (embed);
-\draw[arr] (embed) -- (enc);
-\draw[arr] (enc) -- (route);
-\draw[arr] (route) -- (attnres);
-\draw[arr] (attnres) -- (liz);
-\draw[arr] (liz) -- (moe);
-\draw[arr] (blk.south) -- (dec);
-\draw[arr] (dec) -- (head);
-\end{tikzpicture}
-\caption{Kairos data flow. The AttnRes aggregator builds the input of each
-block; a block is a pre-norm residual pair (attention, feed-forward).
-Scales are fused in the codec decoder, after the per-scale backbones.}
-\label{fig:architecture}
-\end{figure}
-
-\subsection{Byte-level input and PyramidalCodec}
-
-Every modality is serialized to bytes: text as UTF-8, other modalities as
-quantized values written as big-endian byte planes (for example a 16-bit audio
-sample as a high and a low byte). Each byte is one token, and an auxiliary
-\emph{octet-family} id tags which byte plane a token belongs to. Token and
-family embeddings are fused by a linear layer; the output head, tied to the
-token embedding, predicts both the byte and its family.
+Each token id and its octet-family id are embedded and fused by a linear layer (\S\ref{sec:tokenizer});
+the output head, tied to the token embedding, predicts both the byte and its family.
 
 The PyramidalCodec builds $S$ parallel views of the sequence with patch sizes
 $p_s=\text{stride}^s$ (PoC: stride $3$, $S=4$, so $p=3,9,27,81$). A shared
@@ -506,53 +458,65 @@ of optimization instability when sampling the full masking range from a random
 initialization; that observation is not quantified here, and no run without
 the curriculum is reported.
 
-\subsection{Compute-sizing model}
-\label{sec:sizing-model}
+\section{Experimental Protocol}
 
-Consider one microbatch of $T$ tokens on a GPU with peak dense half-precision
-throughput $\pi$ and memory bandwidth $b_s$, whose ridge point is
-$\mathcal{I}^\ast=\pi/b_s$~\citep{williams2009roofline}. Training costs
-$6N_{\text{act}}T$ FLOPs~\citep{kaplan2020scaling}, ignoring attention-score
-FLOPs. Under balanced routing, an expert receives no token with probability
-$(1-k/E)^T\approx e^{-Tk/E}$, so for $T\gtrsim5E/k$ (about 40 tokens at
-$E=32$, $k=4$; miss probability below $1\%$) essentially every expert is
-touched: the forward pass reads $N_{\text{total}}$ weights, not
-$N_{\text{act}}$. The backward pass reads them again for activation gradients
-and writes the weight gradients, giving $3\beta N_{\text{total}}$ bytes of
-weight traffic per microbatch with $\beta=2$ bytes (bf16), independent of $T$.
-The arithmetic intensity is therefore
-\begin{equation}
-\mathcal{I}(T)=\frac{6N_{\text{act}}T}{3\beta N_{\text{total}}}
-=\frac{N_{\text{act}}}{N_{\text{total}}}\,T
-\quad\text{FLOP/byte},
-\label{eq:intensity}
-\end{equation}
-and the microbatch that reaches the ridge point is
-\begin{equation}
-T_{\min}=\frac{N_{\text{total}}}{N_{\text{act}}}\,\mathcal{I}^\ast .
-\label{eq:tmin}
-\end{equation}
-Equivalently, each expert must see about $\mathcal{I}^\ast$ tokens per
-microbatch, as a dense matrix would. Below $T_{\min}$ the step is bandwidth-bound and
-\begin{equation}
-\text{throughput}=\frac{T\,b_s}{3\beta N_{\text{total}}}\ \text{tokens/s},
-\label{eq:bw}
-\end{equation}
-which depends on $N_{\text{total}}$ and not on $N_{\text{act}}$. Above
-$T_{\min}$ the step is compute-bound at $u\pi/(6N_{\text{act}})$ tokens/s for
-a model FLOP utilization $u$, which we assume ($u=25\%$) and do not measure.
+This section fixes the three model scales, then the overfitting protocol behind every
+measured number in \S\ref{sec:ablations}.
 
-Two further terms are estimated separately. An optimizer step reads and writes
-fp32 master weights and two Adam moments and reads the gradient, about 30 bytes
-per parameter, i.e.\ $30N_{\text{total}}/b_s$ seconds per step, amortized over
-the $T_{\text{opt}}$ tokens accumulated per step. The training state occupies
-16 bytes per parameter (bf16 weights and gradients, fp32 master weights and
-two moments). The model omits activation traffic, DeltaNet states, codec
-convolutions, MoE dispatch, kernel-launch overhead and multi-GPU
-communication, so it bounds throughput from above.
+\subsection{Three scales, kept apart}
 
-\subsection{Ablation protocol}
+The codebase is used at three scales that this report does not conflate
+(Table~\ref{tab:configs}). The \textbf{ablation networks} of
+\S\ref{sec:ablations} use the library defaults of
+\texttt{configs/ablations/baseline.yaml} (1 layer, dense feed-forward). The
+\textbf{PoC configuration} is the default of the project's notebook
+(\texttt{notebook/kairos\_pretraining.py}): a $\sim$14--15M-parameter network
+with a 7-expert top-1 MoE, used for pipeline sanity checks. The
+\textbf{target} is a 200M-total/25M-active design point used in
+\S\ref{sec:sizing} purely to size a future run; it has never been
+instantiated. Because dense parameters (attention, codec, embeddings) are
+always active, $N_{\text{act}}=N_{\text{total}}/8+\tfrac78 N_{\text{dense}}$
+for $E/k=8$, and 25M is the lower bound reached when all parameters are
+routed experts.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lp{3.4cm}p{3.9cm}p{2.6cm}@{}}
+\toprule
+ & Ablation baseline & PoC (notebook) & Target (sizing only) \\
+\midrule
+$d_{\text{model}}$; heads (head dim) & 64; 4 (16) & 64; 4 (16) & -- \\
+Backbone layers & 1 & 4 & -- \\
+Codec stride; scales $S$ & 5; 4 & 3; 4 & -- \\
+Codec mode & \texttt{conv}, 1 channel per group & \texttt{conv}, 8 channels per group & -- \\
+AttnRes block size & 1 & 4 & -- \\
+Feed-forward & dense, $I=2048$ & 7 routed ($k=1$) $+$ 1 shared, $I=544$ & 32 routed ($k=4$) \\
+Backbone shared across scales & no & yes & -- \\
+Memory gate & off & on & -- \\
+$N_{\text{total}}$ & 1.98M & $\sim$14--15M & 200M \\
+$N_{\text{act}}$ & $N_{\text{total}}$ & $N_{\text{total}}-2.51$M (Eq.~\ref{eq:active}) & 25M \\
+Training data & 16 identical sentences, 600 steps & sanity checks & 30B tokens (budget) \\
+\bottomrule
+\end{tabular}
+\caption{The three scales this report distinguishes. Dashes: the target
+design point is specified only by its parameter and token budget. The PoC's
+$2.51$M is derived from its configuration
+($4\times7\times3\times64\times544=2.92$M routed-expert parameters, of which
+6/7 are inactive); the instantiated count has not been logged. The ablation
+networks are far smaller than the PoC, so ablation findings are not
+statements about the PoC.}
+\label{tab:configs}
+\end{table}
+
+
+
+\subsection{Overfitting protocol}
 \label{sec:protocol}
+
+The purpose is a convergence check. A network that cannot drive the loss of a fixed
+byte string to near zero has an optimization or implementation defect; success is necessary
+and not sufficient for a useful model, since it says nothing about generalization.
 
 All ablations use \texttt{kairos overfit} on the configurations of
 \texttt{configs/ablations/} (\texttt{kairos==0.4.1.dev46},
@@ -574,76 +538,13 @@ standard deviations ($n-1$).
 
 \section{Results}
 
-Two unrelated kinds of result follow, at two scales: \S\ref{sec:sizing-results}
-is an analytical sizing of the untrained 200M/25M target, and
-\S\ref{sec:ablations} is measured data from the ablation networks. Neither
-substitutes for the other.
+All results are convergence sanity checks (\S\ref{sec:protocol}) on the ablation networks of
+Table~\ref{tab:configs}: the training data are the evaluation data, so they measure
+memorization speed, not generalization. \S\ref{sec:ablations} compares codecs and attention
+variants, \S\ref{sec:qkv-sharing} reports a single-run effect that did not survive controls,
+and the last subsection covers the curriculum and the memory gate.
 
-\subsection{Compute sizing of the target design point}
-\label{sec:sizing-results}
-
-The target needs $C=6N_{\text{act}}D=6\times25\text{M}\times30\text{B}=4.5\times10^{18}$
-FLOPs. Table~\ref{tab:compute} gives, for three GPUs, the ridge point, the
-smallest microbatch that hides the weight traffic of a dense model and of the
-sparse target ($N_{\text{total}}/N_{\text{act}}=8$), and the compute-bound
-throughput and duration at the assumed $25\%$ utilization
-(Figure~\ref{fig:roofline}).
-
-\begin{table}[t]
-\centering
-\small
-\input{tables/compute}
-\caption{Compute-bound sizing of the target ($N_{\text{total}}=200$M,
-$N_{\text{act}}=25$M, $D=30$B). $T_{\min}$ is in tokens per microbatch
-(Eq.~\ref{eq:tmin}); tok/s and days assume $25\%$ utilization, which is
-not measured. Peak dense half-precision throughput $\pi$ and bandwidth $b_s$
-are vendor figures~\citep{nvidia2018t4,nvidia2020a100,nvidia2022h100}. The
-table is generated by \texttt{scripts/roofline.py}.}
-\label{tab:compute}
-\end{table}
-
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}
-\begin{semilogxaxis}[
-  width=0.85\textwidth, height=6cm,
-  xlabel={Microbatch size $T$ (tokens)},
-  ylabel={Attainable fraction of peak},
-  xmin=10, xmax=100000, ymin=0, ymax=1.05,
-  legend style={at={(0.98,0.05)}, anchor=south east, font=\tiny, fill=white, fill opacity=0.85, draw opacity=1, text opacity=1},
-  grid=both, grid style={gray!20}
-]
-\addplot[thick, blue, samples=300, domain=10:100000] {min(1, x/295.2)};
-\addplot[thick, red, samples=300, domain=10:100000] {min(1, x/(8*295.2))};
-\addplot[thick, blue, dashed, samples=300, domain=10:100000] {min(1, x/203.1)};
-\addplot[thick, red, dashed, samples=300, domain=10:100000] {min(1, x/(8*203.1))};
-\legend{Dense (H100), MoE with $N_{\text{total}}/N_{\text{act}}=8$ (H100), Dense (T4), MoE (T4)}
-\end{semilogxaxis}
-\end{tikzpicture}
-\caption{Model output (Eq.~\ref{eq:intensity}), not a measurement: the
-fraction of peak throughput a microbatch can reach. Sparsity moves the
-saturation point right by $N_{\text{total}}/N_{\text{act}}=8$.}
-\label{fig:roofline}
-\end{figure}
-
-A microbatch of about 1.6k tokens (T4, A100) to 2.4k tokens (H100) is enough
-for the sparse target to be compute-bound, against about 200--300 tokens for a
-dense model of the same size. At $2^{17}$ tokens per optimizer step, the
-memory-bound optimizer update adds less than $2.3\%$ to the compute time on
-all three GPUs. The 200M-parameter training state takes 3.2~GB and fits a 16~GB
-card, leaving the rest for activations, which set the achievable $T$. If
-activations or latency cap $T$ below $T_{\min}$, the step time is set by
-$N_{\text{total}}$ (Eq.~\ref{eq:bw}); reducing $N_{\text{total}}$ to 50M at
-fixed $N_{\text{act}}$ divides $T_{\min}$ by four (about 400--600 tokens).
-
-The target's ratio $D/N_{\text{act}}=1{,}200$ is below that of the dense
-Pythia-14M and Pythia-31M, trained on about 300B tokens
-($\sim$21{,}000$\times$ and $\sim$9{,}700$\times$ their
-parameters)~\citep{biderman2023pythia}. Those models are dense, so they bear
-on the plausibility of a high token-to-parameter ratio at small scale, not on
-sparse training.
-
-\subsection{Tiny-scale ablation study}
+\subsection{Convergence of the tiny-scale networks}
 \label{sec:ablations}
 
 Table~\ref{tab:seeds} reports the codec and attention choices under three
@@ -715,7 +616,7 @@ level.}
 \label{tab:sweeps}
 \end{table}
 
-\subsubsection{A correlation-versus-causation case: shared versus separate QKV}
+\subsection{A correlation-versus-causation case: shared versus separate QKV}
 \label{sec:qkv-sharing}
 
 Sharing the Q/K/V/O projections between the two attention branches
@@ -759,7 +660,7 @@ result on a tiny memorization task is a hypothesis until it survives a
 step-budget control, a data-scale control and, where a mechanism is
 suspected, a control that isolates it.
 
-\subsubsection{Curriculum and memory gate}
+\subsection{Curriculum and memory gate}
 
 Table~\ref{tab:stages} splits one 600-step run (baseline, seed 0) by
 curriculum stage (200 steps each). Losses are not comparable across stages
@@ -793,68 +694,106 @@ $9.752$. Twelve steps cannot separate the variants; we draw no conclusion.
 
 \section{Discussion}
 
-\paragraph{Compute sizing.} Under the model of \S\ref{sec:sizing-model}, a
-sparse model trains at compute-bound speed only when its microbatch exceeds
-$N_{\text{total}}/N_{\text{act}}$ times the dense threshold; below that,
-throughput is set by $N_{\text{total}}$, not by the active parameters that
-FLOP-centric accounting counts. Sparsity is therefore not free on
-memory-limited hardware: $E/k$ multiplies the microbatch needed for
-compute-bound execution, and activation memory grows with the microbatch.
-Whether a 16~GB card holds a 2.4k-token microbatch of this architecture is an
-empirical question this report does not answer.
+\paragraph{Summary of findings.} The tiny networks reach a near-zero loss on the
+memorization task, so the implementation optimizes; this does not show that the model
+learns transferable structure. Taken together, the observations suggest that:
+\begin{itemize}
+  \item the codec ranking of Table~\ref{tab:seeds} is stable across three seeds, but it was
+        measured after 600 steps on one repeated sentence and is a memorization-speed ranking;
+  \item the hybrid attention (\texttt{liz2}) reaches a lower loss than window attention alone
+        at 600 steps on every seed, and both reach the same floor at 3\,000 steps;
+  \item the shared-projection advantage is a convergence-speed effect (\S\ref{sec:qkv-sharing});
+        the mechanism is consistent with the freezing control but not isolated;
+  \item depth, top-1 versus top-2 routing and the AttnRes block size show no measurable
+        effect in this setup, the block-size result being a saturation effect;
+  \item the curriculum and the memory gate have no supporting result: one seed for the
+        former, twelve optimizer steps for the latter.
+\end{itemize}
 
-\paragraph{Ablations.} The only architectural comparisons tested at a longer
-horizon (\texttt{liz2} against \texttt{vanilla}, shared against separate
-projections) show no capacity difference. The codec ranking of
-Table~\ref{tab:seeds} is stable across seeds but has not been tested at longer
-horizons or on diverse data, and should be read as a memorization-speed
-ranking.
+\paragraph{Practical implications.} The ablation runs used a CPU. A memorization test of this
+kind can be repeated whenever a component changes, but the seed spread ($\pm0.03$ to
+$\pm0.19$ in Table~\ref{tab:seeds}) limits which differences it can detect.
+
+\paragraph{Compute sizing of the target.}
+\label{sec:sizing}
+The 200M-total/25M-active design point has not been instantiated; a roofline
+argument~\citep{williams2009roofline} indicates what a run would need. Training costs
+$6N_{\text{act}}D=4.5\times10^{18}$ FLOPs for $D=30$B tokens~\citep{kaplan2020scaling}, a ratio
+$D/N_{\text{act}}=1{,}200$ far below that of the dense Pythia-14M, trained on about 300B
+tokens~\citep{biderman2023pythia}. Chinchilla is fitted on dense models of 70M parameters and
+more~\citep{hoffmann2022chinchilla}, so applying it to 25M active parameters is an extrapolation,
+and MoE scaling laws~\citep{ludziejewski2025moe,abnar2025parameters} parameterize loss rather
+than step time. Under balanced routing, a microbatch of $T$ tokens touches nearly every expert
+once $T$ exceeds a few times $E/k$, so a step reads $N_{\text{total}}$ weights, not
+$N_{\text{act}}$; with bf16 weights the arithmetic intensity is
+$\mathcal{I}(T)=(N_{\text{act}}/N_{\text{total}})\,T$ FLOP/byte, and the smallest microbatch that
+reaches the ridge point $\mathcal{I}^{\ast}=\pi/b_s$ of a GPU with peak throughput $\pi$ and
+bandwidth $b_s$ is
+\begin{equation}
+T_{\min}=\frac{N_{\text{total}}}{N_{\text{act}}}\,\mathcal{I}^{\ast}.
+\label{eq:tmin}
+\end{equation}
+
+With the vendor figures of a T4, an A100 and an H100~\citep{nvidia2018t4,nvidia2020a100,nvidia2022h100}
+and $N_{\text{total}}/N_{\text{act}}=8$, $T_{\min}$ is about 1.6k tokens (T4, A100) to 2.4k tokens
+(H100), against 200--300 for a dense model of the same size; below it, throughput is set by
+$N_{\text{total}}$, not by the active parameters that FLOP-centric accounting counts. Sparsity is
+therefore not free on memory-limited hardware. These are upper bounds from a model that counts
+weight traffic only and omits activations, DeltaNet states, codec convolutions, MoE dispatch and
+communication, and any utilization would be assumed, not measured. Whether a 16~GB card holds a
+2.4k-token microbatch of this architecture is an empirical question this report does not answer.
+The numbers come from \texttt{scripts/roofline.py}.
 
 \subsection{Limitations}
 
-The target-scale analysis is a sizing model for a run that has not been
-performed: throughput is an upper bound at an assumed utilization, it assumes
-balanced routing and counts weight and optimizer traffic only, and the
-Chinchilla comparison is an extrapolation. The ablation study memorizes one
-sentence in 16 copies on text only, with a window branch that attends
-globally, on CPU, with runs that are not bit-reproducible; its metric is a
-minimum over noisy per-step losses. Only Table~\ref{tab:seeds} and
-\S\ref{sec:qkv-sharing} carry multi-seed or multi-control statistics; the
-other sweeps are single-run. Parameter counts of the ablation rows in
-Table~\ref{tab:seeds} other than the baseline are carried over from earlier
-logs. The PoC's active-parameter count has not been logged from an
-instantiated model. No dense baseline is compared, so nothing here supports a
-claim of superiority; the multimodal, curriculum and memory-gate components
-have no supporting result yet.
+The ablation study memorizes one sentence in 16 copies on text only, with a window branch that
+attends globally, on CPU, with runs that are not bit-reproducible; its metric is a minimum over
+noisy per-step losses. Only Table~\ref{tab:seeds} and \S\ref{sec:qkv-sharing} carry multi-seed
+or multi-control statistics; the other sweeps are single-run. Parameter counts of the ablation
+rows in Table~\ref{tab:seeds} other than the baseline are carried over from earlier logs. The
+PoC's active-parameter count has not been logged from an instantiated model. No dense baseline
+is compared, so nothing here supports a claim of superiority; the multimodal, curriculum and
+memory-gate components have no supporting result yet. The target sizing is analytical.
 
 \subsection{Future work}
+\label{sec:future}
 
-Four experiments would turn this report's hypotheses into findings: (i) a
-measured tokens/s against microbatch size for the 200M/25M and a 50M/25M
-variant on a T4 and an A100/H100, which tests Eqs.~\ref{eq:tmin}
-and~\ref{eq:bw} directly; (ii) 3-seed, steps-to-threshold reruns of the
-single-run sweeps on diverse data; (iii) per-modality loss on real multimodal
-data; (iv) a run without the curriculum.
+The next step is a pretraining run, which would turn these sanity checks into held-out
+results. The notebook \texttt{notebook/kairos\_pretraining.py} trains on the text corpus
+\texttt{keep-it-simple} (640{,}646 rows of bidirectional prompt--text pairs) and on
+\texttt{keep-it-simple-multimodal} (6{,}336 rows, a deliberately small pilot mix), through the
+MAE, transition and diffusion curriculum. Planned measurements: (i) held-out loss per curriculum
+stage and per modality against trivial baselines, and text loss with and without the
+multimodal data; (ii) a comparison with Pythia-14M~\citep{biderman2023pythia} in bits per byte,
+since tokenizers and objectives differ. Equal total parameter counts do not mean equal compute:
+Pythia's parameters are largely embeddings of a vocabulary of about 50k entries, whereas a
+byte-level vocabulary puts nearly all Kairos parameters in the backbone, so total,
+non-embedding and active parameters and FLOPs per byte should all be reported. A Pythia-shaped
+model trained on the same data would separate architecture from data, and a held-out corpus
+that neither model has seen would avoid favoring Kairos; (iii) 3-seed, steps-to-threshold
+reruns of the single-run sweeps on diverse data; (iv) a run without the curriculum; (v) a
+measured tokens/s against microbatch size for the 200M/25M and a 50M/25M variant, which tests
+Eq.~\ref{eq:tmin} directly.
 
 \section{Conclusion}
 
-Kairos is a proof of concept of 1--15M parameters that runs a hybrid
-bidirectional DeltaNet/window-attention, MoE, denoising architecture end to
-end over a byte-level multimodal space, with a separate 200M/25M design point
-used only to size a future run. For that design point, sparse training is
-compute-bound once each expert sees about a ridge point's worth of tokens per
-microbatch, roughly 1.6k--2.4k tokens; the ablation study's main result is
-methodological, since its clearest architectural effect was a convergence-speed
-artifact.
+Kairos is a proof of concept of 1--15M parameters that specifies a hybrid bidirectional
+DeltaNet/window-attention, MoE, denoising architecture over a byte-level space, and shows by
+memorization tests that it optimizes. The clearest architectural effect in these tests, a
+shared-projection advantage, was a convergence-speed artifact, which is why we recommend
+steps-to-threshold and control runs before reading a tiny-scale comparison. Generalization,
+multimodal training and comparison with existing models are the objectives of the run described
+in \S\ref{sec:future}; the 200M/25M design point of \S\ref{sec:sizing} is a sizing exercise only.
 
 \section*{Code and reproducibility}
 
 Code, configurations and logs are in the repository. Ablation configurations
 are in \texttt{configs/ablations/}; a run is
 \texttt{kairos overfit configs/ablations/<name>.yaml --steps 600 --mask-p-max 0.3
---no-mask-reweight --seed <0|1|2>}. The compute table is produced by
-\texttt{python scripts/roofline.py > docs/paper/tables/compute.tex} and checked
-by \texttt{tests/test\_roofline.py} and \texttt{tests/test\_paper.py}.
+--no-mask-reweight --seed <0|1|2>}. The sizing numbers of \S\ref{sec:sizing} come from
+\texttt{scripts/roofline.py}, checked by \texttt{tests/test\_roofline.py} and
+\texttt{tests/test\_paper.py}. The pretraining notebook (marimo) is
+\texttt{notebook/kairos\_pretraining.py}.
 
 \bibliographystyle{plainnat}
 \bibliography{kairos_references}
