@@ -31,7 +31,7 @@ def get_gitignore_spec(root_dir: str) -> pathspec.PathSpec:
         ".venv/",
         ".DS_Store",
         "node_modules/",
-        "*.svg",  # promote .puml, .tikz or mermaid
+        #"*.svg",  # promote .puml, .tikz or mermaid
     ]
 
     gitignore_path = os.path.join(root_dir, ".gitignore")

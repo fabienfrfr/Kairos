@@ -49,7 +49,7 @@ Our conviction: AGI will emerge from a generalist, multimodal, causal model capa
 * **MoE:** Sparse routing across heterogeneous modal experts (32 experts, 4 active), enabling local training by reducing active compute (~8× compute reduction vs dense model).
 * **AttnRes:** Signal stability for multi-modal residual flow ([arXiv:2603.15031](https://arxiv.org/abs/2603.15031)).
 
-![scheme](docs/kairos_architecture.svg)
+![scheme](docs/architecture/kairos_architecture.svg)
 
 > Following the same shared-basis philosophy as LiZAttention2 (shared Q/K/V/O between SWA and DeltaNet), each MoE block combines a shared expert (always active, learns universal token transformations) with sparse routed experts (top-k, learn token-specific patterns). This enforces a common representational foundation at every level of the network — attention, memory, and feed-forward — while keeping active parameter count low.
 
