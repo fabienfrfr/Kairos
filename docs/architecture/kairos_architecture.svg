@@ -26,10 +26,18 @@
   <!-- white background -->
   <rect x="0" y="-30" width="1280" height="412" fill="#ffffff"/>
 
-  <!-- tied-weight links: two small arcs above the pipeline, not buried in prose -->
-  <path d="M163,70 Q635,-25 1108,70" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="4,3" marker-end="url(#arrow-light)"/>
-  <path d="M307,20 Q574,-9 842,20" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="4,3" marker-end="url(#arrow-light)"/>
-  <text x="640" y="2" class="note" text-anchor="middle" font-size="8">dashed arcs = tied weights, both ways: Embedding / Output Head, and Codec encode / decode</text>
+  <!-- tied-weight links: small local dashed stubs, not long arcs that cross other boxes -->
+  <path d="M163,70 L163,12" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="3,2" marker-end="url(#arrow-light)"/>
+  <text x="167" y="10" class="note" text-anchor="start" font-size="7.5">tied: Output Head</text>
+
+  <path d="M1108,70 L1108,12" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="3,2" marker-end="url(#arrow-light)"/>
+  <text x="1104" y="10" class="note" text-anchor="end" font-size="7.5">tied: Embedding</text>
+
+  <path d="M307,20 Q330,6 346,1" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="3,2" marker-end="url(#arrow-light)"/>
+  <text x="350" y="3" class="note" text-anchor="start" font-size="7.5">tied: decode</text>
+
+  <path d="M842,20 Q819,6 803,1" fill="none" stroke="#8a6bb0" stroke-width="1.1" stroke-dasharray="3,2" marker-end="url(#arrow-light)"/>
+  <text x="799" y="3" class="note" text-anchor="end" font-size="7.5">tied: encode</text>
 
   <!-- ===================== ROW 1: main pipeline, all boxes at the same height, left to right ===================== -->
 
@@ -65,21 +73,20 @@
 
   <!-- KairosBackbone x num_scales -->
   <rect x="406" y="6" width="330" height="175" rx="6" fill="#eefaf0" stroke="#4c9a5c" stroke-width="1.1"/>
-  <text x="571" y="20" class="group-label" text-anchor="middle">KairosBackbone, one independent stack per scale</text>
+  <text x="571" y="20" class="group-label" text-anchor="middle" font-size="10">KairosBackbone (one stack per scale)</text>
 
   <rect class="box" x="422" y="30" width="298" height="30" fill="#fff" stroke-dasharray="2,2"/>
-  <text x="571" y="49" class="note" text-anchor="middle" font-size="9.5">AttnRes: this layer's input is a weighted mix of the</text>
+  <text x="571" y="49" class="note" text-anchor="middle" font-size="9">AttnRes: mix of embedding + prior block sums</text>
 
-  <rect class="box" x="470" y="72" width="200" height="94" fill="#fff"/>
+  <rect class="box" x="470" y="72" width="200" height="86" fill="#fff"/>
   <text x="570" y="86" class="sub" text-anchor="middle" font-weight="700" font-size="10">KairosBlock &#215; n layers</text>
-  <rect class="box" x="482" y="94" width="176" height="30" fill="#dceaff"/>
-  <text x="570" y="105" class="note" text-anchor="middle" font-size="8.5" font-style="normal" font-weight="700">KairosLiZAttention2 (bidirectional)</text>
-  <text x="570" y="118" class="note" text-anchor="middle" font-size="8.5" font-style="normal">h + Attn(norm(h))</text>
-  <rect class="box" x="482" y="134" width="176" height="24" fill="#fff3d6"/>
-  <text x="570" y="150" class="note" text-anchor="middle" font-size="9.5" font-style="normal">x + FFN/MoE(norm(x))</text>
+  <rect class="box" x="482" y="94" width="176" height="24" fill="#dceaff"/>
+  <text x="570" y="107" class="note" text-anchor="middle" font-size="8.5" font-style="normal">LiZAttention2: h + Attn(norm(h))</text>
+  <rect class="box" x="482" y="128" width="176" height="24" fill="#fff3d6"/>
+  <text x="570" y="141" class="note" text-anchor="middle" font-size="9" font-style="normal">x + FFN/MoE(norm(x))</text>
   <path class="arr" d="M570,60 L570,72"/>
 
-  <text x="571" y="170" class="note" text-anchor="middle">embedding and the prior blocks' summed outputs</text>
+  <text x="571" y="167" class="note" text-anchor="middle" font-size="8.5">bidirectional: SWA + DeltaNet, shared QKVO</text>
   <path class="arr" d="M736,91 L750,91"/>
 
   <!-- ScaleRouter.scatter + PyramidalCodec.decode -->
@@ -123,11 +130,13 @@
 
   <!-- text example under the INPUT box: the masked input -->
   <path class="dashed-light" d="M50,112 L50,192"/>
-  <rect x="6" y="192" width="196" height="60" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1.1"/>
+  <rect x="6" y="192" width="196" height="76" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1.1"/>
   <text x="16" y="207" class="sub" font-weight="700" font-size="9.5">input example (masked)</text>
   <text x="16" y="223" class="mask" font-size="9.5"><tspan font-weight="700">input</tspan>: The capital of</text>
   <text x="16" y="236" class="mask" font-size="9.5">France is &#9608;&#9608;&#9608;&#9608;&#9608; .</text>
   <text x="16" y="249" class="note" font-size="8">same mechanism at any curriculum stage</text>
+  <text x="16" y="264" class="note" font-size="8" font-weight="700" font-style="normal">one byte space, any modality:</text>
+  <text x="16" y="275" class="note" font-size="8">text, image, audio, video, control, &#8230;</text>
 
   <!-- text example under the OUTPUT box: the denoised output -->
   <path class="dashed-light" d="M1213,112 L1213,192"/>
@@ -182,16 +191,16 @@
   <!-- ===================== bottom: pretraining curriculum as three small stages ===================== -->
   <text x="6" y="349" class="sub" font-weight="700" font-size="9.5">Pretraining curriculum, same masking mechanism throughout &#8211; later stages (LoRA fine-tuning, dynamic MaG scheduling) train differently, see Training Procedure:</text>
 
-  <rect x="6" y="356" width="230" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
-  <text x="121" y="369" class="sub" text-anchor="middle" font-size="9">stage 1 &#8211; MAE: fixed mask rate, plain cross-entropy</text>
+  <rect x="6" y="356" width="405" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
+  <text x="208" y="369" class="sub" text-anchor="middle" font-size="9">stage 1 &#8211; MAE: fixed mask rate, plain cross-entropy</text>
 
-  <path class="arr" d="M236,365 L256,365"/>
+  <path class="arr" d="M411,365 L427,365"/>
 
-  <rect x="256" y="356" width="380" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
-  <text x="446" y="369" class="sub" text-anchor="middle" font-size="9">stage 2 &#8211; transition: mask rate ramps linearly</text>
+  <rect x="427" y="356" width="405" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
+  <text x="629" y="369" class="sub" text-anchor="middle" font-size="9">stage 2 &#8211; transition: mask rate ramps linearly</text>
 
-  <path class="arr" d="M636,365 L656,365"/>
+  <path class="arr" d="M832,365 L848,365"/>
 
-  <rect x="656" y="356" width="618" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
-  <text x="965" y="369" class="sub" text-anchor="middle" font-size="9">stage 3 &#8211; diffusion: t ~ U(0,1), reweighted loss</text>
+  <rect x="848" y="356" width="426" height="18" rx="4" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
+  <text x="1061" y="369" class="sub" text-anchor="middle" font-size="9">stage 3 &#8211; diffusion: t ~ U(0,1), reweighted loss</text>
 </svg>
