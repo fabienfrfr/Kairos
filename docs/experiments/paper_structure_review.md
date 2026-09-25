@@ -160,3 +160,92 @@ Code observations (tokenizer not executed here: `torch`/`transformers` absent; t
   inserts; the Figure 1 caption says so. No element leaves its box (checked on a 3x render).
 - The output "byte stream" box is unchanged (it is the tokenizer's decode side).
 - Text in the figure is still ~3 pt at page width; the two-row redesign is not done.
+
+## Session 6: two-row redesign of Figure 1, PDFs generated
+
+- Rebuilt `kairos_architecture.svg` from scratch as a fixed 880x644 canvas, two rows (input row: tokenizer,
+  embedding, codec, image example, masked-input box; output row: backbone, scatter-back, head, output
+  stream, denoised-output box, streaming cache, memory gate), same content and colors as the one-row
+  version, plus two small purple weight-sharing badges (Embedding<->Output Head, Codec encode<->decode)
+  since the return arrow that used to show this (top dashed loop) no longer fits the layout; the caption
+  now explains the badges. Original one-row file kept as `kairos_architecture_wide.svg` (not referenced
+  by the paper).
+- At the paper's actual print width (measured on the compiled PDF, 300dpi), the smallest labels
+  ("row wrap (4)" etc.) render close to 7pt, legible; previously ~3pt. Figure changed from `[H]` to `[t]`,
+  full `\linewidth` (was 0.95).
+- Generated `docs/architecture/kairos_architecture.pdf` (cairosvg) and `docs/paper/kairos_paper.pdf`
+  (latexmk) and put both in the zip. `tests/test_paper.py`/`test_roofline.py`: 30 passed. Build: 15 pages,
+  no undefined reference/citation.
+- Not redone: the SVG is now plain rects/paths (no `<style>` classes to hand-tune later); porting further
+  paper-text tweaks means re-running `make_svg.py`, not hand-editing the SVG.
+
+## Session 7: single-direction figure, on page 1
+
+Complaint: the two-row figure still had crossing/zigzag arrows and did not fit page 1. Rebuilt again:
+
+- **Flow direction, strictly one-way.** Main pipeline is now one row, left to right, seven boxes
+  (Tokenizer -> Embedding -> Codec -> Backbone -> Scatter back -> Output Head -> byte stream), arrows
+  only rightward. Every annotation (input/output example, image example, streaming cache, memory gate)
+  hangs directly below its box on straight vertical arrows, never back up or sideways. Curriculum strip
+  at the bottom, left to right. No arrow crosses another module's box.
+- **Sizing.** Column widths are computed once (max of a box's own width and its child annotation's
+  width) so nothing overlaps; verified by rendering at 3x and by the compiled PDF. Overall canvas
+  1220x288 (aspect ~4.2:1), shorter than the two-row version (was 880x644, ~1.4:1).
+- **Page 1.** `\maketitle` spacing was tightened (`titling` package, no code/text removed) to recover
+  the whitespace LaTeX puts around the title block; the figure environment changed from `[t]` (which
+  only ever lands at the top of *a* page) to `[H]` (float package, "here", placed inline at that point
+  in the text). Combined, the figure, its caption and the first paragraph of the Introduction now fit
+  on page 1 with the compiled PDF (checked: no Overfull vbox, no undefined reference, 14 pages).
+- The one-row/no-zigzag constraint means several previous nested details (AttnRes dashed box inside
+  Backbone, the per-scale codec grid) are now one-line captions on the main-row box instead of a nested
+  diagram; the full detail is still in the Model section text and Algorithms 1-3.
+- `kairos_architecture_wide.svg` (session 6, two-row) is superseded and can be deleted; kept for now.
+
+## Session 8: fixed overlap bug, restored internal blocks
+
+Bug found: session 7's box widths for the annotation row (image example, streaming/memory) were
+hardcoded pixel values that no longer matched the column widths after a manual rescale-to-1220 pass,
+so those boxes bled into the neighboring column (e.g. image-example box: x in [270.7, 565.7] vs the
+Streaming-cache box starting at x=506.3 -- a 59-unit overlap, confirmed on a 3x render).
+
+Rebuilt without the rescale step: the canvas is now sized to its natural content width (no forced
+total), so every annotation box is drawn at exactly its own column's width and position -- overlap is
+impossible by construction (checked: printed column x-ranges are strictly increasing and non-touching).
+LaTeX's `\includegraphics[width=\linewidth]` still scales the whole PDF down proportionally, so this
+adds no manual-scale bug surface.
+
+Internal blocks restored (asked for): the Pyramidal Codec box now shows its 2x2 per-scale grid; the
+KairosBackbone box shows the dashed AttnRes strip and the KairosBlock (LiZAttention2 + FFN/MoE) rows;
+Scatter back shows the Codec-decode sub-box. This only grew the figure's height (canvas 1632x466,
+aspect ~3.5:1 vs ~4.2:1 before), not its width, so the single left-to-right row is unchanged.
+
+Checked: 30 tests pass; compiled PDF is 14 pages, 0 undefined references, 0 Overfull warnings; Figure 1
+with all internals still fits on page 1 (\maketitle tightened in session 7, [H] placement).
+`kairos_architecture_wide.svg` (superseded two-row draft) removed from the repo.
+
+## Session 9: legibility check, title, "proof of concept" reframed, missing citations
+
+- **Legibility, verified.** At 300dpi on the compiled PDF (true print size), the figure's smallest
+  labels are clearly readable, comparable to the caption text size -- the session-7/8 fix holds; the
+  earlier "looks like session 1 again" impression was the overlap bug (session 8), now fixed, not a
+  size regression.
+- **Title.** Changed from a flat two-line description to a hook + question:
+  "Kairos: One Byte Space for Every Modality" / "A Hybrid Delta/Window-Attention Mixture-of-Experts
+  Denoising Network -- Does It Converge? Sanity Checks at Tiny Scale."
+- **"Proof of concept" removed.** The abstract and conclusion no longer brand Kairos as a PoC (an
+  engineering-deliverable framing); both now pose it as a research question ("this report asks whether
+  the combination optimizes at all"). The unrelated technical shorthand "PoC" used throughout Methods/
+  Results/Table 2 to name one of the three model scales (the notebook's default config, as opposed to
+  the ablation baseline and the sizing target) is renamed "notebook config" everywhere, for the same
+  reason, with no change in meaning.
+- **Missing citations added:**
+  - `furfaro2024pixelbytes` (arXiv:2410.01820, PixelBytes): cited in Related Work as the two-modality
+    precursor this report substantially revises, and in the tokenizer table caption as the source of
+    the control-stream action/state encoding.
+  - `keepitsimple2026` / `keepitsimplemm2026`: both HF datasets now cited (not just named) where first
+    introduced, in Future Work.
+  - All three added to `kairos_references.bib` as `@misc` entries with direct `\url{}` links (visible
+    in the reference list, not the margin -- this class has no margin-note mechanism).
+- Checked: 30 tests pass; build is 15 pages (bibliography gained 3 entries, spilling one extra line to
+  a mostly-blank final page); 0 undefined citation/reference, 0 Overfull; Figure 1 still fits page 1
+  with room to spare under the new 3-line title.

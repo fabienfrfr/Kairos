@@ -41,25 +41,31 @@
 \usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 \sloppy
 
-\title{Kairos: A Hybrid Delta/Window-Attention Mixture-of-Experts\\
-Denoising Model over a Byte-Level Multimodal Latent Space\\
-\large Design and Convergence Sanity Checks at Tiny Scale}
+\title{Kairos: One Byte Space for Every Modality\\
+\large A Hybrid Delta/Window-Attention Mixture-of-Experts Denoising Network --\\
+\large Does It Converge? Sanity Checks at Tiny Scale}
 
 \author{Fabien Furfaro\thanks{Code and configurations:
 \url{https://github.com/fabienfrfr/Kairos}}}
 \date{September 2026}
+
+\usepackage{titling}
+\setlength{\droptitle}{-1.6cm}
+\posttitle{\par\end{center}\vspace{-0.6cm}}
+\preauthor{\begin{center}\large}
+\postauthor{\par\end{center}\vspace{-0.9cm}}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
 \textbf{Background:} Small language models trained on a single local machine leave
-little room for architectural trial and error. Kairos is a proof of concept that
-combines bidirectional gated-DeltaNet linear attention and sliding-window attention over
-shared projections (LiZAttention2), block-wise Attention-Residual aggregation, a sparse
-Mixture-of-Experts (MoE) feed-forward layer and a multi-scale byte-level codec, trained
-with a uniform-noise denoising objective over a shared byte space meant for text, image,
-audio, video, lidar and control streams.
+little room for architectural trial and error. Kairos combines bidirectional gated-DeltaNet linear attention and sliding-window attention
+over shared projections (LiZAttention2), block-wise Attention-Residual aggregation, a
+sparse Mixture-of-Experts (MoE) feed-forward layer and a multi-scale byte-level codec,
+trained with a uniform-noise denoising objective over one byte space shared by text, image,
+audio, video, lidar and control streams; this report asks whether the combination optimizes
+at all before asking whether it is useful.
 \textbf{Methods:} We give code-derived algorithms for each component, including a
 cross-session recurrent-state memory gate, then run convergence sanity checks: overfitting
 a single 440-byte sentence at 1--15M parameters, text only, with three seeds for codec and
@@ -78,7 +84,7 @@ target analytically; none of its throughput figures is measured.
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.95\linewidth]{../architecture/kairos_architecture.pdf}
+    \includegraphics[width=\linewidth]{../architecture/kairos_architecture.pdf}
     \caption{Kairos data and training flow, left to right. The tokenizer (\S\ref{sec:tokenizer})
     flattens every modality to one byte stream; the image example shows a 2D image flattened row by
     row (its \texttt{<ENDLINE>} markers are omitted). Each KairosBlock is a standard
@@ -109,7 +115,8 @@ training~\citep{austin2021d3pm,lou2023sedd,sahoo2024mdlm,nie2025llada}, which
 generalizes masked language modeling~\citep{devlin2018bert}. A fourth,
 orthogonal choice removes the tokenizer: byte-level
 inputs~\citep{xue2022byt5,yu2023megabyte,pagnoni2024blt} give one vocabulary
-that can cover several modalities.
+that can cover several modalities, an idea we had explored at smaller scale for two
+modalities~\citep{furfaro2024pixelbytes} and revise substantially here for six.
 
 Each lever is usually reported on its own. Combining them in one model small enough to
 train on a single local machine raises a practical question before any question of
@@ -259,7 +266,8 @@ Control & action and state, 2 bytes each, interleaved & \texttt{<OBS>} for state
 \bottomrule
 \end{tabular}
 \caption{Every modality reduces to bytes plus at most three kinds of side information: a
-delimiter, a structural marker and a family id (\texttt{kairos/tokenizer.py}).}
+delimiter, a structural marker and a family id (\texttt{kairos/tokenizer.py}). The control
+serialization follows the action--state encoding of~\citet{furfaro2024pixelbytes}.}
 \label{tab:tokenizer}
 \end{table}
 
@@ -269,7 +277,7 @@ Each token id and its octet-family id are embedded and fused by a linear layer (
 the output head, tied to the token embedding, predicts both the byte and its family.
 
 The PyramidalCodec builds $S$ parallel views of the sequence with patch sizes
-$p_s=\text{stride}^s$ (PoC: stride $3$, $S=4$, so $p=3,9,27,81$). A shared
+$p_s=\text{stride}^s$ (notebook config: stride $3$, $S=4$, so $p=3,9,27,81$). A shared
 rank-$r$ bottleneck mixer
 ($\text{Conv1d}_{d\to r}\to\text{GELU}\to\text{Conv1d}_{r\to d}$,
 $r=\max(8,d/4)$, cost $O(rd)$ against $O(d^2)$ for a dense $1{\times}1$
@@ -282,7 +290,7 @@ convolution. \texttt{mode="patch"} replaces the convolution and mixer chain by
 one $\text{Linear}(p_s d\to d)$ per scale, decoded with the transposed weight
 (tied encode and decode). Each scale runs through its own backbone, or through
 one shared backbone (about $75\%$ fewer backbone parameters for $S=4$). A
-scale router lets each modality read only a subset of scales (PoC: text
+scale router lets each modality read only a subset of scales (notebook config: text
 $\to$ scales 1--2, control 1, image 2--3, lidar 2, audio 3, video 3--4,
 metadata 4); positions of modalities not routed to a scale bypass its
 backbone. Decoding mirrors encoding with grouped transposed convolutions and
@@ -348,7 +356,7 @@ input. The weight vector $w$ of each aggregator is initialized to zero, so the
 initial mix is uniform. With block size $1$ each earlier layer output is a
 separate source, a densely connected pattern~\citep{huang2016densenet} with learned
 softmax weights; with block size $n_{\text{layers}}$ the sources reduce to the
-embedding and one running sum, and larger sizes change nothing. The PoC uses
+embedding and one running sum, and larger sizes change nothing. The notebook config uses
 block size $4$ over $4$ layers; the ablation networks have one layer, where
 the aggregator is a structural no-op.
 
@@ -397,7 +405,7 @@ gate over a bank of states left by earlier sequences (the preceding batch's
 final state, or an externally supplied bank). One gate module is shared by all
 scales and layers. It is a single-head cross-attention over a rank-$r'$
 bottleneck, $r'=\max(8,\text{round}(\sqrt{D}/4))$, where $D$ is the flattened
-DeltaNet state size ($D=2048$ and $r'=11$ for the PoC). The query is the
+DeltaNet state size ($D=2048$ and $r'=11$ for the notebook config). The query is the
 projection of the (zero) current state; the keys and values are that same
 projection followed by the projected bank, so the gate can attend to the
 bank or fall back on the current state (Algorithm~\ref{alg:memgate}). It is
@@ -469,7 +477,7 @@ The codebase is used at three scales that this report does not conflate
 (Table~\ref{tab:configs}). The \textbf{ablation networks} of
 \S\ref{sec:ablations} use the library defaults of
 \texttt{configs/ablations/baseline.yaml} (1 layer, dense feed-forward). The
-\textbf{PoC configuration} is the default of the project's notebook
+\textbf{Notebook configuration} is the default of the project's notebook
 (\texttt{notebook/kairos\_pretraining.py}): a $\sim$14--15M-parameter network
 with a 7-expert top-1 MoE, used for pipeline sanity checks. The
 \textbf{target} is a 200M-total/25M-active design point used in
@@ -484,7 +492,7 @@ routed experts.
 \small
 \begin{tabular}{@{}lp{3.4cm}p{3.9cm}p{2.6cm}@{}}
 \toprule
- & Ablation baseline & PoC (notebook) & Target (sizing only) \\
+ & Ablation baseline & Notebook config & Target (sizing only) \\
 \midrule
 $d_{\text{model}}$; heads (head dim) & 64; 4 (16) & 64; 4 (16) & -- \\
 Backbone layers & 1 & 4 & -- \\
@@ -500,12 +508,12 @@ Training data & 16 identical sentences, 600 steps & sanity checks & 30B tokens (
 \bottomrule
 \end{tabular}
 \caption{The three scales this report distinguishes. Dashes: the target
-design point is specified only by its parameter and token budget. The PoC's
+design point is specified only by its parameter and token budget. The notebook config's
 $2.51$M is derived from its configuration
 ($4\times7\times3\times64\times544=2.92$M routed-expert parameters, of which
 6/7 are inactive); the instantiated count has not been logged. The ablation
-networks are far smaller than the PoC, so ablation findings are not
-statements about the PoC.}
+networks are far smaller than the notebook config, so ablation findings are not
+statements about the notebook config.}
 \label{tab:configs}
 \end{table}
 
@@ -553,7 +561,7 @@ every seed: \texttt{patch} $<$ dense \texttt{conv} $<$ \texttt{conv} with 8
 channels per group $<$ depthwise \texttt{conv} (\texttt{liz2}
 baseline), from $0.018$ to $0.354$. The hybrid attention beats SWA alone on
 every seed ($0.227$, $0.258$, $0.576$ against $0.596$, $0.728$, $0.798$),
-although the mean $\pm$ sd ranges overlap. The PoC uses \texttt{conv} with 8
+although the mean $\pm$ sd ranges overlap. The notebook config uses \texttt{conv} with 8
 channels per group, a compromise between the depthwise default and the dense
 variants.
 
@@ -751,7 +759,7 @@ attends globally, on CPU, with runs that are not bit-reproducible; its metric is
 noisy per-step losses. Only Table~\ref{tab:seeds} and \S\ref{sec:qkv-sharing} carry multi-seed
 or multi-control statistics; the other sweeps are single-run. Parameter counts of the ablation
 rows in Table~\ref{tab:seeds} other than the baseline are carried over from earlier logs. The
-PoC's active-parameter count has not been logged from an instantiated model. No dense baseline
+notebook config's active-parameter count has not been logged from an instantiated model. No dense baseline
 is compared, so nothing here supports a claim of superiority; the multimodal, curriculum and
 memory-gate components have no supporting result yet. The target sizing is analytical.
 
@@ -759,9 +767,10 @@ memory-gate components have no supporting result yet. The target sizing is analy
 \label{sec:future}
 
 The next step is a pretraining run, which would turn these sanity checks into held-out
-results. The notebook \texttt{notebook/kairos\_pretraining.py} trains on the text corpus
-\texttt{keep-it-simple} (640{,}646 rows of bidirectional prompt--text pairs) and on
-\texttt{keep-it-simple-multimodal} (6{,}336 rows, a deliberately small pilot mix), through the
+results. The pretraining notebook (\texttt{notebook/kairos\_pretraining.py}) trains on the text corpus
+\texttt{keep-it-simple}~\citep{keepitsimple2026} (640{,}646 rows of bidirectional
+prompt--text pairs) and on \texttt{keep-it-simple-multimodal}~\citep{keepitsimplemm2026}
+(6{,}336 rows, a deliberately small pilot mix), through the
 MAE, transition and diffusion curriculum. Planned measurements: (i) held-out loss per curriculum
 stage and per modality against trivial baselines, and text loss with and without the
 multimodal data; (ii) a comparison with Pythia-14M~\citep{biderman2023pythia} in bits per byte,
@@ -777,9 +786,9 @@ Eq.~\ref{eq:tmin} directly.
 
 \section{Conclusion}
 
-Kairos is a proof of concept of 1--15M parameters that specifies a hybrid bidirectional
-DeltaNet/window-attention, MoE, denoising architecture over a byte-level space, and shows by
-memorization tests that it optimizes. The clearest architectural effect in these tests, a
+Kairos poses a design question at 1--15M parameters: whether a hybrid bidirectional
+DeltaNet/window-attention, MoE, denoising architecture over a byte-level space optimizes at
+all. Memorization tests answer yes at this scale. The clearest architectural effect in these tests, a
 shared-projection advantage, was a convergence-speed artifact, which is why we recommend
 steps-to-threshold and control runs before reading a tiny-scale comparison. Generalization,
 multimodal training and comparison with existing models are the objectives of the run described
