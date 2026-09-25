@@ -249,3 +249,30 @@ with all internals still fits on page 1 (\maketitle tightened in session 7, [H] 
 - Checked: 30 tests pass; build is 15 pages (bibliography gained 3 entries, spilling one extra line to
   a mostly-blank final page); 0 undefined citation/reference, 0 Overfull; Figure 1 still fits page 1
   with room to spare under the new 3-line title.
+
+## Session 10: real overflow bug fixed, numbered references, new title, foundation-model aim
+
+- **Overflow, confirmed and fixed.** The user's screenshot was right: the Pyramidal Codec's caption
+  ("reshape per scale, not pooling; each modality uses only the scales it needs", 76 chars) was a
+  single unwrapped `<text>` spanning past both edges of its 300-unit-wide box into the neighboring
+  KairosBackbone box. A systematic check (every other caption's estimated width against its containing
+  box) found this was the only real overflow; one other flagged case was a false positive from the
+  check script matching a small grid-cell rect instead of the actual container. Fixed by wrapping the
+  caption onto two lines within the box. Regenerated PDF/PNG; re-verified visually at 3x.
+- **References renumbered.** `\usepackage{natbib}` -> `\usepackage[numbers,sort&compress]{natbib}`;
+  bibliography stays alphabetical (`plainnat`) but both in-text citations and the final list are now
+  numbered ([1], [2], ... [46]), which is shorter given how citation-dense the Related Work paragraph is.
+- **arXiv readiness, read through fully section by section:** no undefined references/citations, no
+  Overfull warnings, no leftover TODOs or dangling cross-references from the multi-session edits. Two
+  non-blocking notes: (i) page size is Letter, not A4 -- both are accepted by arXiv, purely a choice;
+  (ii) arXiv auto-runs bibtex from the .bib when no .bbl is supplied, which works here, but including a
+  precompiled `.bbl` alongside the submission avoids relying on arXiv's toolchain matching this local
+  build exactly. Nothing else found that would not compile or display correctly on arXiv.
+- **Title, changed again** per a follow-up request to foreground the more distinctive design choices:
+  "Kairos: A Pyramidal Codec and Diffusion over One Byte Space" / "Bidirectional Delta/Window-Attention
+  Mixture-of-Experts -- Does It Converge? Sanity Checks at Tiny Scale." Fits on one line at print width;
+  Figure 1 still fits page 1.
+- **Foundation-model aim, added once** (per the paper's own no-restatement rule), at the start of
+  Future Work: "The long-term aim behind Kairos is a small multimodal foundation model that a single
+  local machine can pretrain end to end; this report only asks whether the substrate optimizes."
+- Checked: 30 tests pass; build is 14 pages, 0 undefined reference/citation, 0 Overfull.

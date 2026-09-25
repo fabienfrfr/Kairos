@@ -37,7 +37,8 @@
 <text x="486.0" y="127.0" class="r" text-anchor="middle">scale 2</text>
 <rect x="555.0" y="110.0" width="118.0" height="26.0" rx="6" fill="#fff" stroke="#333" stroke-width="1.2"/>
 <text x="614.0" y="127.0" class="r" text-anchor="middle">scale 3</text>
-<text x="550.0" y="164.0" class="nn" text-anchor="middle">reshape per scale, not pooling; each modality uses only the scales it needs</text>
+<text x="550.0" y="157.0" class="nn" text-anchor="middle">reshape per scale, not pooling;</text>
+<text x="550.0" y="169.0" class="nn" text-anchor="middle">each modality uses only the scales it needs</text>
 <rect x="716.0" y="28.0" width="300.0" height="150.0" rx="6" fill="#eafaf0" stroke="#4c9a5c" stroke-width="1.1"/>
 <text x="866.0" y="48.0" class="t" text-anchor="middle">KairosBackbone</text>
 <text x="866.0" y="64.0" class="n" text-anchor="middle">one stack per scale</text>

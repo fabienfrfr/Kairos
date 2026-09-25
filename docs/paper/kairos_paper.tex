@@ -33,7 +33,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{xcolor}
-\usepackage{natbib}
+\usepackage[numbers,sort&compress]{natbib}
 \usepackage{float}
 \usepackage{graphicx}
 \usepackage{algorithm}
@@ -41,8 +41,8 @@
 \usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 \sloppy
 
-\title{Kairos: One Byte Space for Every Modality\\
-\large A Hybrid Delta/Window-Attention Mixture-of-Experts Denoising Network --\\
+\title{Kairos: A Pyramidal Codec and Diffusion over One Byte Space\\
+\large Bidirectional Delta/Window-Attention Mixture-of-Experts --\\
 \large Does It Converge? Sanity Checks at Tiny Scale}
 
 \author{Fabien Furfaro\thanks{Code and configurations:
@@ -766,8 +766,10 @@ memory-gate components have no supporting result yet. The target sizing is analy
 \subsection{Future work}
 \label{sec:future}
 
-The next step is a pretraining run, which would turn these sanity checks into held-out
-results. The pretraining notebook (\texttt{notebook/kairos\_pretraining.py}) trains on the text corpus
+The long-term aim behind Kairos is a small multimodal foundation model that a single local
+machine can pretrain end to end; this report only asks whether the substrate optimizes. The
+next step toward that aim is a pretraining run, which would turn these sanity checks into
+held-out results. The pretraining notebook (\texttt{notebook/kairos\_pretraining.py}) trains on the text corpus
 \texttt{keep-it-simple}~\citep{keepitsimple2026} (640{,}646 rows of bidirectional
 prompt--text pairs) and on \texttt{keep-it-simple-multimodal}~\citep{keepitsimplemm2026}
 (6{,}336 rows, a deliberately small pilot mix), through the
