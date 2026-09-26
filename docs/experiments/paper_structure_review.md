@@ -377,3 +377,40 @@ two separate name-like fragments rather than one phrase. Merged into a single se
 it reads as one line rather than a stacked pair. Technical-stack subtitle unchanged below.
 Checked: 30 tests pass, 14 pages, 0 undefined reference/citation, 0 Overfull; the title block is now
 3 lines total (was 4), leaving Figure 1 even more comfortably on page 1.
+
+## Session 16: every bibliography entry checked for a valid DOI
+
+Went through all 46 entries in `kairos_references.bib` individually and added a real, verified DOI
+(or explained why none exists):
+
+- **30 arXiv-only preprints**: given the arXiv-issued DOI (`10.48550/arXiv.<id>`). Verified this is
+  valid for arXiv's entire corpus, including pre-2022 postings (arXiv/DataCite completed registering
+  DOIs for all existing articles by Feb 2022, confirmed via arXiv's own blog announcement).
+- **9 entries upgraded to their actual published version** (were mislabeled as arXiv preprints; now
+  reflect the peer-reviewed venue, with its DOI): BERT (NAACL 2019, ACL Anthology DOI), RoFormer
+  (Neurocomputing 2024, Elsevier DOI), GQA (EMNLP 2023, ACL Anthology DOI), ResNet and DenseNet (CVPR
+  2016/2017, IEEE DOIs), Hourglass Transformers (Findings of NAACL 2022, ACL Anthology DOI),
+  Transformer-XL (ACL 2019, ACL Anthology DOI), ByT5 (already had the right venue fields, only the DOI
+  was missing). Each keeps the original arXiv id in a `note` field.
+- **2 entries checked and given the arXiv DOI with an explanatory note**: Switch Transformers (JMLR
+  2022) and Pythia (ICML/PMLR 2023) are published at venues that do not register a real Crossref DOI
+  (JMLR's own site and PMLR proceedings have none; the `10.5555/...` sometimes seen on ACM's Digital
+  Library is a placeholder, not a resolvable DOI) -- confirmed via dblp, which explicitly flags Pythia
+  as "does not have a DOI." The arXiv DOI is the only valid one available. MobileLLM is the same
+  situation (ICML/PMLR) and was handled the same way.
+- **1 already-correct entry re-verified**: `williams2009roofline`'s existing DOI
+  (10.1145/1498765.1498785, CACM) confirmed correct.
+- **3 NVIDIA datasheets and 2 Hugging Face datasets**: no DOI exists for these (product pages and
+  user-uploaded HF datasets are not the kind of object Crossref/DataCite issue academic DOIs for by
+  default); kept as direct `\url{}` links, which is what the paper already did.
+- **One real inconsistency fixed in passing**: `behrouz2025titans`'s bibkey said "2025" but its `year`
+  field said 2024; the arXiv ID (2501.00663) and its own paper page date it 2025 (submitted 31 Dec
+  2024, posted as a January-2025 arXiv id) -- `year` corrected to 2025 to match the key and the ID.
+- **Two entries specifically checked for existence** given how recent/unusual they looked:
+  `kimiteam2026attnres` (arXiv:2603.15031, March 2026) is real, confirmed via multiple independent
+  citations and the paper itself; not a hallucination.
+
+Checked: all 46 entries still parse (brace-balanced); a real `pdflatex` -> `bibtex` -> `pdflatex` x2
+cycle produced no bibtex warnings and no undefined citations; 30 project tests still pass; the
+compiled paper grew to 15 pages (bibliography only, each upgraded/DOI'd entry takes 1-2 more lines);
+page 1 (title, abstract, Figure 1) is unaffected.
