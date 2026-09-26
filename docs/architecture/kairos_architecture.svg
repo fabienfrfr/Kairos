@@ -1,8 +1,99 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1632 466" width="1632" height="466" font-family="Helvetica, Arial, sans-serif">
-<defs>
-<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 10,5 0,10Z" fill="#333"/></marker>
-<marker id="arrow-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 10,5 0,10Z" fill="#999"/></marker>
-<style>
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 1632 466"
+   width="1632"
+   height="466"
+   font-family="Helvetica, Arial, sans-serif"
+   version="1.1"
+   id="svg97"
+   sodipodi:docname="kairos_architecture.svg"
+   inkscape:version="1.4.3 (0d15f75042, 2025-12-25)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview97"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showgrid="false"
+     inkscape:zoom="0.84313725"
+     inkscape:cx="565.74419"
+     inkscape:cy="371.82558"
+     inkscape:window-width="1477"
+     inkscape:window-height="891"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg97">
+    <inkscape:grid
+       id="grid99"
+       units="px"
+       originx="0"
+       originy="0"
+       spacingx="1"
+       spacingy="1"
+       empcolor="#0099e5"
+       empopacity="0.30196078"
+       color="#0099e5"
+       opacity="0.14902"
+       empspacing="5"
+       enabled="true"
+       visible="false" />
+  </sodipodi:namedview>
+  <defs
+     id="defs2">
+    <marker
+       style="overflow:visible"
+       id="ArrowWideHeavy"
+       refX="0"
+       refY="0"
+       orient="auto-start-reverse"
+       inkscape:stockid="Wide, heavy arrow"
+       markerWidth="0.5"
+       markerHeight="0.5"
+       viewBox="0 0 1 1"
+       inkscape:isstock="true"
+       inkscape:collect="always"
+       preserveAspectRatio="xMidYMid">
+      <path
+         style="fill:context-stroke;fill-rule:evenodd;stroke:none"
+         d="m 1,0 -3,3 h -2 l 3,-3 -3,-3 h 2 z"
+         id="path3" />
+    </marker>
+    <marker
+       id="arrow"
+       viewBox="0 0 10 10"
+       refX="9"
+       refY="5"
+       markerWidth="6"
+       markerHeight="6"
+       orient="auto-start-reverse">
+      <path
+         d="M0,0 10,5 0,10Z"
+         fill="#333"
+         id="path1" />
+    </marker>
+    <marker
+       id="arrow-light"
+       viewBox="0 0 10 10"
+       refX="9"
+       refY="5"
+       markerWidth="5"
+       markerHeight="5"
+       orient="auto-start-reverse">
+      <path
+         d="M0,0 10,5 0,10Z"
+         fill="#999"
+         id="path2" />
+    </marker>
+    <style
+       id="style2">
 .t{font-size:14px;font-weight:700;fill:#222}
 .b{font-size:13px;font-weight:700;fill:#222}
 .r{font-size:12px;fill:#222}
@@ -14,141 +105,1013 @@
 .arr{stroke:#333;stroke-width:1.4;fill:none;marker-end:url(#arrow)}
 .dl{stroke:#aaa;stroke-width:1.1;fill:none;stroke-dasharray:2,2;marker-end:url(#arrow-light)}
 </style>
-</defs>
-<rect width="1632" height="500" fill="#fff"/>
-<rect x="28.0" y="71.0" width="230.0" height="64.0" rx="6" fill="#eaf1fb" stroke="#333" stroke-width="1.2"/>
-<text x="143.0" y="100.0" class="b" text-anchor="middle">Kairos Tokenizer</text>
-<text x="143.0" y="117.0" class="n" text-anchor="middle">bytes + modality id</text>
-<rect x="274.0" y="71.0" width="110.0" height="64.0" rx="6" fill="#dbe7fb" stroke="#333" stroke-width="1.2"/>
-<text x="329.0" y="93.0" class="b" text-anchor="middle">Kairos</text>
-<text x="329.0" y="107.0" class="b" text-anchor="middle">Embedding</text>
-<circle cx="374.0" cy="81.0" r="8" fill="#8a6bb0"/>
-<text x="374.0" y="84.6" class="bd" text-anchor="middle">1</text>
-<rect x="400.0" y="28.0" width="300.0" height="150.0" rx="6" fill="#f6effb" stroke="#8a6bb0" stroke-width="1.1"/>
-<text x="550.0" y="48.0" class="t" text-anchor="middle">Pyramidal Codec</text>
-<text x="550.0" y="64.0" class="n" text-anchor="middle">one encoder per scale</text>
-<circle cx="690.0" cy="38.0" r="8" fill="#8a6bb0"/>
-<text x="690.0" y="41.6" class="bd" text-anchor="middle">2</text>
-<rect x="427.0" y="76.0" width="118.0" height="26.0" rx="6" fill="#fff" stroke="#333" stroke-width="1.2"/>
-<text x="486.0" y="93.0" class="r" text-anchor="middle">scale 0</text>
-<rect x="555.0" y="76.0" width="118.0" height="26.0" rx="6" fill="#fff" stroke="#333" stroke-width="1.2"/>
-<text x="614.0" y="93.0" class="r" text-anchor="middle">scale 1</text>
-<rect x="427.0" y="110.0" width="118.0" height="26.0" rx="6" fill="#fff" stroke="#333" stroke-width="1.2"/>
-<text x="486.0" y="127.0" class="r" text-anchor="middle">scale 2</text>
-<rect x="555.0" y="110.0" width="118.0" height="26.0" rx="6" fill="#fff" stroke="#333" stroke-width="1.2"/>
-<text x="614.0" y="127.0" class="r" text-anchor="middle">scale 3</text>
-<text x="550.0" y="157.0" class="nn" text-anchor="middle">reshape per scale, not pooling;</text>
-<text x="550.0" y="169.0" class="nn" text-anchor="middle">each modality uses only the scales it needs</text>
-<rect x="716.0" y="28.0" width="300.0" height="150.0" rx="6" fill="#eafaf0" stroke="#4c9a5c" stroke-width="1.1"/>
-<text x="866.0" y="48.0" class="t" text-anchor="middle">KairosBackbone</text>
-<text x="866.0" y="64.0" class="n" text-anchor="middle">one stack per scale</text>
-<rect x="730.0" y="72.0" width="272.0" height="20.0" rx="6" fill="#fff" stroke="#333" stroke-width="1" stroke-dasharray="2,2"/>
-<text x="866.0" y="86.0" class="nn" text-anchor="middle">AttnRes: mix of embedding + prior block sums</text>
-<rect x="730.0" y="96.0" width="272.0" height="58.0" rx="6" fill="#fff" stroke="#333" stroke-width="1.2"/>
-<text x="866.0" y="111.0" class="r" text-anchor="middle">KairosBlock x n layers</text>
-<rect x="740.0" y="117.0" width="252.0" height="16.0" rx="6" fill="#dceaff" stroke="#333" stroke-width="1.2"/>
-<text x="866.0" y="129.0" class="nn" text-anchor="middle">LiZAttention2: h + Attn(norm(h))</text>
-<rect x="740.0" y="136.0" width="252.0" height="16.0" rx="6" fill="#fff3d6" stroke="#333" stroke-width="1.2"/>
-<text x="866.0" y="148.0" class="nn" text-anchor="middle">x + FFN/MoE(norm(x))</text>
-<text x="866.0" y="170.0" class="nn" text-anchor="middle">bidirectional: SWA + DeltaNet, shared QKVO</text>
-<rect x="1032.0" y="48.0" width="190.0" height="110.0" rx="6" fill="#f6effb" stroke="#8a6bb0" stroke-width="1.1"/>
-<text x="1127.0" y="66.0" class="t" text-anchor="middle">Scatter back</text>
-<circle cx="1212.0" cy="58.0" r="8" fill="#8a6bb0"/>
-<text x="1212.0" y="61.6" class="bd" text-anchor="middle">2</text>
-<rect x="1044.0" y="76.0" width="166.0" height="34.0" rx="6" fill="#fff" stroke="#333" stroke-width="1.2"/>
-<text x="1127.0" y="90.0" class="r" text-anchor="middle">Codec decode</text>
-<text x="1127.0" y="104.0" class="nn" text-anchor="middle">concat -&gt; norm -&gt; fusion</text>
-<text x="1127.0" y="148.0" class="nn" text-anchor="middle">fusion shares weights with encoder</text>
-<rect x="1238.0" y="71.0" width="120.0" height="64.0" rx="6" fill="#dbe7fb" stroke="#333" stroke-width="1.2"/>
-<text x="1298.0" y="93.0" class="b" text-anchor="middle">Output</text>
-<text x="1298.0" y="107.0" class="b" text-anchor="middle">Head</text>
-<text x="1298.0" y="123.0" class="nn" text-anchor="middle">norm + tied</text>
-<circle cx="1348.0" cy="81.0" r="8" fill="#8a6bb0"/>
-<text x="1348.0" y="84.6" class="bd" text-anchor="middle">1</text>
-<rect x="1374.0" y="71.0" width="230.0" height="64.0" rx="6" fill="#eaf1fb" stroke="#333" stroke-width="1.2"/>
-<text x="1489.0" y="100.0" class="b" text-anchor="middle">byte stream</text>
-<text x="1489.0" y="117.0" class="n" text-anchor="middle">predicted, from logits</text>
-<path class="arr" d="M258.0,103.0 H274.0"/>
-<path class="arr" d="M384.0,103.0 H400.0"/>
-<path class="arr" d="M700.0,103.0 H716.0"/>
-<path class="arr" d="M1016.0,103.0 H1032.0"/>
-<path class="arr" d="M1222.0,103.0 H1238.0"/>
-<path class="arr" d="M1358.0,103.0 H1374.0"/>
-<path class="dl" d="M143.0,135.0 V212.0"/>
-<rect x="28.0" y="212.0" width="230.0" height="92.0" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1"/>
-<text x="38.0" y="228.0" class="b" text-anchor="start">input example (masked)</text>
-<text x="38.0" y="245.0" class="m" text-anchor="start">input: The capital of</text>
-<text x="38.0" y="260.0" class="m" text-anchor="start">France is █████ .</text>
-<text x="38.0" y="278.0" class="nn" text-anchor="start">any modality: text, image, audio, video, ...</text>
-<text x="38.0" y="292.0" class="nn" text-anchor="start">one shared byte space</text>
-<path class="dl" d="M550.0,178.0 V212.0"/>
-<rect x="400.0" y="212.0" width="300.0" height="168.0" rx="6" fill="#fbfaf7" stroke="#ccc" stroke-width="1"/>
-<text x="550.0" y="230.0" class="b" text-anchor="middle">image example (stride 3)</text>
-<rect x="502.0" y="238.0" width="24.0" height="24.0" rx="0" fill="#b9a6d0" stroke="#999" stroke-width="1"/>
-<rect x="526.0" y="238.0" width="24.0" height="24.0" rx="0" fill="#dbe7fb" stroke="#999" stroke-width="1"/>
-<rect x="550.0" y="238.0" width="24.0" height="24.0" rx="0" fill="#fdeef0" stroke="#999" stroke-width="1"/>
-<rect x="574.0" y="238.0" width="24.0" height="24.0" rx="0" fill="#eee" stroke="#999" stroke-width="1"/>
-<rect x="502.0" y="262.0" width="24.0" height="24.0" rx="0" fill="#b9a6d0" stroke="#999" stroke-width="1"/>
-<rect x="526.0" y="262.0" width="24.0" height="24.0" rx="0" fill="#dbe7fb" stroke="#999" stroke-width="1"/>
-<rect x="550.0" y="262.0" width="24.0" height="24.0" rx="0" fill="#fdeef0" stroke="#999" stroke-width="1"/>
-<rect x="574.0" y="262.0" width="24.0" height="24.0" rx="0" fill="#eee" stroke="#999" stroke-width="1"/>
-<rect x="502.0" y="286.0" width="24.0" height="24.0" rx="0" fill="#b9a6d0" stroke="#999" stroke-width="1"/>
-<rect x="526.0" y="286.0" width="24.0" height="24.0" rx="0" fill="#dbe7fb" stroke="#999" stroke-width="1"/>
-<rect x="550.0" y="286.0" width="24.0" height="24.0" rx="0" fill="#fdeef0" stroke="#999" stroke-width="1"/>
-<rect x="574.0" y="286.0" width="24.0" height="24.0" rx="0" fill="#eee" stroke="#999" stroke-width="1"/>
-<text x="550.0" y="328.0" class="n" text-anchor="middle">2D image, flattened by tokenizer</text>
-<rect x="418.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#b9a6d0" stroke="#999" stroke-width="1"/>
-<rect x="440.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#dbe7fb" stroke="#999" stroke-width="1"/>
-<rect x="462.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#fdeef0" stroke="#999" stroke-width="1"/>
-<rect x="484.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#eee" stroke="#999" stroke-width="1"/>
-<rect x="506.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#b9a6d0" stroke="#999" stroke-width="1"/>
-<rect x="528.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#dbe7fb" stroke="#999" stroke-width="1"/>
-<rect x="550.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#fdeef0" stroke="#999" stroke-width="1"/>
-<rect x="572.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#eee" stroke="#999" stroke-width="1"/>
-<rect x="594.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#b9a6d0" stroke="#999" stroke-width="1"/>
-<rect x="616.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#dbe7fb" stroke="#999" stroke-width="1"/>
-<rect x="638.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#fdeef0" stroke="#999" stroke-width="1"/>
-<rect x="660.0" y="336.0" width="22.0" height="16.0" rx="0" fill="#eee" stroke="#999" stroke-width="1"/>
-<path d="M506.0,330.0 V358.0" stroke="#888" stroke-width="1.2" stroke-dasharray="2,1.4" fill="none"/>
-<path d="M594.0,330.0 V358.0" stroke="#888" stroke-width="1.2" stroke-dasharray="2,1.4" fill="none"/>
-<path d="M484.0,352.0 V361.0" stroke="#3a6fd8" stroke-width="1.6" fill="none"/>
-<path d="M550.0,352.0 V361.0" stroke="#3a6fd8" stroke-width="1.6" fill="none"/>
-<path d="M616.0,352.0 V361.0" stroke="#3a6fd8" stroke-width="1.6" fill="none"/>
-<path d="M616.0,361.0 V370.0" stroke="#d88a2a" stroke-width="1.6" fill="none"/>
-<text x="550.0" y="374.0" class="nn" text-anchor="middle">row wrap | scale 0 (3) | scale 1 (9)</text>
-<path class="dl" d="M866.0,178.0 V212.0"/>
-<rect x="716.0" y="212.0" width="300.0" height="110.0" rx="6" fill="#ffffff" stroke="#999" stroke-width="0"/>
-<rect x="716.0" y="212.0" width="143.0" height="110.0" rx="6" fill="#fafafa" stroke="#999" stroke-width="1"/>
-<text x="787.5" y="228.0" class="b" text-anchor="middle">Streaming cache</text>
-<text x="787.5" y="245.0" class="nn" text-anchor="middle">conv + DeltaNet state,</text>
-<text x="787.5" y="259.0" class="nn" text-anchor="middle">carried step to step;</text>
-<text x="787.5" y="273.0" class="nn" text-anchor="middle">windowed attention</text>
-<text x="787.5" y="287.0" class="nn" text-anchor="middle">resets every batch</text>
-<rect x="873.0" y="212.0" width="143.0" height="110.0" rx="6" fill="#fdeef0" stroke="#b5566b" stroke-width="1" stroke-dasharray="3,3"/>
-<text x="944.5" y="228.0" class="b" text-anchor="middle">Memory gate</text>
-<text x="944.5" y="245.0" class="nn" text-anchor="middle">blends recurrent state</text>
-<text x="944.5" y="259.0" class="nn" text-anchor="middle">across sessions,</text>
-<text x="944.5" y="273.0" class="nn" text-anchor="middle">between forward calls</text>
-<text x="944.5" y="287.0" class="nn" text-anchor="middle">(opt-in)</text>
-<path class="dl" d="M859.0,260.0 H873.0"/>
-<path class="dl" d="M1489.0,135.0 V212.0"/>
-<rect x="1374.0" y="212.0" width="230.0" height="92.0" rx="6" fill="#fff6ea" stroke="#c99a3d" stroke-width="1"/>
-<text x="1384.0" y="228.0" class="b" text-anchor="start">output example (denoised)</text>
-<text x="1384.0" y="245.0" class="c" text-anchor="start">output: The capital of</text>
-<text x="1384.0" y="260.0" class="c" text-anchor="start">France is Paris .</text>
-<text x="1384.0" y="278.0" class="nn" text-anchor="start">loss computed on masked</text>
-<text x="1384.0" y="292.0" class="nn" text-anchor="start">positions only</text>
-<text x="28.0" y="402.0" class="t" text-anchor="start">Pretraining curriculum, same masking mechanism throughout</text>
-<text x="1604.0" y="402.0" class="nn" text-anchor="end">numbered badges: modules that share weights</text>
-<rect x="28.0" y="410.0" width="514.7" height="44.0" rx="6" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
-<text x="285.3" y="428.0" class="b" text-anchor="middle">stage 1 - MAE:</text>
-<text x="285.3" y="444.0" class="r" text-anchor="middle">fixed mask rate, plain cross-entropy</text>
-<path class="arr" d="M542.7,432.0 H558.7"/>
-<rect x="558.7" y="410.0" width="514.7" height="44.0" rx="6" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
-<text x="816.0" y="428.0" class="b" text-anchor="middle">stage 2 - transition:</text>
-<text x="816.0" y="444.0" class="r" text-anchor="middle">mask rate ramps linearly</text>
-<path class="arr" d="M1073.3,432.0 H1089.3"/>
-<rect x="1089.3" y="410.0" width="514.7" height="44.0" rx="6" fill="#fdf1e3" stroke="#c99a3d" stroke-width="1"/>
-<text x="1346.7" y="428.0" class="b" text-anchor="middle">stage 3 - diffusion:</text>
-<text x="1346.7" y="444.0" class="r" text-anchor="middle">t ~ U(0,1), reweighted loss</text>
+  </defs>
+  <rect
+     width="1632"
+     height="500"
+     fill="#ffffff"
+     id="rect2"
+     x="0"
+     y="4" />
+  <rect
+     x="28.0"
+     y="71.0"
+     width="230.0"
+     height="64.0"
+     rx="6"
+     fill="#eaf1fb"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect3" />
+  <text
+     x="143.0"
+     y="100.0"
+     class="b"
+     text-anchor="middle"
+     id="text3">Kairos Tokenizer</text>
+  <text
+     x="143.0"
+     y="117.0"
+     class="n"
+     text-anchor="middle"
+     id="text4">bytes + modality id</text>
+  <rect
+     x="274.0"
+     y="71.0"
+     width="110.0"
+     height="64.0"
+     rx="6"
+     fill="#dbe7fb"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect4" />
+  <text
+     x="329.0"
+     y="93.0"
+     class="b"
+     text-anchor="middle"
+     id="text5">Kairos</text>
+  <text
+     x="329.0"
+     y="107.0"
+     class="b"
+     text-anchor="middle"
+     id="text6">Embedding</text>
+  <circle
+     cx="374.0"
+     cy="81.0"
+     r="8"
+     fill="#8a6bb0"
+     id="circle6" />
+  <text
+     x="374.0"
+     y="84.6"
+     class="bd"
+     text-anchor="middle"
+     id="text7">1</text>
+  <rect
+     x="400.0"
+     y="28.0"
+     width="300.0"
+     height="150.0"
+     rx="6"
+     fill="#f6effb"
+     stroke="#8a6bb0"
+     stroke-width="1.1"
+     id="rect7" />
+  <text
+     x="550.0"
+     y="48.0"
+     class="t"
+     text-anchor="middle"
+     id="text8">Pyramidal Codec</text>
+  <text
+     x="550.0"
+     y="64.0"
+     class="n"
+     text-anchor="middle"
+     id="text9">one encoder per scale</text>
+  <circle
+     cx="690.0"
+     cy="38.0"
+     r="8"
+     fill="#8a6bb0"
+     id="circle9" />
+  <text
+     x="690.0"
+     y="41.6"
+     class="bd"
+     text-anchor="middle"
+     id="text10">2</text>
+  <rect
+     x="427.0"
+     y="76.0"
+     width="118.0"
+     height="26.0"
+     rx="6"
+     fill="#fff"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect10" />
+  <text
+     x="486.0"
+     y="93.0"
+     class="r"
+     text-anchor="middle"
+     id="text11">scale 0</text>
+  <rect
+     x="555.0"
+     y="76.0"
+     width="118.0"
+     height="26.0"
+     rx="6"
+     fill="#fff"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect11" />
+  <text
+     x="614.0"
+     y="93.0"
+     class="r"
+     text-anchor="middle"
+     id="text12">scale 1</text>
+  <rect
+     x="427.0"
+     y="110.0"
+     width="118.0"
+     height="26.0"
+     rx="6"
+     fill="#fff"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect12" />
+  <text
+     x="486.0"
+     y="127.0"
+     class="r"
+     text-anchor="middle"
+     id="text13">scale 2</text>
+  <rect
+     x="555.0"
+     y="110.0"
+     width="118.0"
+     height="26.0"
+     rx="6"
+     fill="#fff"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect13" />
+  <text
+     x="614.0"
+     y="127.0"
+     class="r"
+     text-anchor="middle"
+     id="text14">scale 3</text>
+  <text
+     x="550.0"
+     y="157.0"
+     class="nn"
+     text-anchor="middle"
+     id="text15">reshape per scale, not pooling;</text>
+  <text
+     x="550.0"
+     y="169.0"
+     class="nn"
+     text-anchor="middle"
+     id="text16">each modality uses only the scales it needs</text>
+  <rect
+     x="716.0"
+     y="28.0"
+     width="300.0"
+     height="150.0"
+     rx="6"
+     fill="#eafaf0"
+     stroke="#4c9a5c"
+     stroke-width="1.1"
+     id="rect16" />
+  <text
+     x="866.0"
+     y="48.0"
+     class="t"
+     text-anchor="middle"
+     id="text17">KairosBackbone</text>
+  <text
+     x="866.0"
+     y="64.0"
+     class="n"
+     text-anchor="middle"
+     id="text18">one stack per scale</text>
+  <rect
+     x="730.0"
+     y="72.0"
+     width="272.0"
+     height="20.0"
+     rx="6"
+     fill="#fff"
+     stroke="#333"
+     stroke-width="1"
+     stroke-dasharray="2,2"
+     id="rect18" />
+  <text
+     x="866.0"
+     y="86.0"
+     class="nn"
+     text-anchor="middle"
+     id="text19">AttnRes: mix of embedding + prior block sums</text>
+  <rect
+     x="730.0"
+     y="96.0"
+     width="272.0"
+     height="58.0"
+     rx="6"
+     fill="#fff"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect19" />
+  <text
+     x="866.0"
+     y="111.0"
+     class="r"
+     text-anchor="middle"
+     id="text20">KairosBlock x n layers</text>
+  <rect
+     x="740.0"
+     y="117.0"
+     width="252.0"
+     height="16.0"
+     rx="6"
+     fill="#dceaff"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect20" />
+  <text
+     x="866.0"
+     y="129.0"
+     class="nn"
+     text-anchor="middle"
+     id="text21">LiZAttention2: h + Attn(norm(h))</text>
+  <rect
+     x="740.0"
+     y="136.0"
+     width="252.0"
+     height="16.0"
+     rx="6"
+     fill="#fff3d6"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect21" />
+  <text
+     x="866.0"
+     y="148.0"
+     class="nn"
+     text-anchor="middle"
+     id="text22">x + FFN/MoE(norm(x))</text>
+  <text
+     x="866.0"
+     y="170.0"
+     class="nn"
+     text-anchor="middle"
+     id="text23">bidirectional: SWA + DeltaNet, shared QKVO</text>
+  <rect
+     x="1032.0"
+     y="48.0"
+     width="190.0"
+     height="110.0"
+     rx="6"
+     fill="#f6effb"
+     stroke="#8a6bb0"
+     stroke-width="1.1"
+     id="rect23" />
+  <text
+     x="1127.0"
+     y="66.0"
+     class="t"
+     text-anchor="middle"
+     id="text24">Scatter back</text>
+  <circle
+     cx="1212.0"
+     cy="58.0"
+     r="8"
+     fill="#8a6bb0"
+     id="circle24" />
+  <text
+     x="1212.0"
+     y="61.6"
+     class="bd"
+     text-anchor="middle"
+     id="text25">2</text>
+  <rect
+     x="1044.0"
+     y="76.0"
+     width="166.0"
+     height="34.0"
+     rx="6"
+     fill="#fff"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect25" />
+  <text
+     x="1127.0"
+     y="90.0"
+     class="r"
+     text-anchor="middle"
+     id="text26">Codec decode</text>
+  <text
+     x="1127.0"
+     y="104.0"
+     class="nn"
+     text-anchor="middle"
+     id="text27">concat -&gt; norm -&gt; fusion</text>
+  <text
+     x="1127.0"
+     y="148.0"
+     class="nn"
+     text-anchor="middle"
+     id="text28">fusion shares weights with encoder</text>
+  <rect
+     x="1238.0"
+     y="71.0"
+     width="120.0"
+     height="64.0"
+     rx="6"
+     fill="#dbe7fb"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect28" />
+  <text
+     x="1298.0"
+     y="93.0"
+     class="b"
+     text-anchor="middle"
+     id="text29">Output</text>
+  <text
+     x="1298.0"
+     y="107.0"
+     class="b"
+     text-anchor="middle"
+     id="text30">Head</text>
+  <text
+     x="1298.0"
+     y="123.0"
+     class="nn"
+     text-anchor="middle"
+     id="text31">norm + tied</text>
+  <circle
+     cx="1348.0"
+     cy="81.0"
+     r="8"
+     fill="#8a6bb0"
+     id="circle31" />
+  <text
+     x="1348.0"
+     y="84.6"
+     class="bd"
+     text-anchor="middle"
+     id="text32">1</text>
+  <rect
+     x="1374.0"
+     y="71.0"
+     width="230.0"
+     height="64.0"
+     rx="6"
+     fill="#eaf1fb"
+     stroke="#333"
+     stroke-width="1.2"
+     id="rect32" />
+  <text
+     x="1489.0"
+     y="100.0"
+     class="b"
+     text-anchor="middle"
+     id="text33">byte stream</text>
+  <text
+     x="1489.0"
+     y="117.0"
+     class="n"
+     text-anchor="middle"
+     id="text34">predicted, from logits</text>
+  <path
+     class="arr"
+     d="M258.0,103.0 H274.0"
+     id="path34" />
+  <path
+     class="arr"
+     d="M384.0,103.0 H400.0"
+     id="path35" />
+  <path
+     class="arr"
+     d="M700.0,103.0 H716.0"
+     id="path36" />
+  <path
+     class="arr"
+     d="M1016.0,103.0 H1032.0"
+     id="path37" />
+  <path
+     class="arr"
+     d="M1222.0,103.0 H1238.0"
+     id="path38" />
+  <path
+     class="arr"
+     d="M1358.0,103.0 H1374.0"
+     id="path39" />
+  <path
+     class="dl"
+     d="M143.0,135.0 V212.0"
+     id="path40" />
+  <rect
+     x="28.0"
+     y="212.0"
+     width="230.0"
+     height="92.0"
+     rx="6"
+     fill="#fff6ea"
+     stroke="#c99a3d"
+     stroke-width="1"
+     id="rect40" />
+  <text
+     x="38.0"
+     y="228.0"
+     class="b"
+     text-anchor="start"
+     id="text40">input example (masked)</text>
+  <text
+     x="38.0"
+     y="245.0"
+     class="m"
+     text-anchor="start"
+     id="text41">input: The capital of</text>
+  <text
+     x="38.0"
+     y="260.0"
+     class="m"
+     text-anchor="start"
+     id="text42">France is █████ .</text>
+  <text
+     x="38.0"
+     y="278.0"
+     class="nn"
+     text-anchor="start"
+     id="text43">any modality: text, image, audio, video, ...</text>
+  <text
+     x="38.0"
+     y="292.0"
+     class="nn"
+     text-anchor="start"
+     id="text44">one shared byte space</text>
+  <path
+     class="dl"
+     d="M550.0,178.0 V212.0"
+     id="path44" />
+  <rect
+     x="400"
+     y="212"
+     width="300"
+     height="173.03197"
+     rx="6"
+     fill="#fbfaf7"
+     stroke="#cccccc"
+     stroke-width="1"
+     id="rect44" />
+  <text
+     x="550.0"
+     y="230.0"
+     class="b"
+     text-anchor="middle"
+     id="text45">image example (stride 3)</text>
+  <rect
+     x="502.0"
+     y="238.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#b9a6d0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect45" />
+  <rect
+     x="526.0"
+     y="238.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#dbe7fb"
+     stroke="#999"
+     stroke-width="1"
+     id="rect46" />
+  <rect
+     x="550.0"
+     y="238.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#fdeef0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect47" />
+  <rect
+     x="574.0"
+     y="238.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#eee"
+     stroke="#999"
+     stroke-width="1"
+     id="rect48" />
+  <rect
+     x="502.0"
+     y="262.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#b9a6d0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect49" />
+  <rect
+     x="526.0"
+     y="262.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#dbe7fb"
+     stroke="#999"
+     stroke-width="1"
+     id="rect50" />
+  <rect
+     x="550.0"
+     y="262.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#fdeef0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect51" />
+  <rect
+     x="574.0"
+     y="262.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#eee"
+     stroke="#999"
+     stroke-width="1"
+     id="rect52" />
+  <rect
+     x="502.0"
+     y="286.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#b9a6d0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect53" />
+  <rect
+     x="526.0"
+     y="286.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#dbe7fb"
+     stroke="#999"
+     stroke-width="1"
+     id="rect54" />
+  <rect
+     x="550.0"
+     y="286.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#fdeef0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect55" />
+  <rect
+     x="574.0"
+     y="286.0"
+     width="24.0"
+     height="24.0"
+     rx="0"
+     fill="#eee"
+     stroke="#999"
+     stroke-width="1"
+     id="rect56" />
+  <text
+     x="550.0"
+     y="328.0"
+     class="n"
+     text-anchor="middle"
+     id="text56">2D image, flattened by tokenizer</text>
+  <rect
+     x="418.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#b9a6d0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect57" />
+  <rect
+     x="440.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#dbe7fb"
+     stroke="#999"
+     stroke-width="1"
+     id="rect58" />
+  <rect
+     x="462.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#fdeef0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect59" />
+  <rect
+     x="484.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#eee"
+     stroke="#999"
+     stroke-width="1"
+     id="rect60" />
+  <rect
+     x="506.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#b9a6d0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect61" />
+  <rect
+     x="528.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#dbe7fb"
+     stroke="#999"
+     stroke-width="1"
+     id="rect62" />
+  <rect
+     x="550.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#fdeef0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect63" />
+  <rect
+     x="572.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#eee"
+     stroke="#999"
+     stroke-width="1"
+     id="rect64" />
+  <rect
+     x="594.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#b9a6d0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect65" />
+  <rect
+     x="616.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#dbe7fb"
+     stroke="#999"
+     stroke-width="1"
+     id="rect66" />
+  <rect
+     x="638.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#fdeef0"
+     stroke="#999"
+     stroke-width="1"
+     id="rect67" />
+  <rect
+     x="660.0"
+     y="336.0"
+     width="22.0"
+     height="16.0"
+     rx="0"
+     fill="#eee"
+     stroke="#999"
+     stroke-width="1"
+     id="rect68" />
+  <path
+     d="M506.0,330.0 V358.0"
+     stroke="#888"
+     stroke-width="1.2"
+     stroke-dasharray="2,1.4"
+     fill="none"
+     id="path68" />
+  <path
+     d="M594.0,330.0 V358.0"
+     stroke="#888"
+     stroke-width="1.2"
+     stroke-dasharray="2,1.4"
+     fill="none"
+     id="path69" />
+  <path
+     d="M 484,337.11376 V 361"
+     stroke="#3a6fd8"
+     stroke-width="1.6"
+     fill="none"
+     id="path70"
+     sodipodi:nodetypes="cc" />
+  <path
+     d="M 550,337.11376 V 361"
+     stroke="#3a6fd8"
+     stroke-width="1.6"
+     fill="none"
+     id="path71"
+     sodipodi:nodetypes="cc" />
+  <path
+     d="m 616,336.25948 v 31.01487"
+     stroke="#d88a2a"
+     stroke-width="3.09795"
+     fill="none"
+     id="path73"
+     sodipodi:nodetypes="cc"
+     style="stroke-width:5;stroke-dasharray:none" />
+  <path
+     d="M 616,337.11376 V 361"
+     stroke="#3a6fd8"
+     stroke-width="1.6"
+     fill="none"
+     id="path72"
+     sodipodi:nodetypes="cc" />
+  <text
+     x="550"
+     y="378"
+     class="nn"
+     text-anchor="middle"
+     id="text73">row wrap | <tspan
+   style="fill:#0055d4"
+   id="tspan98">scale 0 (3)</tspan> | <tspan
+   style="fill:#c87137"
+   id="tspan97">scale 1 (9)</tspan></text>
+  <path
+     class="dl"
+     d="M866.0,178.0 V212.0"
+     id="path74" />
+  <rect
+     x="716.0"
+     y="212.0"
+     width="300.0"
+     height="110.0"
+     rx="6"
+     fill="#ffffff"
+     stroke="#999"
+     stroke-width="0"
+     id="rect74" />
+  <rect
+     x="716.0"
+     y="212.0"
+     width="143.0"
+     height="110.0"
+     rx="6"
+     fill="#fafafa"
+     stroke="#999"
+     stroke-width="1"
+     id="rect75" />
+  <text
+     x="787.5"
+     y="228.0"
+     class="b"
+     text-anchor="middle"
+     id="text75">Streaming cache</text>
+  <text
+     x="787.5"
+     y="245.0"
+     class="nn"
+     text-anchor="middle"
+     id="text76">conv + DeltaNet state,</text>
+  <text
+     x="787.5"
+     y="259.0"
+     class="nn"
+     text-anchor="middle"
+     id="text77">carried step to step;</text>
+  <text
+     x="787.5"
+     y="273.0"
+     class="nn"
+     text-anchor="middle"
+     id="text78">windowed attention</text>
+  <text
+     x="787.5"
+     y="287.0"
+     class="nn"
+     text-anchor="middle"
+     id="text79">resets every batch</text>
+  <rect
+     x="873.0"
+     y="212.0"
+     width="143.0"
+     height="110.0"
+     rx="6"
+     fill="#fdeef0"
+     stroke="#b5566b"
+     stroke-width="1"
+     stroke-dasharray="3,3"
+     id="rect79" />
+  <text
+     x="944.5"
+     y="228.0"
+     class="b"
+     text-anchor="middle"
+     id="text80">Memory gate</text>
+  <text
+     x="944.5"
+     y="245.0"
+     class="nn"
+     text-anchor="middle"
+     id="text81">blends recurrent state</text>
+  <text
+     x="944.5"
+     y="259.0"
+     class="nn"
+     text-anchor="middle"
+     id="text82">across sessions,</text>
+  <text
+     x="944.5"
+     y="273.0"
+     class="nn"
+     text-anchor="middle"
+     id="text83">between forward calls</text>
+  <text
+     x="944.5"
+     y="287.0"
+     class="nn"
+     text-anchor="middle"
+     id="text84">(opt-in)</text>
+  <path
+     class="dl"
+     d="M859.0,260.0 H873.0"
+     id="path84" />
+  <path
+     class="dl"
+     d="M1489.0,135.0 V212.0"
+     id="path85" />
+  <rect
+     x="1374.0"
+     y="212.0"
+     width="230.0"
+     height="92.0"
+     rx="6"
+     fill="#fff6ea"
+     stroke="#c99a3d"
+     stroke-width="1"
+     id="rect85" />
+  <text
+     x="1384.0"
+     y="228.0"
+     class="b"
+     text-anchor="start"
+     id="text85">output example (denoised)</text>
+  <text
+     x="1384.0"
+     y="245.0"
+     class="c"
+     text-anchor="start"
+     id="text86">output: The capital of</text>
+  <text
+     x="1384.0"
+     y="260.0"
+     class="c"
+     text-anchor="start"
+     id="text87">France is Paris .</text>
+  <text
+     x="1384.0"
+     y="278.0"
+     class="nn"
+     text-anchor="start"
+     id="text88">loss computed on masked</text>
+  <text
+     x="1384.0"
+     y="292.0"
+     class="nn"
+     text-anchor="start"
+     id="text89">positions only</text>
+  <text
+     x="28.0"
+     y="402.0"
+     class="t"
+     text-anchor="start"
+     id="text90">Pretraining curriculum, same masking mechanism throughout</text>
+  <text
+     x="1604.0"
+     y="402.0"
+     class="nn"
+     text-anchor="end"
+     id="text91">numbered badges: modules that share weights</text>
+  <rect
+     x="28.0"
+     y="410.0"
+     width="514.7"
+     height="44.0"
+     rx="6"
+     fill="#fdf1e3"
+     stroke="#c99a3d"
+     stroke-width="1"
+     id="rect91" />
+  <text
+     x="285.3"
+     y="428.0"
+     class="b"
+     text-anchor="middle"
+     id="text92">stage 1 - MAE:</text>
+  <text
+     x="285.3"
+     y="444.0"
+     class="r"
+     text-anchor="middle"
+     id="text93">fixed mask rate, plain cross-entropy</text>
+  <path
+     class="arr"
+     d="M542.7,432.0 H558.7"
+     id="path93" />
+  <rect
+     x="558.7"
+     y="410.0"
+     width="514.7"
+     height="44.0"
+     rx="6"
+     fill="#fdf1e3"
+     stroke="#c99a3d"
+     stroke-width="1"
+     id="rect93" />
+  <text
+     x="816.0"
+     y="428.0"
+     class="b"
+     text-anchor="middle"
+     id="text94">stage 2 - transition:</text>
+  <text
+     x="816.0"
+     y="444.0"
+     class="r"
+     text-anchor="middle"
+     id="text95">mask rate ramps linearly</text>
+  <path
+     class="arr"
+     d="M1073.3,432.0 H1089.3"
+     id="path95" />
+  <rect
+     x="1089.3"
+     y="410.0"
+     width="514.7"
+     height="44.0"
+     rx="6"
+     fill="#fdf1e3"
+     stroke="#c99a3d"
+     stroke-width="1"
+     id="rect95" />
+  <text
+     x="1346.7"
+     y="428.0"
+     class="b"
+     text-anchor="middle"
+     id="text96">stage 3 - diffusion:</text>
+  <text
+     x="1346.7"
+     y="444.0"
+     class="r"
+     text-anchor="middle"
+     id="text97">t ~ U(0,1), reweighted loss</text>
+  <path
+     style="fill:#3a6fd8;fill-opacity:1;stroke:#3a6fd8;stroke-width:2;stroke-dasharray:none;stroke-opacity:1;marker-start:url(#ArrowWideHeavy);marker-end:url(#ArrowWideHeavy);stroke-dashoffset:0"
+     d="m 420,357 h 60"
+     id="path99" />
+  <path
+     style="fill:#0055d4;fill-opacity:1;stroke:#d88a2a;stroke-width:2;stroke-dasharray:none;marker-start:url(#ArrowWideHeavy);marker-end:url(#ArrowWideHeavy);stroke-dashoffset:0"
+     d="M 420,365 H 610"
+     id="path100" />
 </svg>
