@@ -41,9 +41,9 @@
 \usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 \sloppy
 
-\title{Kairos: A Pyramidal Codec and Diffusion over One Byte Space\\
-\large Bidirectional Delta/Window-Attention Mixture-of-Experts --\\
-\large Does It Converge? Sanity Checks at Tiny Scale}
+\title{Kairos: Toward a Byte-Level Foundation Model for Every Modality\\
+\large A Pyramidal Codec and Denoising Diffusion over Bidirectional Delta/Window-Attention\\
+\large Mixture-of-Experts -- Does It Converge? Sanity Checks at Tiny Scale}
 
 \author{Fabien Furfaro\thanks{Code and configurations:
 \url{https://github.com/fabienfrfr/Kairos}}}
@@ -84,7 +84,7 @@ target analytically; none of its throughput figures is measured.
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=\linewidth]{../architecture/kairos_architecture.pdf}
+    \includegraphics[width=\linewidth]{kairos_architecture.pdf}
     \caption{Kairos data and training flow, left to right. The tokenizer (\S\ref{sec:tokenizer})
     flattens every modality to one byte stream; the image example shows a 2D image flattened row by
     row (its \texttt{<ENDLINE>} markers are omitted). Each KairosBlock is a standard
@@ -477,7 +477,7 @@ The codebase is used at three scales that this report does not conflate
 (Table~\ref{tab:configs}). The \textbf{ablation networks} of
 \S\ref{sec:ablations} use the library defaults of
 \texttt{configs/ablations/baseline.yaml} (1 layer, dense feed-forward). The
-\textbf{Notebook configuration} is the default of the project's notebook
+\textbf{notebook configuration} is the default of the project's notebook
 (\texttt{notebook/kairos\_pretraining.py}): a $\sim$14--15M-parameter network
 with a 7-expert top-1 MoE, used for pipeline sanity checks. The
 \textbf{target} is a 200M-total/25M-active design point used in
@@ -589,7 +589,7 @@ about half of \texttt{patch}'s parameters (2.50M against 4.93M). The
 \label{tab:seeds}
 \end{table}
 
-The seed spread ($\pm0.03$ to $\pm0.19$) sets the noise floor for the
+The seed spread ($\pm0.002$ to $\pm0.193$) sets the noise floor for the
 single-run sweeps of Table~\ref{tab:sweeps}, so differences of a few
 hundredths there are not readable. Monotone trends are consistent with the
 expected direction but confounded with the setup: at 128 tokens a sequence
@@ -647,8 +647,7 @@ QKV frozen after step 100 & 0.705 & 0.521 & \textbf{gap reverses} \\
 \bottomrule
 \end{tabular}
 \caption{Min.\ loss for shared and separate projections
-(\nolinkurl{docs/experiments/ablations_codec_attention.md}, \S7; per-step
-curves in \nolinkurl{docs/experiments/liz2_shared_vs_separate_followup_raw.jsonl}).
+(\nolinkurl{docs/experiments/ablations_codec_attention.md}, \S7).
 The advantage was faster early convergence, not higher capacity: with enough
 steps or diverse data both variants reach the same floor.}
 \label{tab:qkv-sharing}
@@ -719,8 +718,8 @@ learns transferable structure. Taken together, the observations suggest that:
 \end{itemize}
 
 \paragraph{Practical implications.} The ablation runs used a CPU. A memorization test of this
-kind can be repeated whenever a component changes, but the seed spread ($\pm0.03$ to
-$\pm0.19$ in Table~\ref{tab:seeds}) limits which differences it can detect.
+kind can be repeated whenever a component changes, but the seed spread ($\pm0.002$ to
+$\pm0.193$ in Table~\ref{tab:seeds}) limits which differences it can detect.
 
 \paragraph{Compute sizing of the target.}
 \label{sec:sizing}

@@ -276,3 +276,104 @@ with all internals still fits on page 1 (\maketitle tightened in session 7, [H] 
   Future Work: "The long-term aim behind Kairos is a small multimodal foundation model that a single
   local machine can pretrain end to end; this report only asks whether the substrate optimizes."
 - Checked: 30 tests pass; build is 14 pages, 0 undefined reference/citation, 0 Overfull.
+
+## Session 11: "denoising" restored in title; full critical re-read for v1
+
+Confirmed the user's observation: the previous title change had dropped "denoising" in favor of
+"diffusion." Both are real and distinct in this paper (denoising is the umbrella training objective;
+diffusion is only its final curriculum stage), so both now appear:
+"Kairos: A Pyramidal Codec and Denoising Diffusion over One Byte Space" (manual line break added so
+the title doesn't leave an orphan word on its own line). Still fits page 1 with Figure 1 intact.
+
+Full section-by-section critical read of the paper text, cross-checking every number against its own
+table and against the underlying `docs/experiments/*` logs. Four real issues found and fixed:
+
+1. **Capitalization parallelism.** The three model scales are introduced as bolded terms in one
+   sentence ("ablation networks", "notebook configuration", "target"); only the middle one was
+   capitalized ("Notebook configuration"). Lowercased for consistency.
+2. **A factual inaccuracy, now fixed.** Both mentions of "the seed spread" gave the range
+   "$\pm0.03$ to $\pm0.19$", but Table 2's own sd column runs from $0.002$ (patch codec) to $0.193$
+   (baseline) -- the stated range silently dropped the two tightest configurations (0.002, 0.007).
+   Corrected to "$\pm0.002$ to $\pm0.193$" in both places (after Table 2, and in Discussion's
+   Practical implications).
+3. **A reproducibility gap.** Table 3's caption cited a per-step-curve file,
+   `docs/experiments/liz2_shared_vs_separate_followup_raw.jsonl`, that is not in the repository
+   snapshot (checked: absent). Removed the dangling reference from the caption; the remaining
+   citation (`ablations_codec_attention.md`, \S7) does exist and matches. **Not fixed, flagged for the
+   author:** the Results paragraph right after Table 3 still reports a number derived from that same
+   missing file ("+9 to +14% steps for separate projections", from "the saved curves"). This is a
+   live quantitative claim with no traceable artifact in what was provided -- either the raw JSONL
+   needs to be added back to the repo before submission, or the claim should be softened/removed.
+4. Checked and found consistent (no fix needed): the active-parameter formula
+   ($N_\text{act}=N_\text{total}/8+\tfrac78 N_\text{dense}$) against Eq.~\ref{eq:active}; the
+   200M/25M target's 8x ratio against the roofline paragraph's $N_\text{total}/N_\text{act}=8$; every
+   per-seed number in Results/Discussion against Table 2 and Table 3; both cited log section numbers
+   (\S7, item 13) against the actual files; US spelling throughout (no -ise/-ize mixing).
+
+Not touched (judgment calls, not defects): the repeated "does it optimize at all" framing across
+Abstract/Introduction/Conclusion -- standard IMRaD practice for a paper's throughline, distinct from
+restating a *finding* three times, which the paper avoids elsewhere. "Kairos'" (bare apostrophe
+possessive) used consistently in four places; defensible style, left as is.
+
+## Session 12: title restructured -- value proposition up front, stack in the subtitle
+
+Feedback: the previous main title ("A Pyramidal Codec and Denoising Diffusion over One Byte Space")
+led with jargon and didn't communicate the point to a reader who doesn't already know the components.
+Restructured so the hook states the actual value proposition and the subtitle carries the technical
+stack:
+- Title: "Kairos: One Byte Space for Every Modality" -- the thing a reader should remember: one shared
+  representation across modalities.
+- Subtitle: "A Pyramidal Codec and Denoising Diffusion over Bidirectional Delta/Window-Attention
+  Mixture-of-Experts -- Does It Converge? Sanity Checks at Tiny Scale" -- every component (codec,
+  denoising diffusion, bidirectional hybrid attention, MoE) plus the humble question framing.
+Checked: 30 tests pass, 14 pages, 0 undefined reference/citation, 0 Overfull; Figure 1 still fits
+page 1 under the four-line title block.
+
+## Session 13: paper folder made self-contained for submission
+
+The user's instinct was right: a paper's `\includegraphics` should not reach outside its own
+directory. `docs/paper/kairos_paper.tex` referenced `../architecture/kairos_architecture.pdf` --
+harmless when compiling from this repo (the relative path resolves), but not how a submission bundle
+should be organized, and fragile if anyone ever zips just the `paper` folder. Fixed:
+
+- Copied `kairos_architecture.pdf` into `docs/paper/` itself; the figure is now
+  `\includegraphics{kairos_architecture.pdf}`, no `../`. `docs/architecture/` remains the design
+  source (svg, puml, and its own pdf copy for the diagram tooling) -- that separation is fine, the
+  paper just no longer depends on reaching into it.
+- **Verified with a real self-contained build**: copied only `kairos_paper.tex`,
+  `kairos_references.bib` and `kairos_architecture.pdf` into an empty directory and ran
+  `pdflatex` -> `bibtex` -> `pdflatex` x2 from there, exactly the arXiv toolchain. Clean: 0 undefined
+  citations/references, 0 Overfull, 14 pages, and a `.bbl` generated with no bibtex warnings.
+- **Found one more orphan**: `docs/paper/tables/compute.tex` is not `\input` anywhere in the current
+  paper (the old Appendix that used to include it was replaced by inline Discussion prose in session 9)
+  but is still read directly by `tests/test_paper.py::test_compute_table_is_generated_by_the_script`,
+  which checks it stays in sync with `scripts/roofline.py`'s output. Harmless for the PDF (arXiv won't
+  see or need it) but stale relative to the current paper structure -- flagged for the author to decide
+  whether to keep it as a repo-hygiene fixture or retire it and the test with it.
+- Produced `kairos_arxiv_submission.zip`: exactly the four files arXiv needs
+  (`kairos_paper.tex`, `kairos_references.bib`, `kairos_paper.bbl`, `kairos_architecture.pdf`), flat,
+  no subdirectories, matching arXiv's own upload model (subdirectories only survive if uploaded as a
+  single archive; flat is the safer default). Including the precompiled `.bbl` means arXiv does not
+  need to run bibtex itself.
+
+## Session 14: title -- "Toward a Foundation Model", not "Foundation Model"
+
+The author's first instinct was "Kairos Foundation Model: One Byte Space for Every Modality" -- too
+strong a claim for a paper whose only evidence is convergence sanity checks at 1-15M parameters (no
+held-out results, no multimodal training run yet). Landed on a phrasing that keeps the destination
+visible without asserting arrival:
+"Kairos: One Byte Space for Every Modality / Toward a Foundation Model" (both at title size), with the
+technical-stack subtitle unchanged below. "Toward" carries the same function as the paper's own
+"this report only asks whether the substrate optimizes" (Future Work) -- an aim, not a result.
+Checked: 30 tests pass, 14 pages, 0 undefined reference/citation, 0 Overfull; still 4 title/subtitle
+lines total, Figure 1 still fits page 1.
+
+## Session 15: title collapsed to one line
+
+Two stacked title lines ("One Byte Space for Every Modality" / "Toward a Foundation Model") read as
+two separate name-like fragments rather than one phrase. Merged into a single sentence:
+"Kairos: Toward a Byte-Level Foundation Model for Every Modality" -- "toward" keeps the humility,
+"byte-level" carries what "one byte space" meant, "for every modality" keeps the multimodal hook, and
+it reads as one line rather than a stacked pair. Technical-stack subtitle unchanged below.
+Checked: 30 tests pass, 14 pages, 0 undefined reference/citation, 0 Overfull; the title block is now
+3 lines total (was 4), leaving Figure 1 even more comfortably on page 1.
