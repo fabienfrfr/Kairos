@@ -1,0 +1,144 @@
+# tiny-scale ablation config; see docs/experiments/ablations_codec_attention.md
+model:
+  d_model: 64
+  n_heads: 4
+  n_layers: 1
+  use_moe: false
+  attn_type: liz2
+  liz2_share_qkv: true
+  codec_mode: conv
+data:
+  text_examples:
+  - modality: text
+    text: the quick brown fox jumps over the lazy dog
+  - modality: text
+    text: a journey of a thousand miles begins with a single step
+  - modality: text
+    text: she sells seashells by the seashore every summer morning
+  - modality: text
+    text: the early bird catches the worm before sunrise
+  - modality: text
+    text: practice makes perfect when you repeat it daily
+  - modality: text
+    text: the rain in spain falls mainly on the plain
+  - modality: text
+    text: actions speak louder than words in every language
+  - modality: text
+    text: an apple a day keeps the doctor away for years
+  - modality: text
+    text: the pen is mightier than the sword in politics
+  - modality: text
+    text: better late than never when arriving at the party
+  - modality: text
+    text: curiosity killed the cat but satisfaction brought it back
+  - modality: text
+    text: every cloud has a silver lining after the storm
+  - modality: text
+    text: fortune favors the bold who take real risks
+  - modality: text
+    text: honesty is the best policy in every relationship
+  - modality: text
+    text: if it aint broke dont fix it right now
+  - modality: text
+    text: knowledge is power when applied with wisdom
+  - modality: text
+    text: laughter is the best medicine for a heavy heart
+  - modality: text
+    text: the grass is always greener on the other side
+  - modality: text
+    text: necessity is the mother of invention in hard times
+  - modality: text
+    text: practice what you preach if you want respect
+  - modality: text
+    text: the squeaky wheel gets the grease first
+  - modality: text
+    text: time heals all wounds if you let it
+  - modality: text
+    text: two wrongs dont make a right in any case
+  - modality: text
+    text: when in rome do as the romans do
+  - modality: text
+    text: you cant judge a book by its cover alone
+  - modality: text
+    text: actions have consequences that ripple through time
+  - modality: text
+    text: beauty is in the eye of the beholder always
+  - modality: text
+    text: dont count your chickens before they hatch fully
+  - modality: text
+    text: every dog has its day sooner or later
+  - modality: text
+    text: fools rush in where angels fear to tread
+  - modality: text
+    text: good things come to those who wait patiently
+  - modality: text
+    text: haste makes waste when you rush a decision
+  - modality: text
+    text: the ball is in your court to decide
+  - modality: text
+    text: let sleeping dogs lie unless truly necessary
+  - modality: text
+    text: money doesnt grow on trees so save wisely
+  - modality: text
+    text: no news is good news during quiet times
+  - modality: text
+    text: one mans trash is another mans treasure
+  - modality: text
+    text: the proof is in the pudding once tasted
+  - modality: text
+    text: rome wasnt built in a day nor was this
+  - modality: text
+    text: slow and steady wins the race eventually
+  - modality: text
+    text: the squeaky door needs oil to stay quiet
+  - modality: text
+    text: theres no place like home after a long trip
+  - modality: text
+    text: two heads are better than one when solving problems
+  - modality: text
+    text: when the going gets tough the tough get going
+  - modality: text
+    text: you reap what you sow in the long run
+  - modality: text
+    text: absence makes the heart grow fonder over distance
+  - modality: text
+    text: all that glitters is not gold in this market
+  - modality: text
+    text: birds of a feather flock together in nature
+  - modality: text
+    text: dont put all your eggs in one basket ever
+  - modality: text
+    text: every rose has its thorn beneath the petals
+  - modality: text
+    text: great minds think alike when solving puzzles
+  - modality: text
+    text: history repeats itself if lessons go unlearned
+  - modality: text
+    text: the ink is barely dry on this agreement
+  - modality: text
+    text: judge not lest ye be judged in return
+  - modality: text
+    text: keep your friends close and enemies closer still
+  - modality: text
+    text: look before you leap into any big decision
+  - modality: text
+    text: make hay while the sun shines this week
+  - modality: text
+    text: never judge a book by its cover twice
+  - modality: text
+    text: out of sight out of mind after a while
+  - modality: text
+    text: practice safe habits to stay healthy longer
+  - modality: text
+    text: quality over quantity matters in every craft
+  - modality: text
+    text: read between the lines to grasp the meaning
+  - modality: text
+    text: silence is golden during a heated argument
+  max_len: 32
+  batch_size: 8
+train:
+  save_every: 10000
+  run_dir: /tmp/ablations/diverse_shared
+  mask_eps: 0.001
+  mask_reweight_clip: 10.0

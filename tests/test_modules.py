@@ -6,11 +6,11 @@ import torch
 from kairos.attentions import KairosRotaryEmbedding
 from kairos.dataset import KairosPretrainingDataset, KairosRLDataset, KairosSFTDataset
 from kairos.modeling import (
-    DiffusionBlock,
     KairosAttnRes,
+    KairosBackbone,
+    KairosBlock,
     KairosCache,
     KairosConfig,
-    KairosDiffusionBackbone,
     KairosDiffusionFM,
     KairosEmbedding,
     KairosMultiCache,
@@ -83,7 +83,7 @@ def mini_alpaca():
 
 @pytest.fixture
 def config():
-    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2)
+    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, intermediate_size=32)
 
 
 def test_kairos_config(config):
@@ -137,14 +137,75 @@ def test_n_routed_experts_stays_synced_with_num_local_experts():
 
 
 def test_diffusion_block(config):
-    block = DiffusionBlock(config, 0)
+    block = KairosBlock(config, 0)
     x = torch.randn(2, 8, 32)
     out = block(x)
     assert out.shape == x.shape
 
 
+def test_kairos_config_attn_type_defaults_to_liz2(config):
+    assert config.attn_type == "liz2"
+
+
+def test_kairos_config_codec_conv_channels_per_group_defaults_to_none(config):
+    assert config.codec_conv_channels_per_group is None
+
+
+def test_kairos_config_rejects_unknown_attn_type():
+    with pytest.raises(ValueError, match="attn_type"):
+        KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, attn_type="not_a_real_type")
+
+
+def test_diffusion_block_vanilla_attn_type_runs_and_shapes_match():
+    from kairos.attentions import KairosAttention
+
+    config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, attn_type="vanilla")
+    block = KairosBlock(config, 0)
+
+    assert isinstance(block.attn, KairosAttention)
+    out = block(torch.randn(2, 8, 32))
+    assert out.shape == (2, 8, 32)
+
+
+def test_diffusion_block_delta_only_attn_type_runs_and_shapes_match():
+    from kairos.attentions import KairosDeltaOnlyAttention
+
+    config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, attn_type="delta_only")
+    block = KairosBlock(config, 0)
+
+    assert isinstance(block.attn, KairosDeltaOnlyAttention)
+    out = block(torch.randn(2, 8, 32))
+    assert out.shape == (2, 8, 32)
+
+
+def test_kairos_config_rejects_unknown_attn_type_includes_delta_only_in_message():
+    with pytest.raises(ValueError, match="delta_only"):
+        KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, attn_type="nope")
+
+
+def test_liz2_share_qkv_defaults_to_shared_projections():
+    config = KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, attn_type="liz2")
+    block = KairosBlock(config, 0)
+
+    assert block.attn.share_qkv is True
+    assert block.attn.delta.q_proj is block.attn.swa.q_proj
+    assert block.attn.delta.out_proj is block.attn.swa.out
+
+
+def test_liz2_share_qkv_false_gives_independent_projections():
+    config = KairosConfig(
+        d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=2, attn_type="liz2", liz2_share_qkv=False
+    )
+    block = KairosBlock(config, 0)
+
+    assert block.attn.share_qkv is False
+    assert block.attn.delta.q_proj is not block.attn.swa.q_proj
+    out = block(torch.randn(2, 8, 32))
+    assert out.shape == (2, 8, 32)
+
+
 def test_backbone(config):
-    model = KairosDiffusionBackbone(config)
+    model = KairosBackbone(config)
     x = torch.randn(2, 8, 32)
     out = model(x)
     assert out.shape == x.shape
@@ -177,7 +238,7 @@ def test_backbone_block_size_one_matches_original_graph():
     torch.manual_seed(0)
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=4, vocab_size=259, num_modalities=2, attnres_block_size=1)
     torch.manual_seed(42)
-    model = KairosDiffusionBackbone(cfg)
+    model = KairosBackbone(cfg)
     x = torch.randn(2, 6, 16)
 
     # Reference: the original states=[x]; h=agg[i](states); x=layer(h);
@@ -195,7 +256,7 @@ def test_backbone_block_size_one_matches_original_graph():
 
 def test_backbone_block_size_greater_than_one_shape():
     cfg = KairosConfig(d_model=32, n_heads=4, n_layers=6, vocab_size=259, num_modalities=2, attnres_block_size=3)
-    model = KairosDiffusionBackbone(cfg)
+    model = KairosBackbone(cfg)
     x = torch.randn(2, 8, 32)
     out = model(x)
     assert out.shape == x.shape
@@ -207,16 +268,16 @@ def test_backbone_block_size_changes_output():
     cfg1 = KairosConfig(d_model=32, n_heads=4, n_layers=6, vocab_size=259, num_modalities=2, attnres_block_size=1)
     cfg3 = KairosConfig(d_model=32, n_heads=4, n_layers=6, vocab_size=259, num_modalities=2, attnres_block_size=3)
     torch.manual_seed(42)
-    model1 = KairosDiffusionBackbone(cfg1)
+    model1 = KairosBackbone(cfg1)
     torch.manual_seed(42)
-    model3 = KairosDiffusionBackbone(cfg3)
+    model3 = KairosBackbone(cfg3)
     x = torch.randn(2, 8, 32)
     assert not torch.allclose(model1(x), model3(x), atol=1e-5)
 
 
 def test_backbone_block_size_backward():
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=5, vocab_size=259, num_modalities=2, attnres_block_size=2)
-    model = KairosDiffusionBackbone(cfg)
+    model = KairosBackbone(cfg)
     x = torch.randn(2, 6, 16, requires_grad=True)
     out = model(x)
     out.mean().backward()
@@ -227,7 +288,7 @@ def test_backbone_block_size_backward():
 def test_backbone_block_size_uneven_layers_no_nan():
     # n_layers not a multiple of attnres_block_size
     cfg = KairosConfig(d_model=16, n_heads=2, n_layers=5, vocab_size=259, num_modalities=2, attnres_block_size=3)
-    model = KairosDiffusionBackbone(cfg)
+    model = KairosBackbone(cfg)
     x = torch.randn(1, 4, 16)
     out = model(x)
     assert out.shape == x.shape
@@ -368,6 +429,45 @@ def test_codec_conv_decoder_is_depthwise_not_dense():
     n_small = sum(p.numel() for p in small.decoders.parameters())
     n_big = sum(p.numel() for p in big.decoders.parameters())
     assert n_big < n_small * 3  # well under the 4x a dense (patch*d_model^2) decoder would give
+
+
+def test_codec_conv_channels_per_group_defaults_to_depthwise():
+    codec = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    assert codec.conv_channels_per_group == 1
+    assert codec.conv_groups == 32
+    assert codec.encoders[0].groups == 32
+    assert codec.decoders[0].groups == 32
+
+
+def test_codec_conv_channels_per_group_scales_groups_with_d_model():
+    small = PyramidalCodec(32, stride=3, num_scales=2, mode="conv", conv_channels_per_group=8)
+    big = PyramidalCodec(64, stride=3, num_scales=2, mode="conv", conv_channels_per_group=8)
+
+    assert small.conv_groups == 4  # 32 / 8
+    assert big.conv_groups == 8  # 64 / 8, same ratio as small
+
+
+def test_codec_conv_channels_per_group_equal_to_d_model_gives_a_dense_conv():
+    depthwise = PyramidalCodec(32, stride=3, num_scales=2, mode="conv")
+    dense = PyramidalCodec(32, stride=3, num_scales=2, mode="conv", conv_channels_per_group=32)
+
+    assert dense.conv_groups == 1
+    assert dense.encoders[0].groups == 1
+    n_depthwise = sum(p.numel() for p in depthwise.encoders.parameters())
+    n_dense = sum(p.numel() for p in dense.encoders.parameters())
+    assert n_dense > n_depthwise
+
+
+def test_codec_conv_channels_per_group_dense_still_roundtrips():
+    codec = PyramidalCodec(32, stride=3, num_scales=2, mode="conv", conv_channels_per_group=32)
+    x = torch.randn(2, 16, 32)
+    decoded = codec.decode(codec.encode(x))
+    assert decoded.shape == x.shape
+
+
+def test_codec_rejects_conv_channels_per_group_not_dividing_d_model():
+    with pytest.raises(AssertionError, match="conv_channels_per_group"):
+        PyramidalCodec(32, stride=3, num_scales=2, mode="conv", conv_channels_per_group=5)
 
 
 def test_kairos_model_init(config):
@@ -830,7 +930,7 @@ def test_rldataset_anti_reversal_curse(tokenizer, mini_mcq):
 
 
 def test_diffusion_block_accepts_cache_params(config):
-    block = DiffusionBlock(config, layer_idx=0)
+    block = KairosBlock(config, layer_idx=0)
     cache = KairosCache(config)
     x = torch.randn(1, 8, 32)
     out = block(x, cache_params=cache)
@@ -838,7 +938,7 @@ def test_diffusion_block_accepts_cache_params(config):
 
 
 def test_diffusion_block_output_differs_with_cache(config):
-    block = DiffusionBlock(config, layer_idx=0)
+    block = KairosBlock(config, layer_idx=0)
     x_ctx = torch.randn(1, 16, 32)
     x_q = torch.randn(1, 8, 32)
     out_no_cache = block(x_q)
@@ -849,7 +949,7 @@ def test_diffusion_block_output_differs_with_cache(config):
 
 
 def test_diffusion_block_cache_not_mutated(config):
-    block = DiffusionBlock(config, layer_idx=0)
+    block = KairosBlock(config, layer_idx=0)
     x_ctx = torch.randn(1, 16, 32)
     cache = KairosCache(config)
     _ = block(x_ctx, cache_params=cache)
@@ -867,7 +967,7 @@ def test_diffusion_block_cache_not_mutated(config):
 
 
 def test_diffusion_block_cache_determinism(config):
-    block = DiffusionBlock(config, layer_idx=0)
+    block = KairosBlock(config, layer_idx=0)
     x_ctx = torch.randn(1, 16, 32)
     cache = KairosCache(config)
     _ = block(x_ctx, cache_params=cache)
@@ -878,7 +978,7 @@ def test_diffusion_block_cache_determinism(config):
 
 
 def test_diffusion_block_no_cache_backward(config):
-    block = DiffusionBlock(config, layer_idx=0)
+    block = KairosBlock(config, layer_idx=0)
     x = torch.randn(2, 8, 32, requires_grad=True)
     out = block(x)
     out.mean().backward()
@@ -887,7 +987,7 @@ def test_diffusion_block_no_cache_backward(config):
 
 
 def test_diffusion_block_with_cache_backward(config):
-    block = DiffusionBlock(config, layer_idx=0)
+    block = KairosBlock(config, layer_idx=0)
     cache = KairosCache(config)
     x = torch.randn(2, 8, 32, requires_grad=True)
     out = block(x, cache_params=cache)
@@ -897,7 +997,7 @@ def test_diffusion_block_with_cache_backward(config):
 
 
 def test_backbone_propagates_cache(config):
-    backbone = KairosDiffusionBackbone(config)
+    backbone = KairosBackbone(config)
     cache = KairosCache(config)
     x = torch.randn(1, 8, 32)
     out = backbone(x, cache_params=cache)
@@ -906,7 +1006,7 @@ def test_backbone_propagates_cache(config):
 
 
 def test_backbone_cache_conditions_output(config):
-    backbone = KairosDiffusionBackbone(config)
+    backbone = KairosBackbone(config)
     x_ctx1 = torch.randn(1, 16, 32)
     x_ctx2 = torch.randn(1, 16, 32)
     x_q = torch.randn(1, 8, 32)

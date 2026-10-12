@@ -28,7 +28,7 @@ def router(modality_scales):
 
 @pytest.fixture
 def config():
-    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=4)
+    return KairosConfig(d_model=32, n_heads=4, n_layers=2, vocab_size=259, num_modalities=4, intermediate_size=32)
 
 
 def test_build_active_mask_shape(router):

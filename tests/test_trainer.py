@@ -3,15 +3,18 @@ import pytest
 import torch
 
 from kairos.dataset import KairosPretrainingDataset, pack_multimodal_data
-from kairos.modeling import KairosConfig, KairosDiffusionFM
+from kairos.modeling import KairosConfig, KairosDiffusionFM, KairosTopkRouter
 from kairos.pipeline import TrainConfig
 from kairos.tokenizer import KairosTokenizer
 from kairos.trainer import (
     KairosDiffusionTrainer,
     anneal_mask_schedule,
+    collect_moe_aux_loss,
     compute_masked_diffusion_losses,
     make_diffusion_mask,
     stage_mask_schedule,
+    stage_name_at,
+    update_moe_bias,
 )
 
 
@@ -30,6 +33,7 @@ def config(tokenizer):
         num_modalities=8,
         stride=1,
         num_scales=2,
+        intermediate_size=32,
         # keep both aliases in sync; different transformers versions read different fields
         num_local_experts=7,
         n_routed_experts=7,
@@ -257,6 +261,40 @@ def test_compute_masked_diffusion_losses_reweight_false_is_plain_ce(dense_model)
     assert plain.max() < 50  # sane CE range for a small vocab, no 1/p blowup
 
 
+def test_compute_masked_diffusion_losses_reweight_clip_bounds_extreme_weight(dense_model):
+    """A tiny p (~1e-3) gives a ~1000x /p weight uncapped; reweight_clip must bound it."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=1e-3, dtype=torch.float)
+
+    torch.manual_seed(0)
+    uncapped, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    torch.manual_seed(0)
+    capped, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True, reweight_clip=10.0)
+    torch.manual_seed(0)
+    plain, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=False)
+
+    assert uncapped.max() > capped.max()
+    assert torch.allclose(capped, plain * 10, atol=1e-4)
+
+
+def test_compute_masked_diffusion_losses_reweight_clip_none_matches_unbounded_default(dense_model):
+    """reweight_clip defaults to None: identical to the pre-clip unbounded behaviour."""
+    torch.manual_seed(0)
+    x0 = torch.randint(0, dense_model.lm_head.vocab_size, (2, 8))
+    noise_mask = torch.zeros_like(x0, dtype=torch.bool)
+    noise_mask[:, 2:5] = True
+    p = torch.full_like(x0, fill_value=5, dtype=torch.float)
+
+    torch.manual_seed(0)
+    a, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True)
+    torch.manual_seed(0)
+    b, _, _, _ = compute_masked_diffusion_losses(dense_model, x0, noise_mask, p, reweight=True, reweight_clip=None)
+    assert torch.equal(a, b)
+
+
 def test_compute_masked_diffusion_losses_with_data_parallel_wrapper(dense_model):
     """Regression for wrapped (DataParallel/multi-GPU) models; .module resolution."""
     torch.manual_seed(0)
@@ -277,6 +315,7 @@ def test_trainer_mask_p_max_and_reweight_default_to_full_diffusion(dense_model):
     trainer = KairosDiffusionTrainer(model=dense_model)
     assert trainer.mask_p_max == 1.0
     assert trainer.mask_reweight is True
+    assert trainer.mask_reweight_clip == 3.0
 
 
 # ----------------------------------------------------------------- self-conditioning
@@ -415,6 +454,15 @@ def test_stage_mask_schedule_flat_at_target_during_diffusion_phase():
     assert reweight == pytest.approx(1.0)
 
 
+def test_stage_name_at_matches_stage_mask_schedule_boundaries():
+    assert stage_name_at(0, mae_steps=100, transition_steps=50) == "mae"
+    assert stage_name_at(99, mae_steps=100, transition_steps=50) == "mae"
+    assert stage_name_at(100, mae_steps=100, transition_steps=50) == "transition"
+    assert stage_name_at(149, mae_steps=100, transition_steps=50) == "transition"
+    assert stage_name_at(150, mae_steps=100, transition_steps=50) == "diffusion"
+    assert stage_name_at(10_000, mae_steps=100, transition_steps=50) == "diffusion"
+
+
 def test_stage_mask_schedule_zero_transition_jumps_straight_to_target():
     """transition_steps=0: no ramp — MAE phase, then immediately the diffusion target."""
     p_max, reweight = stage_mask_schedule(99, 100, 0, 0.3, False, 1.0, True)
@@ -499,6 +547,115 @@ def test_trainer_mae_mode_runs_end_to_end(dense_model, tokenizer):
     assert torch.is_tensor(loss) and not torch.isnan(loss)
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in dense_model.parameters())
+
+
+# ----------------------------------------------------------- aux-loss-free MoE balancing
+def test_moe_gate_load_count_accumulates_only_while_training(model, tokenizer):
+    router = next(m for m in model.modules() if isinstance(m, KairosTopkRouter))
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+
+    model.eval()
+    trainer.compute_loss(model, batch)
+    assert router.load_count.sum() == 0
+
+    model.train()
+    trainer.compute_loss(model, batch)
+    assert router.load_count.sum() > 0
+
+
+def test_moe_router_bias_update_favors_underloaded_experts(config):
+    router = KairosTopkRouter(config)
+    router.load_count = torch.tensor([10.0, 0.0, 5.0, 5.0, 5.0, 5.0, 5.0])
+    bias_before = router.e_score_correction_bias.clone()
+    router.update_bias(update_rate=0.1)
+    assert router.e_score_correction_bias[0] < bias_before[0]  # overloaded -> bias goes down
+    assert router.e_score_correction_bias[1] > bias_before[1]  # underloaded -> bias goes up
+    assert torch.equal(router.load_count, torch.zeros_like(router.load_count))
+
+
+def test_update_moe_bias_touches_every_gate_in_the_model(model):
+    routers = [m for m in model.modules() if isinstance(m, KairosTopkRouter)]
+    assert routers, "fixture must build at least one MoE layer"
+    for r in routers:
+        r.load_count = torch.tensor([3.0] + [0.0] * (r.num_experts - 1))
+
+    update_moe_bias(model, update_rate=0.05)
+
+    for r in routers:
+        assert r.load_count.sum() == 0
+        assert r.e_score_correction_bias[0] < 0
+
+
+def test_update_moe_bias_is_noop_on_dense_model(dense_model):
+    update_moe_bias(dense_model, update_rate=0.05)  # no MoE gates at all: must not raise
+
+
+def test_moe_router_sets_last_aux_loss_only_while_training(model, tokenizer):
+    router = next(m for m in model.modules() if isinstance(m, KairosTopkRouter))
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+
+    model.eval()
+    trainer.compute_loss(model, batch)
+    assert router.last_aux_loss is None
+
+    model.train()
+    trainer.compute_loss(model, batch)
+    assert router.last_aux_loss is not None
+    assert torch.is_tensor(router.last_aux_loss) and router.last_aux_loss.requires_grad
+
+
+def test_collect_moe_aux_loss_sums_every_router(model):
+    model.train()
+    routers = [m for m in model.modules() if isinstance(m, KairosTopkRouter)]
+    assert routers, "fixture must build at least one MoE layer"
+    for i, r in enumerate(routers):
+        r.last_aux_loss = torch.tensor(float(i + 1))
+
+    total = collect_moe_aux_loss(model)
+
+    assert total.item() == sum(i + 1 for i in range(len(routers)))
+
+
+def test_collect_moe_aux_loss_is_zero_on_dense_model(dense_model):
+    total = collect_moe_aux_loss(dense_model)
+    assert total.item() == 0.0
+
+
+def test_compute_loss_ignores_aux_loss_by_default(model, tokenizer):
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+    trainer.mask_p_max = 0.3
+    trainer.mask_reweight = False
+    model.train()
+
+    assert trainer.moe_aux_loss_weight == 0.0
+    loss_without = trainer.compute_loss(model, batch)
+
+    for m in model.modules():
+        if isinstance(m, KairosTopkRouter):
+            m.last_aux_loss = torch.tensor(1e6)  # would blow up the loss if it were being added
+    trainer.moe_aux_loss_weight = 0.0
+    loss_still_without = trainer.compute_loss(model, batch)
+
+    assert torch.isfinite(loss_without) and torch.isfinite(loss_still_without)
+
+
+def test_compute_loss_adds_weighted_aux_loss_when_enabled(model, tokenizer):
+    batch = _padded_batch(tokenizer)
+    trainer = KairosDiffusionTrainer(model=model)
+    trainer.mask_p_max = 0.3
+    trainer.mask_reweight = False
+    trainer.moe_aux_loss_weight = 1.0
+    model.train()
+
+    loss = trainer.compute_loss(model, batch)
+
+    assert torch.is_tensor(loss) and torch.isfinite(loss)
+    loss.backward()
+    router = next(m for m in model.modules() if isinstance(m, KairosTopkRouter))
+    assert router.weight.grad is not None and router.weight.grad.abs().sum() > 0
 
 
 def test_trainer_mae_mode_never_exceeds_p_max(dense_model, tokenizer, monkeypatch):

@@ -12,7 +12,13 @@ import torch
 import kairos.pipeline as pipeline_module
 from kairos.dataset import pack_multimodal_data
 from kairos.modeling import KairosConfig, KairosDiffusionFM
-from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig, _resolve_amp_dtype
+from kairos.pipeline import (
+    DataConfig,
+    KairosMultimodalPipeline,
+    TrainConfig,
+    _bf16_hardware_available,
+    _resolve_amp_dtype,
+)
 from kairos.tokenizer import Modality
 from kairos.utils import TrainingSummary, count_parameters
 
@@ -59,7 +65,9 @@ def multimodal_examples(rng):
 
 @pytest.fixture
 def model_config():
-    return KairosConfig(d_model=32, n_heads=4, n_layers=4, num_modalities=8, attnres_block_size=2)
+    return KairosConfig(
+        d_model=32, n_heads=4, n_layers=4, num_modalities=8, attnres_block_size=2, intermediate_size=64
+    )
 
 
 @pytest.fixture
@@ -89,6 +97,21 @@ def test_build_wires_mask_curriculum_config_to_trainer(tmp_path, model_config, t
     assert pipe.hf_trainer.mask_reweight is False
 
 
+def test_build_wires_mask_reweight_clip_to_trainer(tmp_path, model_config, text_examples):
+    """TrainConfig.mask_reweight_clip must reach the underlying trainer, default and override alike."""
+    data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
+    default_pipe = KairosMultimodalPipeline(
+        model_config, data_config, TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run_default"))
+    )
+    default_pipe.build()
+    assert default_pipe.hf_trainer.mask_reweight_clip == 3.0
+
+    train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run_override"), mask_reweight_clip=None)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    assert pipe.hf_trainer.mask_reweight_clip is None
+
+
 def test_build_wires_self_conditioning_prob_to_trainer(tmp_path, model_config, text_examples):
     data_config = DataConfig(text_examples=text_examples, max_len=64, batch_size=2)
     train_config = TrainConfig(epochs=1, save_every=3, run_dir=str(tmp_path / "run"), self_conditioning_prob=0.75)
@@ -111,6 +134,26 @@ def test_resolve_amp_dtype_explicit_bf16_override_wins_even_if_unsupported():
     assert _resolve_amp_dtype("bf16", bf16_supported=False) == torch.bfloat16
 
 
+def test_bf16_hardware_available_false_without_cuda(monkeypatch):
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_available", lambda: False)
+    assert _bf16_hardware_available() is False
+
+
+def test_bf16_hardware_available_trusts_is_bf16_supported_alone_on_rocm(monkeypatch):
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.version, "hip", "5.7.0")
+    assert _bf16_hardware_available() is True
+
+
+def test_bf16_hardware_available_requires_ampere_on_cuda(monkeypatch):
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(pipeline_module.torch.version, "hip", None)
+    monkeypatch.setattr(pipeline_module.torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
+    assert _bf16_hardware_available() is False
+
+
 def test_resolve_amp_dtype_explicit_fp16_override_wins_even_if_bf16_supported():
     assert _resolve_amp_dtype("fp16", bf16_supported=True) == torch.float16
 
@@ -123,7 +166,7 @@ def test_train_config_rejects_invalid_amp_dtype(tmp_path):
 def test_pipeline_uses_bf16_when_cuda_reports_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 0))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.bfloat16
@@ -133,7 +176,7 @@ def test_pipeline_uses_bf16_when_cuda_reports_bf16_support(tmp_path, model_confi
 def test_pipeline_falls_back_to_fp16_when_cuda_lacks_bf16_support(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.float16
@@ -146,7 +189,7 @@ def test_pipeline_falls_back_to_fp16_on_t4_despite_is_bf16_supported_true(
     """Regression test: T4 (SM75) reports is_bf16_supported()=True but has no bf16 tensor cores."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
 
     assert pipe.amp_dtype == torch.float16
@@ -155,7 +198,7 @@ def test_pipeline_falls_back_to_fp16_on_t4_despite_is_bf16_supported_true(
 def test_pipeline_amp_dtype_override_forces_bf16_on_old_hardware(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples, amp_dtype="bf16")
 
     assert pipe.amp_dtype == torch.bfloat16
@@ -175,6 +218,11 @@ def test_default_build_without_cuda_does_not_compile(built_pipeline):
     assert built_pipeline.model_forward is built_pipeline.model
 
 
+# needs a real CUDA device: transformers.TrainingArguments.build() calls set_device() too
+_needs_real_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a real CUDA device")
+
+
+@_needs_real_cuda
 def test_build_compiles_model_forward_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
@@ -185,6 +233,7 @@ def test_build_compiles_model_forward_when_cuda_available(tmp_path, model_config
     assert pipe.model_forward is not pipe.model
 
 
+@_needs_real_cuda
 def test_compile_model_false_skips_compile_even_with_cuda(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples, compile_model=False)
@@ -202,6 +251,7 @@ def _restore_dynamo_scalar_capture():
     torch._dynamo.config.capture_scalar_outputs = original
 
 
+@_needs_real_cuda
 def test_build_enables_capture_scalar_outputs_when_compiling(
     tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_scalar_capture
 ):
@@ -222,6 +272,7 @@ def _restore_dynamo_recompile_limit():
     torch._dynamo.config.recompile_limit = original
 
 
+@_needs_real_cuda
 def test_build_raises_recompile_limit_when_compiling(
     tmp_path, model_config, text_examples, monkeypatch, _restore_dynamo_recompile_limit
 ):
@@ -242,6 +293,7 @@ def _restore_inductor_compile_threads():
     torch._inductor.config.compile_threads = original
 
 
+@_needs_real_cuda
 def test_build_forces_single_compile_thread_when_compiling(
     tmp_path, model_config, text_examples, monkeypatch, _restore_inductor_compile_threads
 ):
@@ -288,9 +340,8 @@ def test_build_and_train_actually_compile_on_cpu_when_forced(
     assert torch.isfinite(loss)
 
 
-def test_build_gives_eval_a_separate_compiled_instance_from_train(
-    tmp_path, model_config, text_examples, monkeypatch
-):
+@_needs_real_cuda
+def test_build_gives_eval_a_separate_compiled_instance_from_train(tmp_path, model_config, text_examples, monkeypatch):
     """Separate instances keep grad_mode from becoming a recompile-triggering guard axis."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
@@ -318,6 +369,7 @@ def test_build_leaves_capture_scalar_outputs_untouched_without_cuda(
     assert torch._dynamo.config.capture_scalar_outputs is False
 
 
+@_needs_real_cuda
 def test_build_enables_tf32_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
     orig_matmul = torch.backends.cuda.matmul.allow_tf32
     orig_cudnn = torch.backends.cudnn.allow_tf32
@@ -355,6 +407,7 @@ def test_build_leaves_tf32_untouched_without_cuda(tmp_path, model_config, text_e
         torch.backends.cudnn.allow_tf32 = orig_cudnn
 
 
+@_needs_real_cuda
 def test_optimizer_uses_fused_adamw_when_cuda_available(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     pipe = _unbuilt_pipe(tmp_path, model_config, text_examples)
@@ -1282,9 +1335,7 @@ def test_replay_ddp_log_survives_a_broken_phase_callback(tmp_path):
 def test_replay_ddp_log_relays_real_triton_autotuning_lines_as_phases(tmp_path):
     log_path = tmp_path / "train_ddp.log"
     log_path.write_text(
-        "phase run\n"
-        "Autotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1\n"
-        "finished after 6.31s,\n"
+        "phase run\nAutotuning kernel l2norm_fwd_kernel with config BT: 8, num_warps: 1\nfinished after 6.31s,\n"
     )
     phases = []
 
@@ -1429,9 +1480,11 @@ def test_async_save_does_not_block_caller(built_pipeline, tmp_path, monkeypatch)
     """Regression test: wait=False must return immediately, not block on a slow write."""
     import time
 
+    real_save = torch.save
+
     def _slow_save(payload, path):
         time.sleep(0.3)
-        torch.save(payload, path)
+        real_save(payload, path)
 
     monkeypatch.setattr(torch, "save", _slow_save)
     path = tmp_path / "slow.pt"
@@ -2037,6 +2090,36 @@ def test_eval_every_steps_overrides_eval_every_epochs(tmp_path, model_config, te
     assert [row["step"] for row in pipe.eval_log_rows] == list(range(1, pipe.global_step + 1))
 
 
+def test_overfit_test_log_every_prints_step_loss_lines(tmp_path, model_config, capsys):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    logs = pipe.overfit_test(n_examples=16, steps=10, lr=1e-2, log_every=5)
+
+    out = capsys.readouterr().out
+    assert "step 1/10" in out  # first step always printed
+    assert "step 6/10" in out  # every log_every-th step printed (0-indexed step 5)
+    assert "step 10/10" in out  # final step always printed, even off the log_every cadence
+    assert "step 2/10" not in out
+    assert len(logs) == 10
+
+
+def test_overfit_test_log_every_zero_stays_silent(tmp_path, model_config, capsys):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    pipe.overfit_test(n_examples=16, steps=10, lr=1e-2)  # log_every defaults to 0
+
+    out = capsys.readouterr().out
+    assert "step " not in out  # only the final one-line summary should print, not per-step lines
+
+
 def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config):
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
@@ -2148,6 +2231,36 @@ def test_overfit_test_mask_override_is_applied_and_restored(tmp_path, model_conf
     # restored to the pipe's original (Stage 2 / diffusion) settings after the call
     assert pipe.hf_trainer.mask_p_max == 1.0
     assert pipe.hf_trainer.mask_reweight is True
+
+
+def test_overfit_test_freeze_callback_runs_once_per_step_before_the_step(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+
+    seen_steps = []
+    pipe.overfit_test(n_examples=16, steps=4, mask_p_max=0.3, mask_reweight=False, freeze_callback=seen_steps.append)
+
+    assert seen_steps == [0, 1, 2, 3]
+
+
+def test_overfit_test_freeze_callback_can_freeze_a_parameter_mid_run(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    target = next(iter(pipe.model.parameters()))
+
+    def freeze_at_step_2(step):
+        if step == 2:
+            target.requires_grad_(False)
+
+    pipe.overfit_test(n_examples=16, steps=4, mask_p_max=0.3, mask_reweight=False, freeze_callback=freeze_at_step_2)
+
+    assert target.requires_grad is False
 
 
 def test_train_without_eval_config_skips_eval(tmp_path, model_config, text_examples):

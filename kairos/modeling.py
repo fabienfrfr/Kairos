@@ -7,11 +7,13 @@ from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE, DeepseekV3TopkRouter
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 
 from .attentions import (
     ATTN_IMPL,
+    KairosAttention,
+    KairosDeltaOnlyAttention,
     KairosLiZAttention2,
     KairosNorm,
     KairosRotaryEmbedding,
@@ -65,6 +67,8 @@ class KairosConfig(PretrainedConfig):
         self.codec_mode = kwargs.get("codec_mode", "conv")
         # rank of the conv-mode codec's mixer bottleneck; None -> PyramidalCodec default
         self.codec_mixer_rank = kwargs.get("codec_mixer_rank", None)
+        # ratio-based, scales with d_model; None -> 1 (depthwise, current default)
+        self.codec_conv_channels_per_group = kwargs.get("codec_conv_channels_per_group", None)
         self.predict_octet_family = kwargs.get("predict_octet_family", True)
         self.num_octet_families = kwargs.get("num_octet_families", 18)  # match KairosTokenizer
 
@@ -86,6 +90,11 @@ class KairosConfig(PretrainedConfig):
         self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4)
         self.hidden_act = kwargs.get("hidden_act", "silu")
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        # "liz2" (default, real architecture) or "vanilla" (plain SWA, no DeltaNet); ablation-only
+        self.attn_type = kwargs.get("attn_type", "liz2")
+        if self.attn_type not in ("liz2", "vanilla", "delta_only"):
+            raise ValueError(f"attn_type must be 'liz2', 'vanilla' or 'delta_only', got {self.attn_type!r}")
+        self.liz2_share_qkv = kwargs.get("liz2_share_qkv", True)  # liz2 only; False = separate QKV/O
 
         self.time_step_min = 0.001
         self.time_step_max = 0.1
@@ -253,6 +262,34 @@ class KairosFFN(Qwen2MoeMLP):
     pass
 
 
+class KairosTopkRouter(DeepseekV3TopkRouter):
+    """Tracks per-expert token load so update_bias() can drive DeepSeek-V3-style aux-loss-free balancing."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.load_count = nn.Buffer(torch.zeros(self.num_experts), persistent=False)
+        self.last_aux_loss = None  # Switch-style load-balancing term; set when training
+
+    def forward(self, hidden_states):
+        router_logits, topk_weights, topk_indices = super().forward(hidden_states)
+        if self.training:
+            with torch.no_grad():
+                counts = torch.bincount(topk_indices.reshape(-1), minlength=self.num_experts).float()
+                self.load_count += counts
+                fraction_dispatched = counts / topk_indices.numel()
+            mean_router_prob = F.softmax(router_logits, dim=-1).mean(dim=0)
+            self.last_aux_loss = self.num_experts * (fraction_dispatched * mean_router_prob).sum()
+        else:
+            self.last_aux_loss = None
+        return router_logits, topk_weights, topk_indices
+
+    def update_bias(self, update_rate: float) -> None:
+        with torch.no_grad():
+            target = self.load_count.mean()
+            self.e_score_correction_bias += update_rate * torch.sign(target - self.load_count)
+            self.load_count.zero_()
+
+
 class KairosMoE(DeepseekV3MoE):
     """DeepseekV3MoE's expert weights are raw torch.empty(), never initialized; fixed here."""
 
@@ -261,15 +298,20 @@ class KairosMoE(DeepseekV3MoE):
         std = getattr(config, "initializer_range", 0.02)
         self.experts.gate_up_proj.data.normal_(mean=0.0, std=std)
         self.experts.down_proj.data.normal_(mean=0.0, std=std)
-        self.gate.weight.data.normal_(mean=0.0, std=std)  # was torch.zeros() at construction; fine
+        self.gate = KairosTopkRouter(config)
+        self.gate.weight.data.normal_(mean=0.0, std=std)
 
 
-class DiffusionBlock(nn.Module):
+ATTN_TYPES = {"vanilla": KairosAttention, "liz2": KairosLiZAttention2, "delta_only": KairosDeltaOnlyAttention}
+
+
+class KairosBlock(nn.Module):
     def __init__(self, config, layer_idx, use_moe=False):
         super().__init__()
         self.norm1 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm2 = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = KairosLiZAttention2(config, layer_idx)
+        attn_cls = ATTN_TYPES.get(getattr(config, "attn_type", "liz2"), KairosLiZAttention2)
+        self.attn = attn_cls(config, layer_idx)
         self.ffn = KairosMoE(config) if use_moe else KairosFFN(config)
 
     def forward(
@@ -315,12 +357,12 @@ class KairosAttnRes(nn.Module):
         return (weights.unsqueeze(-1) * V).sum(dim=0)
 
 
-class KairosDiffusionBackbone(nn.Module):
+class KairosBackbone(nn.Module):
     """v3 Block-AttnRes: prior layer outputs are windowed into blocks before aggregation."""
 
     def __init__(self, config, use_moe=False):
         super().__init__()
-        self.layers = nn.ModuleList([DiffusionBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([KairosBlock(config, i, use_moe) for i in range(config.num_hidden_layers)])
         self.norm = KairosNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.aggregator = nn.ModuleList([KairosAttnRes(config.hidden_size) for _ in range(config.num_hidden_layers)])
         self.attnres_block_size = max(1, getattr(config, "attnres_block_size", 1))
@@ -457,7 +499,16 @@ class CodecOutput:
 class PyramidalCodec(nn.Module):
     """Multi-scale encode/decode: mode='patch' (nn.Linear per scale) or 'conv' (cuDNN, faster)."""
 
-    def __init__(self, d_model, stride=5, num_scales=4, mode="patch", norm_eps=1e-6, mixer_rank=None):
+    def __init__(
+        self,
+        d_model,
+        stride=5,
+        num_scales=4,
+        mode="patch",
+        norm_eps=1e-6,
+        mixer_rank=None,
+        conv_channels_per_group=None,
+    ):
         super().__init__()
         assert mode in ("patch", "conv"), f"mode must be 'patch' or 'conv', got {mode!r}"
         self.stride = stride
@@ -466,6 +517,12 @@ class PyramidalCodec(nn.Module):
         self.patch_sizes = [stride ** (level + 1) for level in range(num_scales)]
         # bottleneck mixer: O(2*r*d) instead of a dense 1x1 conv's O(d^2), same full mixing
         self.mixer_rank = mixer_rank if mixer_rank is not None else max(8, d_model // 4)
+        # channels mixed per conv group: 1 (default) = depthwise/cheapest; d_model = fully dense
+        self.conv_channels_per_group = conv_channels_per_group if conv_channels_per_group is not None else 1
+        assert d_model % self.conv_channels_per_group == 0, (
+            f"d_model ({d_model}) must be divisible by conv_channels_per_group"
+        )
+        self.conv_groups = d_model // self.conv_channels_per_group
 
         if mode == "patch":
             self._init_patch(d_model)
@@ -490,7 +547,7 @@ class PyramidalCodec(nn.Module):
         )
 
     def _init_conv(self, d_model):
-        """Depthwise conv encoder/decoder; one shared pre-mixer feeds context to every scale."""
+        """Depthwise (or grouped) conv encoder/decoder; one shared pre-mixer feeds every scale."""
         self.pre_mixer = self._make_bottleneck_mixer(d_model)
         self.encoders = nn.ModuleList()
         self.mixers = nn.ModuleList()
@@ -498,12 +555,14 @@ class PyramidalCodec(nn.Module):
         self.decode_mixers = nn.ModuleList()
         for patch in self.patch_sizes:
             self.encoders.append(
-                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
+                nn.Conv1d(d_model, d_model, kernel_size=patch, stride=patch, groups=self.conv_groups, bias=True)
             )
             self.mixers.append(self._make_bottleneck_mixer(d_model))
-            # depthwise transpose conv: O(patch*d_model), not O(patch*d_model^2) for a dense decoder
+            # grouped transpose conv: O(patch*d^2/groups); groups=d_model (default) is depthwise-cheap
             self.decoders.append(
-                nn.ConvTranspose1d(d_model, d_model, kernel_size=patch, stride=patch, groups=d_model, bias=True)
+                nn.ConvTranspose1d(
+                    d_model, d_model, kernel_size=patch, stride=patch, groups=self.conv_groups, bias=True
+                )
             )
             self.decode_mixers.append(self._make_bottleneck_mixer(d_model))
 
@@ -588,6 +647,7 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
             mode=config.codec_mode,
             norm_eps=config.rms_norm_eps,
             mixer_rank=getattr(config, "codec_mixer_rank", None),
+            conv_channels_per_group=getattr(config, "codec_conv_channels_per_group", None),
         )
         self.router = KairosScaleRouter(config.modality_scales)
         if vocab_size is None:
@@ -598,11 +658,11 @@ class KairosDiffusionFM(PreTrainedModel, KairosDiffusionGenerationMixin):
         self.embedding = KairosEmbedding(vocab_size=vocab_size, d_model=config.hidden_size, num_octet_families=n_octet)
         share = getattr(config, "share_backbones", False)
         if share:
-            shared = KairosDiffusionBackbone(config=config, use_moe=use_moe)
+            shared = KairosBackbone(config=config, use_moe=use_moe)
             self.backbones = nn.ModuleList([shared] * self.codec.num_scales)
         else:
             self.backbones = nn.ModuleList(
-                [KairosDiffusionBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
+                [KairosBackbone(config=config, use_moe=use_moe) for _ in range(self.codec.num_scales)]
             )
         if getattr(config, "use_memory_gate", False):
             head_dim = config.hidden_size // config.num_attention_heads

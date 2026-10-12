@@ -7,16 +7,26 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import os
+    # auto: fused flex_attention on SM>=7.0 GPUs (T4); multi-GPU (T4x2) needs torchrun for DDP.
+    os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
+    return (os,)
+
+
+@app.cell
+def _(os):
     from huggingface_hub import login
 
     try:
         from kaggle_secrets import UserSecretsClient
         HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
-    except ImportError:
+    except Exception:  # noqa: BLE001 – kaggle fallback
         HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
 
-    login(token=HF_TOKEN, add_to_git_credential=False)
-    return (os,)
+    try:
+        login(token=HF_TOKEN, add_to_git_credential=False)
+    except Exception:  # noqa: BLE001 – missing token fallback
+        print("No HF_TOKEN")
+    return
 
 
 @app.cell
@@ -45,11 +55,8 @@ def _():
 
 
 @app.cell
-def _(os):
+def _():
     from pathlib import Path
-
-    # auto: fused flex_attention on SM>=7.0 GPUs (T4); multi-GPU (T4x2) needs torchrun for DDP.
-    os.environ.setdefault("KAIROS_ATTN_BACKEND", "auto")
 
     import torch
     import pandas as pd
@@ -57,7 +64,6 @@ def _(os):
     from kairos.modeling import KairosConfig
     from kairos.tokenizer import KairosTokenizer, Modality
     from kairos.pipeline import KairosMultimodalPipeline, DataConfig, TrainConfig
-    from kairos.utils import make_progress_callback
     from kairos.dataset import (
         diagnose_raw_control_balance,
         modality_counts,
@@ -67,6 +73,7 @@ def _(os):
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
+    print(f"build ROCm : {torch.version.hip}")   # None if build CUDA/CPU
 
     tokenizer = KairosTokenizer()
     print(f"vocab size: {len(tokenizer)}")
@@ -82,7 +89,6 @@ def _(os):
         Path,
         TrainConfig,
         diagnose_raw_control_balance,
-        make_progress_callback,
         modality_counts,
         pd,
         preview_multimodal_examples,
@@ -224,9 +230,11 @@ def _():
     CFG_INTERMEDIATE = 544  # raised to keep ~14-15M total params after d_model 88->64
     CFG_USE_MEMORY_BANK = True  # cross-session DeltaNet state gating
     CFG_SHARE_BACKBONES = True  # share one backbone across all scales (saves ~75% params)
-    CFG_CODEC_MODE = "patch"  # "conv" (fast, cuDNN) or "patch" (nn.Linear per scale)
+    CFG_CODEC_MODE = "conv"  # "conv" (fast, cuDNN) or "patch" (nn.Linear per scale)
+    CFG_CODEC_CONV_CHANNELS_PER_GROUP = 8  # 1=depthwise/cheapest (default); d_model=dense/patch-like
     return (
         CFG_ATTNRES_BLOCK,
+        CFG_CODEC_CONV_CHANNELS_PER_GROUP,
         CFG_CODEC_MODE,
         CFG_D_MODEL,
         CFG_EXPERTS,
@@ -274,6 +282,7 @@ def _():
 @app.cell
 def _(
     CFG_ATTNRES_BLOCK,
+    CFG_CODEC_CONV_CHANNELS_PER_GROUP,
     CFG_CODEC_MODE,
     CFG_D_MODEL,
     CFG_EXPERTS,
@@ -312,9 +321,10 @@ def _(
         use_memory_gate=CFG_USE_MEMORY_BANK,
         share_backbones=CFG_SHARE_BACKBONES,
         codec_mode=CFG_CODEC_MODE,
+        codec_conv_channels_per_group=CFG_CODEC_CONV_CHANNELS_PER_GROUP,
     )
     print(
-        f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE}"
+        f"moe: {use_moe}  block-attnres window: {CFG_ATTNRES_BLOCK}  memory_bank: {CFG_USE_MEMORY_BANK}  share_backbones: {CFG_SHARE_BACKBONES}  codec_mode: {CFG_CODEC_MODE} (channels_per_group={CFG_CODEC_CONV_CHANNELS_PER_GROUP})"
     )
     return (model_config,)
 
@@ -460,10 +470,9 @@ def _(
 ):
     from kairos.utils import count_active_parameters
 
-    pipe = KairosMultimodalPipeline(
+    pipe = KairosMultimodalPipeline.from_configs(
         model_config, data_config, train_config, eval_data_config=eval_data_config, tokenizer=tokenizer
     )
-    pipe.build()
 
     total_params = sum(p.numel() for p in pipe.model.parameters())
     active_params = count_active_parameters(
@@ -567,35 +576,24 @@ def _():
     OVERFIT_RUN = True  # sanity-check the model can memorize before the real run
     OVERFIT_EXAMPLES = 16  # tiny subset, repeated each epoch
     OVERFIT_STEPS = 200  # steps on that subset; loss should crash toward 0
-    return OVERFIT_EXAMPLES, OVERFIT_RUN, OVERFIT_STEPS
+    OVERFIT_LOG_EVERY = max(1, OVERFIT_STEPS // 20)  # print the loss this often, in addition to the progress bar
+    return OVERFIT_EXAMPLES, OVERFIT_LOG_EVERY, OVERFIT_RUN, OVERFIT_STEPS
 
 
 @app.cell
 def _(
     OVERFIT_EXAMPLES,
+    OVERFIT_LOG_EVERY,
     OVERFIT_RUN,
     OVERFIT_STEPS,
-    make_progress_callback,
     mo,
     pipe,
 ):
+    from kairos.runners import overfit_with_progress
+
     # walks whichever of the MAE / transition / diffusion stages are configured, proportionally
     if OVERFIT_RUN:
-        if mo.running_in_notebook():
-            with mo.status.progress_bar(total=OVERFIT_STEPS, title="overfit_test") as _bar:
-                pipe.overfit_test(
-                    n_examples=OVERFIT_EXAMPLES,
-                    steps=OVERFIT_STEPS,
-                    progress_callback=lambda step, total, loss_val: _bar.update(
-                        increment=1, subtitle=f"loss={loss_val:.4f}"
-                    ),
-                )
-        else:
-            pipe.overfit_test(
-                n_examples=OVERFIT_EXAMPLES,
-                steps=OVERFIT_STEPS,
-                progress_callback=make_progress_callback(desc="overfit_test"),
-            )
+        overfit_with_progress(pipe, OVERFIT_EXAMPLES, OVERFIT_STEPS, OVERFIT_LOG_EVERY, mo=mo)
     else:
         print("OVERFIT_RUN is False - skipping overfit test")
     return
@@ -608,68 +606,18 @@ def _():
 
 
 @app.cell
-def _(FORCE_RESTART, make_progress_callback, mo, pipe):
-    _resumed = not FORCE_RESTART and (pipe.ckpt_dir / "last.pt").exists()
-    if _resumed:
-        print(f"found last.pt in {pipe.ckpt_dir} - resuming")
-    elif FORCE_RESTART:
-        print("FORCE_RESTART is True - ignoring any existing checkpoint")
+def _(FORCE_RESTART, mo, pipe):
+    from kairos.runners import train_with_progress
 
-    # on multi-GPU, pipe.train itself spawns a torchrun job (flex + memory gate per rank)
-    # and replays its steps into the progress_callback; results come back into this pipe.
-    _total_steps = pipe.train_config.epochs * len(pipe.loader)
-
-    if mo.running_in_notebook():
-        with mo.status.progress_bar(total=_total_steps, title="training") as _bar:
-            _state = {"last_step": 0}
-
-            def _on_step(step, total, loss_val):
-                _bar.update(increment=step - _state["last_step"], subtitle=f"loss={loss_val:.4f}")
-                _state["last_step"] = step
-
-            def _on_phase(name):
-                _bar.update(increment=0, subtitle=name)
-
-            logs = pipe.train(progress_callback=_on_step, phase_callback=_on_phase, resume=not FORCE_RESTART)
-    else:
-        _cb = make_progress_callback()
-        logs = pipe.train(progress_callback=_cb, phase_callback=_cb.phase, resume=not FORCE_RESTART)
-
-    print(f"training complete - steps: {len(logs)}  best avg-epoch loss: {pipe.best_loss:.4f}")
-    print(f"skipped non-finite batches: {pipe.skipped_nonfinite_steps}")
-    if pipe.eval_log_rows:
-        print(f"eval points: {len(pipe.eval_log_rows)}  best eval loss: {pipe.best_eval_loss:.4f}")
-    print(f"checkpoints: {pipe.ckpt_dir}")
+    logs = train_with_progress(pipe, force_restart=FORCE_RESTART, mo=mo)
     return (logs,)
 
 
 @app.cell
-def _(eval_data_config, pipe, torch):
-    from kairos.dataset import KairosPretrainingDataset
-    from torch.utils.data import DataLoader
+def _(eval_data_config, pipe):
+    from kairos.runners import evaluate_and_log
 
-    if len(eval_data_config.multimodal_examples) == 0:
-        print("no eval examples - skipping")
-    else:
-        eval_dataset = KairosPretrainingDataset(
-            multimodal_examples=eval_data_config.multimodal_examples,
-            tokenizer=pipe.tokenizer,
-            max_len=eval_data_config.max_len,
-            stride=eval_data_config.stride,
-        )
-        eval_loader = DataLoader(eval_dataset, batch_size=eval_data_config.batch_size, shuffle=False)
-
-        pipe.model.eval()
-        losses = []
-        with torch.no_grad():
-            for batch in eval_loader:
-                batch = {k: v.to(pipe.device) for k, v in batch.items()}
-                with pipe._autocast():
-                    losses.append(pipe.hf_trainer.compute_loss(pipe.model, batch).item())
-        pipe.model.train()
-        eval_loss = sum(losses) / len(losses)
-        pipe.writer.add_scalar("eval/loss", eval_loss, pipe.global_step)
-        print(f"eval loss: {eval_loss:.4f} on {len(eval_dataset)} samples")
+    evaluate_and_log(pipe, eval_data_config)
     return
 
 
@@ -711,40 +659,23 @@ def _(
     text_examples,
     tokenizer,
 ):
-    # diffusion generation via KairosDiffusionGenerationMixin (HF EntropyBoundSampler + adaptive)
-    _rows = [
-        ex
-        for ex in eval_examples
-        if ex.get("modality") == "text"
-        and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
-    ]
-    if len(_rows) < GEN_N_EXAMPLES:
-        _rows = [
-            ex
-            for ex in text_examples
-            if ex.get("modality") == "text"
-            and len(tokenizer.encode(ex["text"], add_special_tokens=False)) > GEN_PROMPT_TOKENS
-        ]
-    _rows = _rows[:GEN_N_EXAMPLES]
+    from kairos.runners import run_generation_demo
 
-    for _i, _ex in enumerate(_rows, 1):
-        _ids = tokenizer.encode(_ex["text"], add_special_tokens=False)
-        _prompt = _ids[:GEN_PROMPT_TOKENS]
-        _full = pipe.generate(
-            _prompt,
-            max_new_tokens=GEN_MAX_NEW_TOKENS,
-            max_denoising_steps=GEN_DENOISING_STEPS,
-            entropy_bound=GEN_ENTROPY_BOUND,
-            t_min=GEN_T_MIN,
-            t_max=GEN_T_MAX,
-            seed=GEN_SEED + _i,
-        )
-        _gen = _full[GEN_PROMPT_TOKENS:]
-        _reference = _ids[GEN_PROMPT_TOKENS : GEN_PROMPT_TOKENS + GEN_MAX_NEW_TOKENS]
-        print(f"--- example {_i} ---")
-        print("prompt:    ", tokenizer.decode(_prompt, skip_special_tokens=True))
-        print("generated: ", tokenizer.decode(_gen, skip_special_tokens=True))
-        print("reference: ", tokenizer.decode(_reference, skip_special_tokens=True))
+    # diffusion generation via KairosDiffusionGenerationMixin (HF EntropyBoundSampler + adaptive)
+    run_generation_demo(
+        pipe,
+        tokenizer,
+        eval_examples,
+        text_examples,
+        GEN_PROMPT_TOKENS,
+        GEN_MAX_NEW_TOKENS,
+        GEN_DENOISING_STEPS,
+        GEN_ENTROPY_BOUND,
+        GEN_T_MIN,
+        GEN_T_MAX,
+        GEN_SEED,
+        GEN_N_EXAMPLES,
+    )
     return
 
 

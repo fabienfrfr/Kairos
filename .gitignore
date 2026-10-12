@@ -14,6 +14,11 @@ project_structure*
 # Jupyter is forbidden here (use marimo and export)
 #*.ipynb
 
+*.bbl
+*.blg
+*.fls
+*.out
+*.gz
 pdflatex*
 
 *.aux

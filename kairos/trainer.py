@@ -4,6 +4,27 @@ import torch
 import torch.nn.functional as F
 from transformers import Trainer
 
+from .modeling import KairosTopkRouter
+
+
+def update_moe_bias(model, update_rate: float) -> None:
+    """Nudges every KairosTopkRouter's correction bias toward equal expert load."""
+    inner = model.module if hasattr(model, "module") else model
+    for module in inner.modules():
+        if isinstance(module, KairosTopkRouter):
+            module.update_bias(update_rate)
+
+
+def collect_moe_aux_loss(model) -> torch.Tensor:
+    """Sums the Switch-style load-balancing term across all routers; 0 if none ran."""
+    inner = model.module if hasattr(model, "module") else model
+    losses = [
+        m.last_aux_loss for m in inner.modules() if isinstance(m, KairosTopkRouter) and m.last_aux_loss is not None
+    ]
+    if not losses:
+        return torch.tensor(0.0)
+    return torch.stack(losses).sum()
+
 
 def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0):
     """Random per-token mask + per-row rate p for the masked-diffusion objective.
@@ -31,6 +52,7 @@ def compute_masked_diffusion_losses(
     cache_params=None,
     reweight=True,
     self_conditioning_prob=0.0,
+    reweight_clip=None,
 ):
     """Noises ``x0`` on ``noise_mask``. With self_conditioning_prob>0, warms up with a no-grad
     pass and feeds its detached logits back in, matching generate()'s inference-time usage."""
@@ -78,6 +100,8 @@ def compute_masked_diffusion_losses(
     alpha = float(reweight)
     if alpha:
         weight = 1.0 + alpha * (1.0 / p[noise_mask] - 1.0)
+        if reweight_clip is not None:
+            weight = weight.clamp(max=reweight_clip)  # bounds gradient variance from rare low-p rows
         per_token_loss = per_token_loss * weight
     return per_token_loss, out.logits, out.octet_logits, octet_targets
 
@@ -120,6 +144,15 @@ def stage_mask_schedule(
     return p_max, reweight
 
 
+def stage_name_at(global_step: int, mae_steps: int, transition_steps: int) -> str:
+    """Names the curriculum stage `stage_mask_schedule` is in at `global_step`: mae/transition/diffusion."""
+    if global_step < mae_steps:
+        return "mae"
+    if global_step < mae_steps + transition_steps:
+        return "transition"
+    return "diffusion"
+
+
 class KairosDiffusionTrainer(Trainer):
     """Masked-diffusion loss: mask a random fraction of non-prompt tokens with noise and."""
 
@@ -127,9 +160,11 @@ class KairosDiffusionTrainer(Trainer):
     mask_eps: float = 1e-3  # floor of p ~ U(eps, p_max); CE/p makes rare low-p rows dominate
     mask_p_max: float = 1.0  # ceiling of p; 1.0 = full diffusion, cap for MAE-style corruption
     mask_reweight: bool = True  # divide CE by p; False for plain CE
+    mask_reweight_clip: float | None = 3.0  # caps 1/p weight; bounds variance from rare low-p rows
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
     # train-time self-conditioning rate; keep >0 so generate()'s usage isn't out-of-distribution.
     self_conditioning_prob: float = 0.5
+    moe_aux_loss_weight: float = 0.0  # classic Switch-style load-balancing loss weight; 0 disables
 
     def compute_loss(self, model, inputs, return_outputs=False, cache_params=None):
         x0 = inputs["input_ids"]
@@ -157,10 +192,13 @@ class KairosDiffusionTrainer(Trainer):
             cache_params,
             reweight=self.mask_reweight,
             self_conditioning_prob=self.self_conditioning_prob,
+            reweight_clip=self.mask_reweight_clip,
         )
         loss = per_token_loss.mean()
         if octet_logits is not None and octet_targets is not None:
             loss = loss + self.octet_loss_weight * F.cross_entropy(octet_logits, octet_targets)
+        if self.moe_aux_loss_weight:
+            loss = loss + self.moe_aux_loss_weight * collect_moe_aux_loss(model)
 
         if not torch.isfinite(loss):
             # capture context here (access to logits/inputs)
