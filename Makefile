@@ -2,6 +2,10 @@
 
 ENV_FILE=.env
 
+# Loads UV_PUBLISH_TOKEN (PyPI token) from .env if present; never committed
+-include $(ENV_FILE)
+export
+
 # ROCm (AMD) vs CUDA/CPU: auto-detect at build time.
 # Force with: make notebook ROCM=1   (or ROCM=0 for CUDA/CPU machines like Kaggle)
 ROCM ?= $(shell command -v rocm-smi >/dev/null 2>&1 && echo 1 || echo 0)
@@ -29,7 +33,9 @@ build: ## Build sdist + wheel into dist/
 	rm -rf dist/
 	uv build
 
-publish: ## Real publishing happens via CI on tag push (see .github/workflows/publish.yml); this is a manual/local fallback only
+publish: ## Manual PyPI publish; needs UV_PUBLISH_TOKEN in env or .env (CI uses OIDC on tag push)
+	@test -n "$(UV_PUBLISH_TOKEN)" || { echo "UV_PUBLISH_TOKEN missing: set it in $(ENV_FILE) (see .env.example)"; exit 1; }
+	rm -rf dist/
 	uv build
 	uv run --with twine twine check dist/*
 	uv publish
