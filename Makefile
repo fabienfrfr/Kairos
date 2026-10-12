@@ -2,6 +2,9 @@
 
 ENV_FILE=.env
 
+# Release version = exact git tag on HEAD (empty if untagged): published wheels never carry .dev
+TAG := $(shell git describe --tags --exact-match 2>/dev/null)
+
 # Loads UV_PUBLISH_TOKEN (PyPI token) from .env if present; never committed
 -include $(ENV_FILE)
 export
@@ -33,10 +36,13 @@ build: ## Build sdist + wheel into dist/
 	rm -rf dist/
 	uv build
 
-publish: ## Manual PyPI publish; needs UV_PUBLISH_TOKEN in env or .env (CI uses OIDC on tag push)
+publish: ## Manual PyPI publish from a clean, tagged commit (v*.*.*); needs UV_PUBLISH_TOKEN (env or .env)
 	@test -n "$(UV_PUBLISH_TOKEN)" || { echo "UV_PUBLISH_TOKEN missing: set it in $(ENV_FILE) (see .env.example)"; exit 1; }
+	@test -n "$(TAG)" || { echo "HEAD is not on a release tag (v*.*.*): refusing to publish a .dev version"; exit 1; }
+	@git diff --quiet HEAD || { echo "Working tree is dirty: commit or stash before publishing"; exit 1; }
 	rm -rf dist/
-	uv build
+	SETUPTOOLS_SCM_PRETEND_VERSION=$(TAG:v%=%) uv build
+	@! ls dist | grep -q '\.dev' || { echo "dev version found in dist/: aborting"; exit 1; }
 	uv run --with twine twine check dist/*
 	uv publish
 

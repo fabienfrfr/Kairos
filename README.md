@@ -109,11 +109,6 @@ comparison with Pythia-14M.
 | `docs/paper/` | LaTeX source of the preprint |
 | `docs/experiments/` | Ablation logs and paper audits |
 
-## Release
-
-CI publishes to PyPI on `v*.*.*` tags (OIDC). Manual fallback: copy `.env.example` to `.env`, set
-`UV_PUBLISH_TOKEN`, run `make publish`.
-
 ## References
 
 * Furfaro, *Kairos: Toward a Byte-Level Foundation Model for Every Modality* ([arXiv:2610.12495](https://arxiv.org/abs/2610.12495))
