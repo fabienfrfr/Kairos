@@ -79,7 +79,8 @@ def _make(work: Path, *args: str):
 @pytest.mark.skipif(_MAKE is None or shutil.which("git") is None, reason="make/git missing")
 def test_publish_refuses_untagged_commit(tmp_path):
     out = _make(_repo(tmp_path, None), "publish")
-    assert "not on a release tag" in out.stdout
+    assert "Usage: make publish v0.X.X" in out.stdout
+    assert "git fetch --tags" in out.stdout
     assert "uv build" not in out.stdout
 
 
@@ -99,3 +100,29 @@ def test_release_docs_live_outside_readme():
     readme = (_ROOT / "README.md").read_text(encoding="utf-8")
     assert "make publish" not in readme
     assert "make publish" in (_ROOT / "docs" / "RELEASING.md").read_text(encoding="utf-8")
+
+
+def test_release_dispatches_publish_workflow():
+    wf = _ROOT / ".github" / "workflows"
+    release = (wf / "release.yml").read_text(encoding="utf-8")
+    publish = (wf / "publish.yml").read_text(encoding="utf-8")
+    assert "gh workflow run publish.yml --ref" in release
+    assert "actions: write" in release
+    assert "workflow_dispatch" in publish
+    assert 'github.ref_type }}" = "tag"' in publish
+
+
+@pytest.mark.skipif(_MAKE is None or shutil.which("git") is None, reason="make/git missing")
+def test_publish_accepts_version_argument(tmp_path):
+    work = _repo(tmp_path, "v1.2.3")
+    _git(work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "later")
+    out = _make(work, "-n", "publish", "v1.2.3")
+    assert "git worktree add --detach .publish-src v1.2.3" in out.stdout
+    assert "SETUPTOOLS_SCM_PRETEND_VERSION=1.2.3 uv build" in out.stdout
+
+
+@pytest.mark.skipif(_MAKE is None or shutil.which("git") is None, reason="make/git missing")
+def test_publish_unknown_tag_fails_before_build(tmp_path):
+    out = _make(_repo(tmp_path, "v1.2.3"), "publish", "v9.9.9")
+    assert "Tag v9.9.9 not found" in out.stdout
+    assert "uv build" not in out.stdout

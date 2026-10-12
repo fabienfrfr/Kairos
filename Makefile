@@ -2,8 +2,12 @@
 
 ENV_FILE=.env
 
-# Release version = exact git tag on HEAD (empty if untagged): published wheels never carry .dev
-TAG := $(shell git describe --tags --exact-match 2>/dev/null)
+# `make publish v0.X.X` publishes that tag; without it, the tag exactly on HEAD (never a .dev version)
+VERSION_ARG := $(firstword $(filter v%,$(MAKECMDGOALS)))
+ifneq ($(VERSION_ARG),)
+$(VERSION_ARG): ; @:
+endif
+TAG := $(or $(VERSION_ARG),$(shell git describe --tags --exact-match 2>/dev/null))
 
 # Loads UV_PUBLISH_TOKEN (PyPI token) from .env if present; never committed
 -include $(ENV_FILE)
@@ -36,12 +40,15 @@ build: ## Build sdist + wheel into dist/
 	rm -rf dist/
 	uv build
 
-publish: ## Manual PyPI publish from a clean, tagged commit (v*.*.*); needs UV_PUBLISH_TOKEN (env or .env)
+publish: ## Manual PyPI publish: make publish v0.X.X (or on a tagged HEAD); needs UV_PUBLISH_TOKEN (env or .env)
 	@test -n "$(UV_PUBLISH_TOKEN)" || { echo "UV_PUBLISH_TOKEN missing: set it in $(ENV_FILE) (see .env.example)"; exit 1; }
-	@test -n "$(TAG)" || { echo "HEAD is not on a release tag (v*.*.*): refusing to publish a .dev version"; exit 1; }
-	@git diff --quiet HEAD || { echo "Working tree is dirty: commit or stash before publishing"; exit 1; }
-	rm -rf dist/
-	SETUPTOOLS_SCM_PRETEND_VERSION=$(TAG:v%=%) uv build
+	@test -n "$(TAG)" || { echo "Usage: make publish v0.X.X (HEAD is not on a release tag; try git fetch --tags)"; exit 1; }
+	@git rev-parse -q --verify "refs/tags/$(TAG)" >/dev/null || { echo "Tag $(TAG) not found: git fetch --tags"; exit 1; }
+	git worktree prune
+	rm -rf dist/ .publish-src/
+	git worktree add --detach .publish-src $(TAG)
+	cd .publish-src && SETUPTOOLS_SCM_PRETEND_VERSION=$(TAG:v%=%) uv build --out-dir ../dist
+	git worktree remove --force .publish-src
 	@! ls dist | grep -q '\.dev' || { echo "dev version found in dist/: aborting"; exit 1; }
 	uv run --with twine twine check dist/*
 	uv publish
