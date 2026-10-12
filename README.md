@@ -74,6 +74,15 @@ make test                    # pytest
 
 Example configs live in `configs/` (ablation configs in `configs/ablations/`).
 
+**One-command pretraining** (model, data and Hub target all come from `configs/pretrain.yaml`):
+
+```bash
+echo "HF_TOKEN=hf_..." > .env
+make pretrain NAME=d64-e7          # HF datasets -> train -> push to ffurfaro/kairos under d64-e7/
+make pretrain ARGS="--no-push"      # train only
+make pretrain ARGS="--set hf_data.text_pct=1"   # quick dev run
+```
+
 Fused DeltaNet / causal-conv1d kernels are optional (pure-PyTorch fallback otherwise):
 
 * NVIDIA/CUDA: `uv sync --extra fast-attn`.

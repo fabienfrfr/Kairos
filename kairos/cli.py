@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Annotated
 
@@ -11,9 +12,11 @@ import typer
 from .diagnostics import REGIMES
 from .diagnostics import format_report as _format_moe_report
 from .diagnostics import run as _run_moe_bias_check
+from .hf_data import load_hf_examples
 from .modeling import KairosConfig
 from .pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 from .runners import evaluate_and_log, overfit_with_progress, run_generation_demo, train_with_progress
+from .tokenizer import KairosTokenizer
 
 app = typer.Typer(add_completion=False, help="Launch KairosFM training/eval/generation from a config file.")
 
@@ -40,14 +43,50 @@ def _looks_like_json(value: str) -> bool:
     return value.lower() in ("true", "false", "null") or value.lstrip("-").replace(".", "", 1).isdigit()
 
 
-def build_pipeline(config: Path, overrides: list[str] | None = None) -> KairosMultimodalPipeline:
-    """Loads a YAML/JSON config file, applies overrides, builds and returns a ready pipeline."""
-    cfg = _apply_overrides(_load_raw_config(config), overrides or [])
-    model_config = KairosConfig(**cfg.get("model", {}))
-    data_config = DataConfig(**cfg.get("data", {}))
-    train_config = TrainConfig(**cfg.get("train", {}))
+def _model_kwargs(model: dict) -> dict:
+    """Int-keys `modality_scales` (JSON/YAML strings) and defaults `vocab_size` to the tokenizer's."""
+    model = dict(model)
+    if "modality_scales" in model:
+        model["modality_scales"] = {int(k): v for k, v in model["modality_scales"].items()}
+    model.setdefault("vocab_size", len(KairosTokenizer()))
+    return model
+
+
+def _data_configs(cfg: dict) -> tuple[DataConfig, DataConfig | None]:
+    """Builds (train, eval) DataConfig, filling examples from the optional `hf_data` section."""
+    data = dict(cfg.get("data", {}))
     eval_cfg = cfg.get("eval_data")
-    eval_data_config = DataConfig(**eval_cfg) if eval_cfg else None
+    if cfg.get("hf_data"):
+        train_ex, eval_ex = load_hf_examples(cfg["hf_data"])
+        eval_base = {k: v for k, v in data.items() if k != "pack"}
+        data.update(multimodal_examples=train_ex, text_examples=[])
+        if eval_ex:
+            eval_cfg = {**eval_base, "multimodal_examples": eval_ex, "shuffle": False, "drop_last": False}
+    return DataConfig(**data), DataConfig(**eval_cfg) if eval_cfg else None
+
+
+_RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _apply_run_name(cfg: dict, name: str) -> dict:
+    """Points train.run_dir and train.hub_subfolder at `name`, a sibling of the configured run_dir."""
+    train = cfg.setdefault("train", {})
+    default = TrainConfig.__dataclass_fields__["run_dir"].default
+    train["run_dir"] = str(Path(train.get("run_dir", default)).parent / name)
+    train["hub_subfolder"] = name
+    return cfg
+
+
+def build_pipeline(
+    config: Path, overrides: list[str] | None = None, run_name: str | None = None
+) -> KairosMultimodalPipeline:
+    """Loads a YAML/JSON config file, applies overrides and run name, builds and returns a ready pipeline."""
+    cfg = _apply_overrides(_load_raw_config(config), overrides or [])
+    if run_name:
+        cfg = _apply_run_name(cfg, run_name)
+    model_config = KairosConfig(**_model_kwargs(cfg.get("model", {})))
+    data_config, eval_data_config = _data_configs(cfg)
+    train_config = TrainConfig(**cfg.get("train", {}))
     return KairosMultimodalPipeline.from_configs(model_config, data_config, train_config, eval_data_config)
 
 
@@ -64,6 +103,27 @@ def train(
     """Runs a full training loop, resuming from run_dir/last.pt unless --force-restart is set."""
     pipe = build_pipeline(config, set_ or [])
     train_with_progress(pipe, force_restart=force_restart, mo=None)
+
+
+@app.command()
+def pretrain(
+    config: ConfigArg,
+    force_restart: Annotated[bool, typer.Option(help="Ignore any existing checkpoint in run_dir.")] = False,
+    push: Annotated[bool, typer.Option(help="Push the full model to train.hub_repo_id when training ends.")] = True,
+    name: Annotated[
+        str | None, typer.Option(help="Run name: checkpoints/<name> locally, <name>/ in the Hub repo.")
+    ] = None,
+    set_: OverrideOpt = None,
+) -> None:
+    """One-shot pretraining: loads the config's data (HF included), trains, then pushes the model to the Hub."""
+    if name and not _RUN_NAME.match(name):
+        raise typer.BadParameter("use letters, digits, '.', '_' or '-' only", param_hint="--name")
+    pipe = build_pipeline(config, set_ or [], run_name=name)
+    train_with_progress(pipe, force_restart=force_restart, mo=None)
+    repo = pipe.train_config.hub_repo_id
+    if push and repo:
+        pipe.push_to_hub(repo, private=pipe.train_config.hub_private)
+        typer.echo(f"pushed to https://huggingface.co/{repo}")
 
 
 @app.command()

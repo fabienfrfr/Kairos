@@ -1416,8 +1416,9 @@ class KairosMultimodalPipeline:
 
     def _try_resume_from_hub(self, repo_id: str):
         # best-effort: no checkpoint on the repo
+        prefix = f"{self.train_config.hub_subfolder}/" if self.train_config.hub_subfolder else ""
         try:
-            return self.load_checkpoint_from_hub(repo_id)
+            return self.load_checkpoint_from_hub(repo_id, f"{prefix}checkpoints/last.pt")
         except Exception:  # noqa: BLE001 — no hub checkpoint yet, start fresh
             return None
 
