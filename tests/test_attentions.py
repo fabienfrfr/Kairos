@@ -156,7 +156,7 @@ def test_swa_linear_complexity():
     cfg = Cfg()
     attn = KairosAttention(cfg)
     rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
-    # Fixed window => O(L); median-of-9 wall-clock trials, generous ratio bound (avoids CI flakiness).
+    # Fixed window => O(L); min-of-9 trials (contention only adds time), generous ratio bound.
     lengths = [256, 512, 1024]
     n_trials = 9
     reps = 50
@@ -173,7 +173,7 @@ def test_swa_linear_complexity():
                 attn(x, cos_sin)
             samples.append((time.perf_counter() - start) / reps * 1000)
         samples.sort()
-        return samples[len(samples) // 2]  # median: robust to noise
+        return samples[0]  # min: contention on shared CI runners only ever adds time
 
     times = [bench(length) for length in lengths]
     floor_ms = 0.05  # floors sub-noise timings so tiny absolute values don't inflate the ratio
@@ -697,6 +697,7 @@ def test_current_backend_is_eager_on_cpu():
     assert ATTN_IMPL == "eager"
 
 
+@pytest.mark.slow
 def test_kairos_attn_backend_eager_override(tmp_path):
     # KAIROS_ATTN_BACKEND=eager must force eager regardless of CUDA.
     script = tmp_path / "check_backend.py"

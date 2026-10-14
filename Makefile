@@ -25,13 +25,16 @@ endif
 # --- Feature ---
 
 coverage: ## prod-level > 95%
-	uv run pytest --cov=kairos --cov-report=term-missing
+	uv run pytest --runslow --cov=kairos --cov-report=term-missing
 
 test: ## Run the test suite
 	uv run pytest -q
 
 converge: ## Converge tests (-s for stdout : take print)
-	uv run pytest tests/test_pipeline.py -k "converg" -v -s
+	uv run pytest tests/test_pipeline.py -k "converg" --runslow -v -s
+
+test-slow: ## Run only the slow tests (all tests over ~5 s)
+	uv run pytest -m slow -v
 
 lint: ## Check code style
 	uv run ruff check .

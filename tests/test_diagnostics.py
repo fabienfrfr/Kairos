@@ -1,8 +1,11 @@
 import math
 
+import pytest
+
 from kairos.diagnostics import REGIMES, format_report, run
 
 
+@pytest.mark.slow
 def test_run_returns_finite_losses_and_expert_usage_for_each_regime():
     for regime in REGIMES:
         losses, usage = run(regime, bias_update_rate=1e-3, steps=2, num_local_experts=4)

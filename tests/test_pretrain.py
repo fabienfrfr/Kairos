@@ -188,6 +188,7 @@ def test_minimal_yaml_builds_valid_configs_with_inline_data():
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_minimal_config_trains_end_to_end_on_cpu(tmp_path):
     args = ["pretrain", str(_ROOT / "kairos" / "configs" / "minimal.yaml"), "--no-push"]
     for key, value in {

@@ -738,6 +738,7 @@ def test_diffusion_trainer_backward(config):
     assert any(g is not None for g in grads)
 
 
+@pytest.mark.slow
 def test_model_overfits_a_tiny_batch_without_collapsing_to_noise(config):
     # Convergence sanity check: on a handful of fixed, repeated sequences the model must both
     # (a) drive the MAE-style loss well below the "predicting uniformly at random" baseline
@@ -810,6 +811,7 @@ def test_dataset_with_text(tokenizer, mini_wiki_texts):
 
 
 @pytest.mark.integration
+@pytest.mark.slow
 def test_dataset_with_wikitext(tokenizer):
     from datasets import load_dataset
 

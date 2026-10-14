@@ -116,7 +116,8 @@ local_scheme = "no-local-version"
 [tool.pytest.ini_options]
 pythonpath = ["."]
 markers = [
-  "integration"
+  "integration",
+  "slow: tests over ~5 s (convergence, compile, e2e), skipped unless --runslow or -m slow",
 ]
 
 
@@ -129,7 +130,7 @@ dev = [
     "mwparserfromhell>=0.7.2",
     "pytest>=8.4.2",
     "pytest-cov>=7.1.0",
-    "ruff>=0.16.5",
+    "ruff>=0.16.5,<0.18",
 ]
 # scripts/ (dataset builders): `uv sync --group scripts` to install
 scripts = [

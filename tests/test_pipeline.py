@@ -319,6 +319,7 @@ def test_build_leaves_compile_threads_untouched_without_cuda(
     assert torch._inductor.config.compile_threads == 8
 
 
+@pytest.mark.slow
 def test_build_and_train_actually_compile_on_cpu_when_forced(
     tmp_path, model_config, text_examples, multimodal_examples, monkeypatch
 ):
@@ -476,6 +477,7 @@ def test_build_loader_num_workers_matches_capped_value(tmp_path, model_config, t
     assert pipe.loader.num_workers == 0
 
 
+@pytest.mark.slow
 def test_training_converges_with_moe_enabled(tmp_path):
     # regression: use_moe=True used to NaN or block convergence; keep MoE small here
     model_config = KairosConfig(
@@ -496,6 +498,7 @@ def test_training_converges_with_moe_enabled(tmp_path):
     assert last_epochs_avg < first_epochs_avg
 
 
+@pytest.mark.slow
 def test_training_converges_with_attnres_block_size_four(tmp_path):
     # cover attnres_block_size=4 (defaults to 1 elsewhere)
     model_config = KairosConfig(d_model=64, n_heads=4, n_layers=3, attnres_block_size=4)
@@ -511,6 +514,7 @@ def test_training_converges_with_attnres_block_size_four(tmp_path):
     assert all(math.isfinite(row["loss"]) for row in logs)
 
 
+@pytest.mark.slow
 def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
     # regression: the exact MoE + attnres_block_size combination the user reported
     model_config = KairosConfig(
@@ -537,6 +541,7 @@ def test_training_converges_with_moe_and_attnres_block_size_four(tmp_path):
     assert last_epochs_avg < first_epochs_avg
 
 
+@pytest.mark.slow
 def test_training_converges_at_realistic_width_shallow_depth(tmp_path):
     # full-width (d_model=768) but trimmed batch/epochs/seq-len to stay fast in CI
     model_config = KairosConfig(d_model=768, n_heads=12, n_layers=2)
@@ -645,6 +650,7 @@ def test_memory_gate_blends_state_t_with_external_bank(tmp_path):
     assert all(math.isfinite(row["loss"]) for row in logs)
 
 
+@pytest.mark.slow
 def test_training_converges_on_easy_repeated_text(tmp_path, model_config):
     # a small, highly repetitive corpus should converge fast
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog"}] * 8
@@ -772,6 +778,7 @@ def test_train_epochs_shortcut_uses_target_mask_values_from_step_zero(
     assert pipe.hf_trainer.mask_reweight == 1.0  # continuous blend factor now, not a bool identity
 
 
+@pytest.mark.slow
 def test_train_single_pipeline_moves_through_mae_transition_diffusion_stages(
     tmp_path, model_config, text_examples, multimodal_examples
 ):
@@ -846,6 +853,7 @@ def test_train_zero_transition_epochs_jumps_straight_from_mae_to_diffusion(
     assert all(v == pytest.approx(1.0) for v in seen_p_max[steps_per_epoch:])
 
 
+@pytest.mark.slow
 def test_train_resume_mid_curriculum_recovers_correct_stage(tmp_path, model_config, text_examples, multimodal_examples):
     """Resuming from a checkpoint taken mid-curriculum must land in the right stage automatically
     — the stage is a pure function of the persisted global_step, not of which pipeline/stage
@@ -1477,23 +1485,23 @@ def test_save_async_write_completes_after_flush(built_pipeline, tmp_path):
 
 
 def test_async_save_does_not_block_caller(built_pipeline, tmp_path, monkeypatch):
-    """Regression test: wait=False must return immediately, not block on a slow write."""
-    import time
+    """Regression test: wait=False must return while the write is still parked (no wall-clock)."""
+    import threading
 
+    release = threading.Event()
     real_save = torch.save
 
-    def _slow_save(payload, path):
-        time.sleep(0.3)
+    def _parked_save(payload, path):
+        release.wait(timeout=30)
         real_save(payload, path)
 
-    monkeypatch.setattr(torch, "save", _slow_save)
+    monkeypatch.setattr(torch, "save", _parked_save)
     path = tmp_path / "slow.pt"
 
-    start = time.monotonic()
     built_pipeline._save(path, loss_val=0.5, epoch=1, wait=False)
-    elapsed = time.monotonic() - start
 
-    assert elapsed < 0.2  # returned well before the 0.3s write finished
+    assert not path.exists()  # returned before the writer thread could finish
+    release.set()
     built_pipeline._flush_checkpoint_writes()
     assert path.exists()
 
@@ -1510,6 +1518,7 @@ def test_flush_checkpoint_writes_reraises_background_failure(built_pipeline, tmp
         built_pipeline._flush_checkpoint_writes()
 
 
+@pytest.mark.slow
 def test_train_flushes_pending_checkpoint_before_hub_push(tmp_path, model_config, text_examples, monkeypatch):
     """train() must flush the async last.pt write before the hub push reads it."""
     monkeypatch.setattr("huggingface_hub.HfApi.create_repo", lambda self, repo_id, **kw: None)
@@ -1565,6 +1574,7 @@ def test_build_creates_hub_repo_when_configured(tmp_path, model_config, text_exa
     assert calls == [("me/kairos-test", {"private": False, "exist_ok": True})]
 
 
+@pytest.mark.slow
 def test_train_pushes_checkpoints_to_hub_at_save_every(tmp_path, model_config, text_examples, monkeypatch):
     monkeypatch.setattr("huggingface_hub.HfApi.create_repo", lambda self, repo_id, **kw: None)
     pushed = []
@@ -1585,6 +1595,7 @@ def test_train_pushes_checkpoints_to_hub_at_save_every(tmp_path, model_config, t
     assert any("step_" in p for p in pushed)
 
 
+@pytest.mark.slow
 def test_train_does_not_push_when_hub_push_disabled(built_pipeline, monkeypatch):
     pushed = []
     monkeypatch.setattr("huggingface_hub.HfApi.upload_file", lambda self, **kw: pushed.append(kw))
@@ -2001,6 +2012,7 @@ def test_last_ckpt_not_written_every_step(built_pipeline, monkeypatch):
     assert last_pt_saves <= built_pipeline.train_config.epochs
 
 
+@pytest.mark.slow
 def test_train_logs_periodic_eval_loss(tmp_path, model_config):
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 8
     eval_texts = [{"modality": "text", "text": "a completely different held-out sentence " * 8}] * 4
@@ -2030,6 +2042,7 @@ def test_train_logs_periodic_eval_loss(tmp_path, model_config):
 
 
 # --------------------------------------------------------- fractional-epoch eval cadence
+@pytest.mark.slow
 def test_eval_every_epochs_default_runs_seven_times_over_full_curriculum(tmp_path, model_config):
     """Default cadence: eval at step 0, then every 0.5 epoch. mae+transition+diffusion=3
     epochs by default -> 6 periodic evals + 1 at start = 7."""
@@ -2120,6 +2133,7 @@ def test_overfit_test_log_every_zero_stays_silent(tmp_path, model_config, capsys
     assert "step " not in out  # only the final one-line summary should print, not per-step lines
 
 
+@pytest.mark.slow
 def test_overfit_test_drives_loss_down_and_restores_state(tmp_path, model_config):
     texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
     data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)

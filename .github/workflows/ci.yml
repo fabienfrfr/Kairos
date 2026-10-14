@@ -5,9 +5,15 @@ on:
     branches: ["**"] # every branch, not just main
   pull_request: # also covers fork PRs, which "push" alone can't see
 
+env:
+  PYTHONHASHSEED: "0" # stable set/dict ordering across runs
+  TOKENIZERS_PARALLELISM: "false" # no fork-after-parallelism warnings or hangs
+  HF_HUB_DISABLE_TELEMETRY: "1"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
@@ -16,6 +22,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
