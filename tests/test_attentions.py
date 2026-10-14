@@ -2,7 +2,6 @@ import importlib
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -144,7 +143,7 @@ def test_swa_determinism():
     assert torch.allclose(out1, out2, atol=1e-5)
 
 
-def test_swa_linear_complexity():
+def test_swa_linear_complexity(monkeypatch):
     class Cfg:
         hidden_size = 32
         num_attention_heads = 4
@@ -156,31 +155,22 @@ def test_swa_linear_complexity():
     cfg = Cfg()
     attn = KairosAttention(cfg)
     rope = KairosRotaryEmbedding(cfg, cfg.hidden_size // cfg.num_attention_heads)
-    # Fixed window => O(L); min-of-9 trials (contention only adds time), generous ratio bound.
-    lengths = [256, 512, 1024]
-    n_trials = 9
-    reps = 50
+    seen = []
+    real_softmax = torch.softmax
 
-    def bench(L):
-        x = torch.randn(1, L, 32)
-        cos_sin = rope(x, torch.arange(L).unsqueeze(0))
-        for _ in range(10):
-            attn(x, cos_sin)
-        samples = []
-        for _ in range(n_trials):
-            start = time.perf_counter()
-            for _ in range(reps):
-                attn(x, cos_sin)
-            samples.append((time.perf_counter() - start) / reps * 1000)
-        samples.sort()
-        return samples[0]  # min: contention on shared CI runners only ever adds time
+    def spy(scores, *args, **kwargs):
+        seen.append(tuple(scores.shape))
+        return real_softmax(scores, *args, **kwargs)
 
-    times = [bench(length) for length in lengths]
-    floor_ms = 0.05  # floors sub-noise timings so tiny absolute values don't inflate the ratio
-    times = [max(t, floor_ms) for t in times]
-    r1 = times[1] / times[0]
-    r2 = times[2] / times[1]
-    assert r1 < 4.5 and r2 < 4.5, f"non-linear scaling suspected: times={times} ms, ratios=({r1:.2f}, {r2:.2f})"
+    monkeypatch.setattr(torch, "softmax", spy)
+    for length in (256, 512, 1024):
+        x = torch.randn(1, length, 32)
+        attn(x, rope(x, torch.arange(length).unsqueeze(0)))
+
+    # Fixed window => each query scores 2w+1 keys whatever L is, so work is O(L), never O(L^2).
+    assert len(seen) == 3
+    assert all(shape[-1] == 2 * cfg.sliding_window_size + 1 for shape in seen), seen
+    assert [shape[1] for shape in seen] == [256, 512, 1024]
 
 
 def get_deltanet_model():

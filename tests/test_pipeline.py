@@ -23,6 +23,12 @@ from kairos.tokenizer import Modality
 from kairos.utils import TrainingSummary, count_parameters
 
 
+@pytest.fixture(autouse=True)
+def _cuda_build_without_hip(monkeypatch):
+    # amp tests simulate NVIDIA GPUs; a ROCm torch build (hip set) must not change their outcome
+    monkeypatch.setattr(torch.version, "hip", None)
+
+
 def make_example(modality, caption=None, source="test", **fields):
     """Build a generic-schema row: numpy-array fields go into `data`, everything else into."""
     arrays = {k: v for k, v in fields.items() if isinstance(v, np.ndarray)}
