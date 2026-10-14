@@ -1,0 +1,27 @@
+# Offline CPU smoke run (~1 min): kairos pretrain minimal --no-push
+model:
+  d_model: 32
+  n_heads: 2
+  n_layers: 1
+  use_moe: false
+  attn_type: vanilla
+  codec_mode: patch
+
+data:
+  text_examples:
+    - {modality: text, text: "the quick brown fox jumps over the lazy dog "}
+    - {modality: text, text: "pack my box with five dozen liquor jugs "}
+    - {modality: text, text: "how vexingly quick daft zebras jump "}
+    - {modality: text, text: "sphinx of black quartz judge my vow "}
+  max_len: 64
+  batch_size: 4
+  num_workers: 0
+
+train:
+  lr: 3.0e-3
+  mae_epochs: 100
+  transition_epochs: 100
+  diffusion_epochs: 200
+  compile_model: false
+  save_every: 1000
+  run_dir: checkpoints/minimal

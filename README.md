@@ -66,22 +66,22 @@ has not been instantiated or trained.
 ## Quick start
 
 ```bash
-uv sync --group dev          # dev tools
-uv sync --extra cli          # `kairos` command (train, overfit, evaluate, generate)
-uv run kairos --help
-make test                    # pytest
+uv add kairos-fm                                  # from PyPI
+export HF_TOKEN=hf_...                            # to read the datasets and push the model
+uv run kairos pretrain minimal --no-push          # offline CPU smoke test (4 sentences, ~1 min)
+uv run kairos pretrain pretrain --name d64-e7     # HF datasets -> train -> push to the Hub under d64-e7/
 ```
 
-Example configs live in `configs/` (ablation configs in `configs/ablations/`).
-
-**One-command pretraining** (model, data and Hub target all come from `configs/pretrain.yaml`):
+`minimal` and `pretrain` are configs shipped with the package. To change the model, data or Hub target, export one,
+edit it and pass the file:
 
 ```bash
-echo "HF_TOKEN=hf_..." > .env
-make pretrain NAME=d64-e7          # HF datasets -> train -> push to ffurfaro/kairos under d64-e7/
-make pretrain ARGS="--no-push"      # train only
-make pretrain ARGS="--set hf_data.text_pct=1"   # quick dev run
+uv run kairos init-config pretrain -o my.yaml
+uv run kairos pretrain my.yaml --name my-run --set train.lr=3e-4
 ```
+
+Other commands: `train`, `overfit`, `evaluate`, `generate`, `moe-bias-check` (see `kairos --help`). Ablation configs
+live in the repository under `configs/ablations/`.
 
 Fused DeltaNet / causal-conv1d kernels are optional (pure-PyTorch fallback otherwise):
 

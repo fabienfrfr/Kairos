@@ -2297,3 +2297,14 @@ def test_preview_tokenized_runs_without_raising(built_pipeline, monkeypatch):
     monkeypatch.setattr(plt, "show", lambda: None)
     built_pipeline.preview_tokenized(n=3, split="train")
     built_pipeline.preview_tokenized(n=2, modality="control", split="train")
+
+
+def test_train_raises_clear_error_when_dataset_is_smaller_than_one_batch(tmp_path, model_config, text_examples):
+    data_config = DataConfig(text_examples=text_examples[:1], max_len=64, batch_size=64, drop_last=True)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"))
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+
+    pipe.build()
+
+    with pytest.raises(ValueError, match="no training batch"):
+        pipe.train()

@@ -33,6 +33,8 @@ dependencies = [
     "tensorboard>=2.19.0",
     "torch>=2.10.0",
     "transformers>=5.15.0", # mandatory for gemma
+    "typer>=0.15",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -65,11 +67,8 @@ fast-attn-rocm = [
     "flash-linear-attention[rocm]>=0.5.1",
     "causal-conv1d>=1.4.0",
 ]
-# `pip install -e ".[cli]"` — everything the `kairos` command-line entry point needs
-cli = [
-    "typer>=0.15",
-    "pyyaml>=6.0",
-]
+# kept so `pip install "kairos-fm[cli]"` keeps working: typer and pyyaml are core dependencies now
+cli = []
 
 [project.scripts]
 kairos = "kairos.cli:app"
@@ -107,7 +106,7 @@ url = "https://stable.repo.amd.com/rocm/whl-next/"
 packages = ["kairos", "kairos.templates"]
 
 [tool.setuptools.package-data]
-kairos = ["templates/*.md"]
+kairos = ["templates/*.md", "configs/*.yaml"]
 
 [tool.setuptools_scm]
 version_file = "kairos/_version.py"

@@ -1,5 +1,6 @@
 """Tests for README arXiv badge and the token-driven `make publish` target."""
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -126,3 +127,11 @@ def test_publish_unknown_tag_fails_before_build(tmp_path):
     out = _make(_repo(tmp_path, "v1.2.3"), "publish", "v9.9.9")
     assert "Tag v9.9.9 not found" in out.stdout
     assert "uv build" not in out.stdout
+
+
+def test_cli_doc_lists_every_registered_command():
+    doc = (_ROOT / "docs" / "CLI.md").read_text(encoding="utf-8")
+    source = (_ROOT / "kairos" / "cli.py").read_text(encoding="utf-8")
+    commands = re.findall(r"@app.command\(\)\ndef (\w+)", source)
+    assert commands
+    assert [c for c in commands if c.replace("_", "-") not in doc] == []

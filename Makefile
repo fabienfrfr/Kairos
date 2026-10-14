@@ -57,7 +57,7 @@ notebook: ## Working test
 	uv run $(UV_TORCH_EXTRA) marimo edit notebook/kairos_pretraining.py
 
 pretrain: ## Full pretraining: HF data -> train -> push to HF (NAME=run-name, CONFIG=..., ARGS="--no-push")
-	uv run --extra cli $(UV_TORCH_EXTRA) kairos pretrain $(or $(CONFIG),configs/pretrain.yaml) $(if $(NAME),--name $(NAME),) $(ARGS)
+	uv run $(UV_TORCH_EXTRA) kairos pretrain $(or $(CONFIG),pretrain) $(if $(NAME),--name $(NAME),) $(ARGS)
 
 jupyter: ## If you want to use Kaggle T4x2
 	uv run $(UV_TORCH_EXTRA) marimo check --fix notebook/kairos_pretraining.py

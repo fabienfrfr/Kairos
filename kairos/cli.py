@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
 
@@ -40,7 +41,12 @@ def _apply_overrides(cfg: dict, overrides: list[str]) -> dict:
 
 
 def _looks_like_json(value: str) -> bool:
-    return value.lower() in ("true", "false", "null") or value.lstrip("-").replace(".", "", 1).isdigit()
+    """True for JSON scalars (3, 1.5, 3e-4, true, null) and JSON lists/objects; plain strings stay strings."""
+    try:
+        json.loads(value)
+    except ValueError:
+        return False
+    return not value.startswith('"')
 
 
 def _model_kwargs(model: dict) -> dict:
@@ -59,7 +65,8 @@ def _data_configs(cfg: dict) -> tuple[DataConfig, DataConfig | None]:
     if cfg.get("hf_data"):
         train_ex, eval_ex = load_hf_examples(cfg["hf_data"])
         eval_base = {k: v for k, v in data.items() if k != "pack"}
-        data.update(multimodal_examples=train_ex, text_examples=[])
+        if train_ex:
+            data.update(multimodal_examples=train_ex, text_examples=[])
         if eval_ex:
             eval_cfg = {**eval_base, "multimodal_examples": eval_ex, "shuffle": False, "drop_last": False}
     return DataConfig(**data), DataConfig(**eval_cfg) if eval_cfg else None
@@ -90,7 +97,31 @@ def build_pipeline(
     return KairosMultimodalPipeline.from_configs(model_config, data_config, train_config, eval_data_config)
 
 
-ConfigArg = Annotated[Path, typer.Argument(exists=True, help="Path to a YAML or JSON pipeline config file.")]
+def _bundled_configs() -> dict[str, Path]:
+    return {
+        f.name.rsplit(".", 1)[0]: Path(str(f))
+        for f in (files("kairos") / "configs").iterdir()
+        if f.name.endswith(".yaml")
+    }
+
+
+def _resolve_config(value: str) -> Path:
+    """Returns the file at `value`, else the bundled config of that name (`minimal`, `pretrain`)."""
+    if Path(value).is_file():
+        return Path(value)
+    bundled = _bundled_configs()
+    name = value.removesuffix(".yaml")
+    if name in bundled:
+        return bundled[name]
+    raise typer.BadParameter(f"{value!r} is not a file nor a bundled config ({', '.join(sorted(bundled))})")
+
+
+ConfigArg = Annotated[
+    Path,
+    typer.Argument(
+        parser=_resolve_config, metavar="CONFIG", help="Config file (YAML/JSON) or bundled name (minimal, pretrain)."
+    ),
+]
 OverrideOpt = Annotated[list[str], typer.Option("--set", help="Override e.g. --set train.lr=1e-4 (repeatable).")]
 
 
@@ -124,6 +155,20 @@ def pretrain(
     if push and repo:
         pipe.push_to_hub(repo, private=pipe.train_config.hub_private)
         typer.echo(f"pushed to https://huggingface.co/{repo}")
+
+
+@app.command("init-config")
+def init_config(
+    name: Annotated[str, typer.Argument(help="Bundled config name (minimal, pretrain).")],
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write to this file instead of stdout.")] = None,
+) -> None:
+    """Prints (or saves with -o) a bundled config so you can edit it and pass the file to `kairos pretrain`."""
+    text = _resolve_config(name).read_text(encoding="utf-8")
+    if output is None:
+        typer.echo(text, nl=False)
+    else:
+        output.write_text(text, encoding="utf-8")
+        typer.echo(f"wrote {output}")
 
 
 @app.command()

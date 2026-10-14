@@ -975,6 +975,11 @@ class KairosMultimodalPipeline:
                 setattr(self, key, value)
             return self.log_rows
         tc = self.train_config
+        if len(self.loader) == 0:
+            raise ValueError(
+                f"no training batch: {len(self.dataset)} window(s) < batch_size={self.data_config.batch_size} "
+                "with drop_last=True; add data, lower batch_size or set drop_last=False"
+            )
         self.model.train()
 
         last_ckpt = self.ckpt_dir / "last.pt"

@@ -20,7 +20,7 @@ def test_load_raw_config_reads_yaml(tmp_path):
     assert _load_raw_config(path) == {"train": {"lr": 0.001}}
 
 
-@pytest.mark.parametrize("value", ["true", "false", "null", "3", "1.5", "-2"])
+@pytest.mark.parametrize("value", ["true", "false", "null", "3", "1.5", "-2", "3e-4", "[1, 2]", '{"a": 1}'])
 def test_looks_like_json_true_for_json_scalars(value):
     assert _looks_like_json(value) is True
 
@@ -110,3 +110,10 @@ def test_overfit_defaults_mask_flags_to_none_and_seed_to_zero(monkeypatch, tmp_p
     assert calls["mask_p_max"] is None
     assert calls["mask_reweight"] is None
     assert calls["seed"] == 0
+
+
+def test_apply_overrides_parses_scientific_floats_and_json_lists():
+    result = _apply_overrides({}, ["train.lr=3e-4", 'data.text_examples=[{"modality": "text", "text": "hi"}]'])
+
+    assert result["train"]["lr"] == 3e-4
+    assert result["data"]["text_examples"] == [{"modality": "text", "text": "hi"}]

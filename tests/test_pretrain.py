@@ -6,16 +6,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import kairos.cli as cli_mod
-from kairos.cli import _apply_run_name, _data_configs, _load_raw_config, _model_kwargs
+from kairos.cli import _apply_run_name, _data_configs, _load_raw_config, _model_kwargs, _resolve_config
 from kairos.hf_data import load_hf_examples
 from kairos.modeling import KairosConfig
 from kairos.pipeline import DataConfig, KairosMultimodalPipeline, TrainConfig
 
 _ROOT = Path(__file__).parents[1]
-_CONFIG = _ROOT / "configs" / "pretrain.yaml"
+_CONFIG = _ROOT / "kairos" / "configs" / "pretrain.yaml"
 
 
 def _fake_loader(calls):
@@ -100,7 +101,7 @@ def test_make_pretrain_runs_cli_with_default_config():
     cmd = ["make", "-n", "pretrain"]
     out = subprocess.run(cmd, check=False, cwd=_ROOT, capture_output=True, text=True)
 
-    assert "kairos pretrain configs/pretrain.yaml" in out.stdout
+    assert "kairos pretrain pretrain" in out.stdout
 
 
 def test_apply_run_name_sets_sibling_run_dir_and_hub_subfolder():
@@ -162,3 +163,101 @@ def test_make_pretrain_forwards_run_name():
     out = subprocess.run(cmd, check=False, cwd=_ROOT, capture_output=True, text=True)
 
     assert "--name run-A" in out.stdout
+
+
+def test_data_configs_keeps_inline_examples_when_hf_returns_nothing(monkeypatch):
+    monkeypatch.setattr(cli_mod, "load_hf_examples", lambda spec: ([], []))
+    inline = [{"modality": "text", "text": "x"}]
+    cfg = {"hf_data": {"text_repo": None}, "data": {"text_examples": inline, "batch_size": 2}}
+
+    data, eval_data = _data_configs(cfg)
+
+    assert data.text_examples == inline
+    assert eval_data is None
+
+
+def test_minimal_yaml_builds_valid_configs_with_inline_data():
+    cfg = _load_raw_config(_ROOT / "kairos" / "configs" / "minimal.yaml")
+
+    data, eval_data = _data_configs(cfg)
+    KairosConfig(**_model_kwargs(cfg["model"]))
+    train = TrainConfig(**cfg["train"])
+
+    assert len(data.text_examples) == 4 and eval_data is None
+    assert train.compile_model is False and train.hub_repo_id is None
+
+
+@pytest.mark.integration
+def test_minimal_config_trains_end_to_end_on_cpu(tmp_path):
+    args = ["pretrain", str(_ROOT / "kairos" / "configs" / "minimal.yaml"), "--no-push"]
+    for key, value in {
+        "run_dir": tmp_path / "run",
+        "mae_epochs": 2,
+        "transition_epochs": 2,
+        "diffusion_epochs": 2,
+    }.items():
+        args += ["--set", f"train.{key}={value}"]
+
+    result = CliRunner().invoke(cli_mod.app, args)
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "run" / "checkpoints" / "best.pt").exists()
+
+
+def test_resolve_config_prefers_existing_file_then_bundled_name(tmp_path):
+    local = tmp_path / "minimal"
+    local.write_text("model: {}\n", encoding="utf-8")
+
+    assert _resolve_config(str(local)) == local
+    assert _resolve_config("minimal").name == "minimal.yaml"
+    assert _resolve_config("pretrain.yaml").name == "pretrain.yaml"
+
+
+def test_resolve_config_unknown_name_lists_bundled_configs():
+    with pytest.raises(typer.BadParameter, match="minimal, pretrain"):
+        _resolve_config("nope")
+
+
+def test_pretrain_accepts_bundled_config_name(monkeypatch):
+    seen = {}
+    pipe = SimpleNamespace(train_config=SimpleNamespace(hub_repo_id=None, hub_private=False))
+
+    def fake_build(config, overrides, run_name=None):
+        seen["config"] = config
+        return pipe
+
+    monkeypatch.setattr(cli_mod, "build_pipeline", fake_build)
+    monkeypatch.setattr(cli_mod, "train_with_progress", lambda p, force_restart, mo: [])
+    result = CliRunner().invoke(cli_mod.app, ["pretrain", "minimal", "--no-push"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["config"].name == "minimal.yaml"
+
+
+def test_pretrain_unknown_config_name_fails_cleanly():
+    result = CliRunner().invoke(cli_mod.app, ["pretrain", "nope"])
+
+    assert result.exit_code == 2
+    assert "bundled config" in result.output
+
+
+def test_init_config_prints_and_saves_bundled_config(tmp_path):
+    runner = CliRunner()
+    expected = (_ROOT / "kairos" / "configs" / "pretrain.yaml").read_text(encoding="utf-8")
+
+    printed = runner.invoke(cli_mod.app, ["init-config", "pretrain"])
+    saved = runner.invoke(cli_mod.app, ["init-config", "pretrain", "-o", str(tmp_path / "my.yaml")])
+
+    assert printed.output == expected
+    assert saved.exit_code == 0 and (tmp_path / "my.yaml").read_text(encoding="utf-8") == expected
+
+
+def test_pyproject_ships_configs_and_cli_deps_in_core():
+    import tomllib
+
+    project = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = " ".join(project["project"]["dependencies"])
+
+    assert "configs/*.yaml" in project["tool"]["setuptools"]["package-data"]["kairos"]
+    assert "typer" in deps and "pyyaml" in deps
+    assert project["project"]["optional-dependencies"]["cli"] == []
