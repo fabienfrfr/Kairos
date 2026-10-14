@@ -9,12 +9,13 @@ def _index(name):
     return next(index for index in _UV["index"] if index["name"] == name)
 
 
-def test_rocm_index_is_explicit_so_default_installs_use_pypi():
-    assert _index("pytorch-rocm")["explicit"] is True
+def test_rocm_index_stays_non_explicit_so_transitive_amd_wheels_resolve():
+    # explicit=true breaks `uv sync`: torch[device-all] needs amd-torch-device-* only AMD hosts
+    assert not _index("pytorch-rocm").get("explicit", False)
 
 
-def test_pypi_index_is_not_explicit():
-    assert not _index("pypi").get("explicit", False)
+def test_best_match_strategy_is_kept_for_local_version_wheels():
+    assert _UV["index-strategy"] == "unsafe-best-match"
 
 
 def test_rocm_sources_are_gated_behind_the_rocm_extra():

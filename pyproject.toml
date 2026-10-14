@@ -101,7 +101,6 @@ url = "https://pypi.org/simple"
 [[tool.uv.index]]
 name = "pytorch-rocm"
 url = "https://stable.repo.amd.com/rocm/whl-next/"
-explicit = true  # only used by the sources above (extra "rocm"); default installs stay on PyPI
 
 [tool.setuptools]
 packages = ["kairos", "kairos.templates"]
