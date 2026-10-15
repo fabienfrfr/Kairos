@@ -49,6 +49,8 @@ notebook = [
     "pandas>=2.0",
     "tqdm>=4.67.0",
 ]
+# CPU-only PyTorch: with uv, wheels come from download.pytorch.org/whl/cpu; with pip it is plain torch
+cpu = ["torch>=2.10.0"]
 # ROCm build of PyTorch only, from AMD's official wheel index (download docs:
 # https://rocm.docs.amd.com/en/latest/how-to/deep-learning/pytorch/install.html);
 # pair with fast-attn-rocm for the fla/causal-conv1d kernels
@@ -77,7 +79,20 @@ kairos = "kairos.cli:app"
 # AMD's ROCm wheels carry local-version tags; let the resolver pick the best
 # match across both indexes (PyPI + AMD) instead of first-index-wins
 index-strategy = "unsafe-best-match"
+default-groups = ["dev", "cuda"]
 conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "rocm" },
+    ],
+    [
+        { group = "cuda" },
+        { extra = "cpu" },
+    ],
+    [
+        { group = "cuda" },
+        { extra = "rocm" },
+    ],
     [
         { extra = "fast-attn" },
         { extra = "rocm" },
@@ -90,8 +105,15 @@ conflicts = [
 
 [tool.uv.sources]
 rocm = [{ index = "pytorch-rocm", extra = "rocm" }]
-torch = [{ index = "pytorch-rocm", extra = "rocm" }]
-triton = [{ index = "pytorch-rocm", extra = "rocm" }]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-rocm", extra = "rocm" },
+    { index = "pypi", group = "cuda" },
+]
+triton = [
+    { index = "pytorch-rocm", extra = "rocm" },
+    { index = "pypi", group = "cuda" },
+]
 
 [[tool.uv.index]]
 name = "pypi"
@@ -101,6 +123,12 @@ url = "https://pypi.org/simple"
 [[tool.uv.index]]
 name = "pytorch-rocm"
 url = "https://stable.repo.amd.com/rocm/whl-next/"
+
+# CPU wheels (local version "+cpu"); explicit so only the `cpu` extra's torch is taken from here
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.setuptools]
 packages = ["kairos", "kairos.templates"]
@@ -122,6 +150,11 @@ markers = [
 
 
 [dependency-groups]
+# default accelerator build: CUDA wheels from PyPI; swap with --no-group cuda plus --extra cpu or rocm
+cuda = [
+    "torch>=2.10.0",
+    "triton>=3.8.0; sys_platform == 'linux'",
+]
 dev = [
     "altair>=5.5.0",
     "libzim>=3.10.0",

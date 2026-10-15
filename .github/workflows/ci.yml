@@ -17,8 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: uv sync --group dev
-      - run: uv run ruff check .
+      - run: uv run --only-group dev ruff check . # lint needs no torch at all
 
   test:
     runs-on: ubuntu-latest
@@ -28,5 +27,5 @@ jobs:
         with:
           fetch-depth: 0 # full history: setuptools_scm needs tags to compute a version
       - uses: astral-sh/setup-uv@v4
-      - run: uv sync --group dev
-      - run: uv run pytest -q --cov=kairos --cov-report=term-missing
+      - run: uv sync --extra cpu --no-group cuda # CPU-only torch: runners have no GPU
+      - run: uv run --extra cpu --no-group cuda pytest -q --cov=kairos --cov-report=term-missing

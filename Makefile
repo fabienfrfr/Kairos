@@ -17,7 +17,7 @@ export
 # Force with: make notebook ROCM=1   (or ROCM=0 for CUDA/CPU machines like Kaggle)
 ROCM ?= $(shell command -v rocm-smi >/dev/null 2>&1 && echo 1 || echo 0)
 ifeq ($(ROCM),1)
-UV_TORCH_EXTRA := --extra rocm
+UV_TORCH_EXTRA := --extra rocm --no-group cuda
 else
 UV_TORCH_EXTRA :=
 endif

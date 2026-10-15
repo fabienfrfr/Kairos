@@ -86,8 +86,10 @@ live in the repository under `configs/ablations/`.
 Fused DeltaNet / causal-conv1d kernels are optional (pure-PyTorch fallback otherwise):
 
 * NVIDIA/CUDA: `uv sync --extra fast-attn`.
-* AMD/ROCm: `uv sync --extra rocm` (PyTorch ROCm build only); add `--extra fast-attn-rocm` to compile the fused
+* AMD/ROCm: `uv sync --extra rocm --no-group cuda` (PyTorch ROCm build only); add `--extra fast-attn-rocm` to compile the fused
   kernels (needs the ROCm HIP toolchain). `fast-attn` is mutually exclusive with the ROCm extras.
+* CPU only (Linux, CI): `uv sync --extra cpu --no-group cuda` installs the `+cpu` PyTorch wheel.
+* Default (`uv sync`): CUDA build of PyTorch from PyPI; the `cpu` and `rocm` extras replace it, hence `--no-group cuda`.
 
 ## Data & training
 
