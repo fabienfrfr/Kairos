@@ -6,7 +6,7 @@ DIR="${SANDBOX_TORCH_DIR:-$HOME}"
 VENV="$DIR/venv"
 STUBS="$DIR/stubs"
 PY="$VENV/bin/python"
-# the repo pyproject sets extra uv indexes (ROCm) that are unreachable here
+# the repo pyproject sets extra uv indexes (ROCm, PyTorch CPU) that are unreachable here
 UV="uv --no-config"
 PKGS="${EXTRA_PKGS:-transformers datasets typer pyyaml einops accelerate tensorboard huggingface-hub pytest}"
 CUDA_LIBS='^lib(cu|nccl|nvrtc|nvshmem|nvJit|nvToolsExt|cupti)'

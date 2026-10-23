@@ -180,7 +180,10 @@ stack~\citep{nawrot2022hourglass}; Perceiver~IO reads arbitrary input arrays,
 including raw bytes, through cross-attention into a fixed latent
 array~\citep{jaegle2022perceiverio}. Kairos' PyramidalCodec instead keeps
 $S$ parallel views of one sequence at geometrically growing patch sizes,
-runs a backbone on each, and fuses them after upsampling. 
+runs a backbone on each, and fuses them after upsampling. Next-Concept
+Modeling~\citep{kumbong2026ncm} also builds a multiscale hierarchy over text, with a residual
+VQ-VAE producing discrete codes that a transformer generates one level at a time; the PyramidalCodec
+is not quantized and processes its levels in parallel inside the backbone.
 
 \paragraph{Sparse MoE.} MoE
 architectures~\citep{shazeer2017outrageously,fedus2021switch,dai2024deepseekmoe,deepseekv3}
@@ -276,7 +279,7 @@ serialization follows the action--state encoding of~\citet{furfaro2024pixelbytes
 Each token id and its octet-family id are embedded and fused by a linear layer (\S\ref{sec:tokenizer});
 the output head, tied to the token embedding, predicts both the byte and its family.
 
-The PyramidalCodec builds $S$ parallel views of the sequence with patch sizes
+The PyramidalCodec (Figure~\ref{fig:codec}) builds $S$ parallel views of the sequence with patch sizes
 $p_s=\text{stride}^s$ (notebook config: stride $3$, $S=4$, so $p=3,9,27,81$). A shared
 rank-$r$ bottleneck mixer
 ($\text{Conv1d}_{d\to r}\to\text{GELU}\to\text{Conv1d}_{r\to d}$,
@@ -296,6 +299,27 @@ metadata 4); positions of modalities not routed to a scale bypass its
 backbone. Decoding mirrors encoding with grouped transposed convolutions and
 per-scale mixers, then concatenates the scales, applies RMSNorm and fuses them
 with a linear layer.
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=\linewidth]{kairos_codec.pdf}
+    \caption{How the PyramidalCodec (stride $3$, $S=4$, text routed to scales 1--2) reads one
+    corrupted text input. Three bytes in the middle are replaced by random bytes; red marks them
+    for the reader only, the model is not told which positions are corrupted. Each scale has its
+    own learned encoder whose window equals its stride, all computed in parallel from the same
+    input, so no scale reads another's output, unlike a sequential
+    hierarchy~\citep{nawrot2022hourglass,yu2023megabyte}. Scale 1 has 9 positions and scale 2 has
+    3; each runs through a backbone with weights shared across scales, while scales 3--4 are not
+    read by text and are bypassed. Each scale is decoded back to 27 positions, then concatenated
+    and fused, and the output head predicts one byte per position. The loss is taken only at the
+    corrupted positions; the output row is the target (the clean text), not a measured
+    prediction. A contiguous span is drawn for readability, whereas training draws independent
+    Bernoulli positions. Spaces are drawn as $\cdot$. In patch mode the encoder is a linear map on
+    the concatenated byte embeddings and the decoder reuses it transposed (tied weights); in conv
+    mode (notebook config, Algorithm~\ref{alg:codec}) it is a shared channel mixer, a grouped
+    strided convolution and a mixer per scale, with separate transposed-convolution decoders.}
+    \label{fig:codec}
+\end{figure}
 
 \begin{algorithm}[t]
 \caption{PyramidalCodec, \texttt{mode="conv"}: encode, per-scale backbone, decode}
