@@ -11,6 +11,8 @@ from kairos.trainer import (
     anneal_mask_schedule,
     collect_moe_aux_loss,
     compute_masked_diffusion_losses,
+    dfm_euler_step,
+    dfm_sample,
     make_diffusion_mask,
     stage_mask_schedule,
     stage_name_at,
@@ -676,3 +678,20 @@ def test_trainer_mae_mode_never_exceeds_p_max(dense_model, tokenizer, monkeypatc
     trainer.compute_loss(dense_model, batch)
 
     assert captured["p"].max() <= 0.3
+
+
+def test_make_diffusion_mask_cubic_path_noises_more_than_linear():
+    torch.manual_seed(0)
+    x0, prompt_len = torch.zeros(512, 4, dtype=torch.long), torch.zeros(512, dtype=torch.long)
+    _, p_lin = make_diffusion_mask(x0, prompt_len, path="linear")
+    _, p_cub = make_diffusion_mask(x0, prompt_len, path="cubic")
+    assert p_cub.mean() > p_lin.mean() and p_cub.max() <= 1.0
+
+
+def test_dfm_sampler_recovers_oracle_target():
+    torch.manual_seed(0)
+    target = torch.tensor([[3, 1, 4, 1, 5, 9]])
+    oracle = lambda x: torch.nn.functional.one_hot(target, 11).float() * 50
+    for path in ("linear", "cubic"):
+        assert torch.equal(dfm_sample(oracle, torch.randint(0, 11, target.shape), 8, path), target)
+    assert torch.equal(dfm_euler_step(target, oracle(target), 0.0, 0.0), target)

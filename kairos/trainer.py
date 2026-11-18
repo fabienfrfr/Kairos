@@ -6,6 +6,25 @@ from transformers import Trainer
 
 from .modeling import KairosTopkRouter
 
+# DFM schedulers (Gat et al., 2024): kappa_t is the clean-token probability at time t, with its derivative
+FLOW_PATHS = {"linear": (lambda t: t, lambda t: 1.0), "cubic": (lambda t: t**3, lambda t: 3 * t**2)}
+
+
+def dfm_euler_step(x_t, logits, t: float, h: float, path: str = "linear"):
+    # each position jumps to a posterior sample at rate kappa'(t) h / (1 - kappa(t)); 1 on the last step
+    kappa, dkappa = FLOW_PATHS[path]
+    rate = 1.0 if t + h >= 1.0 else min(1.0, dkappa(t) * h / (1.0 - kappa(t)))
+    probs = torch.softmax(logits.float(), dim=-1)
+    sample = torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).view_as(x_t)
+    return torch.where(torch.rand(x_t.shape, device=x_t.device) < rate, sample, x_t)
+
+
+def dfm_sample(denoiser, x_init, steps: int, path: str = "linear"):
+    x, h = x_init, 1.0 / steps
+    for i in range(steps):
+        x = dfm_euler_step(x, denoiser(x), i * h, h, path)
+    return x
+
 
 def update_moe_bias(model, update_rate: float) -> None:
     """Nudges every KairosTopkRouter's correction bias toward equal expert load."""
@@ -26,13 +45,14 @@ def collect_moe_aux_loss(model) -> torch.Tensor:
     return torch.stack(losses).sum()
 
 
-def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0):
+def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0, path="linear"):
     """Random per-token mask + per-row rate p for the masked-diffusion objective.
 
     p ~ U(eps, p_max). Full diffusion uses p_max=1.0 (rows can be up to 100% noised).
     A capped p_max (e.g. 0.3) gives a fixed-ish-rate MAE-style corruption instead.
     """
-    p = (p_max - eps) * torch.rand(x0.size(0), device=x0.device) + eps
+    # flow-matching path: p = 1 - kappa(t) with t ~ U(0, 1); "linear" is exactly p ~ U(0, 1)
+    p = (1.0 - FLOW_PATHS[path][0](torch.rand(x0.size(0), device=x0.device))).clamp(eps, p_max)
     p = p[:, None].expand_as(x0)
     noise_mask = torch.rand(x0.shape, device=x0.device) < p
     for i in range(x0.size(0)):
@@ -159,6 +179,7 @@ class KairosDiffusionTrainer(Trainer):
     last_loss_diagnostics: dict | None = None
     mask_eps: float = 1e-3  # floor of p ~ U(eps, p_max); CE/p makes rare low-p rows dominate
     mask_p_max: float = 1.0  # ceiling of p; 1.0 = full diffusion, cap for MAE-style corruption
+    mask_path: str = "linear"  # DFM scheduler for p; with mask_reweight=0 the loss is the DFM posterior CE
     mask_reweight: bool = True  # divide CE by p; False for plain CE
     mask_reweight_clip: float | None = 3.0  # caps 1/p weight; bounds variance from rare low-p rows
     octet_loss_weight: float = 1.0  # weight of the octet-family loss
@@ -173,7 +194,9 @@ class KairosDiffusionTrainer(Trainer):
         family_ids = inputs.get("octet_family_ids")
         pad_mask = inputs.get("mask")
 
-        noise_mask, p = make_diffusion_mask(x0, prompt_len, pad_mask, eps=self.mask_eps, p_max=self.mask_p_max)
+        noise_mask, p = make_diffusion_mask(
+            x0, prompt_len, pad_mask, eps=self.mask_eps, p_max=self.mask_p_max, path=self.mask_path
+        )
         if not noise_mask.any():
             # exceedingly rare: short sequence + low mask ratio
             eligible = pad_mask.bool() if pad_mask is not None else torch.ones_like(noise_mask)

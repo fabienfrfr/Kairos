@@ -210,6 +210,15 @@ by $1/p$ in the manner of MDLM, with a clip, and trained with
 self-conditioning~\citep{chen2022analogbits} and a three-stage curriculum
 (\S\ref{sec:objective}).
 
+\paragraph{Flow matching for language.} The corruption above is also a discrete flow matching
+path~\citep{gat2024dfm} with a uniform source and a linear scheduler, so the unweighted
+objective ($\alpha=0$) is its posterior cross-entropy. Discrete flow matching was scaled to
+1.7B parameters on code~\citep{gat2024dfm}; continuous flow-matching language models
+now include ELF~\citep{hu2026elf}, LangFlow~\citep{chen2026langflow} and
+FLM~\citep{lee2026flowmaplm}, reported at 0.1--0.7B parameters on OpenWebText. Kairos
+does not train with any of them; the trainer exposes the discrete scheduler (\texttt{mask\_path}) and
+an Euler sampler for it (\texttt{dfm\_sample}), neither compared with the current setup.
+
 \paragraph{Recurrent memory.} Transformer-XL carries hidden states across
 segments~\citep{dai2019transformerxl}, Titans learn a test-time
 memory~\citep{behrouz2025titans}, and TPTT retrofits such memory into
