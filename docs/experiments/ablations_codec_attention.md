@@ -158,6 +158,31 @@ far fewer steps - 3 epochs x 4 batches).
 All three are close; 12 steps total is too few to draw a conclusion either way. Would
 need many more steps/epochs to say whether the memory gate's content matters.
 
+## 11. Flow-matching training arms (`flow_*`, full range `mask_p_max=1.0`, 600 steps)
+
+Arms differ in the corruption path and loss weight; configs `flow_mdlm_control`, `flow_dfm_linear`,
+`flow_dfm_cubic` (same tiny `baseline` model). Training losses are **not comparable** across arms (different
+weights and path distributions), so each run also reports a common *reference CE*: plain CE, linear path,
+`p ~ U(0, 1)`, measured on the memorized subset after training (`pipe.overfit_reference_loss`).
+
+| Arm | path / weight | seed 0 | seed 1 | seed 2 | mean ± std |
+|---|---|---:|---:|---:|---:|
+| `flow_mdlm_control` | linear, `1/p` (clip 10) | 0.743 | 0.423 | 0.480 | 0.548 ± 0.170 |
+| `flow_dfm_linear` | linear, plain CE | 1.183 | 0.539 | 0.662 | 0.795 ± 0.341 |
+| `flow_dfm_cubic` | cubic, plain CE | 0.951 | 0.735 | 0.646 | 0.777 ± 0.157 |
+
+- The `1/p` control has the lowest reference CE on all 3 seeds; the gap to the DFM arms (0.23-0.25 on average) is
+  within the seed spread, so it is a 3-of-3 pairing, not a measured effect size.
+- `linear` vs `cubic` DFM are indistinguishable at this budget.
+- Caveats: memorized 16-copy sentence (reference CE is a training-set measure), one tiny model, 3 seeds, and
+  run-to-run non-determinism (`flow_dfm_linear` seed 0 gave 1.136 in a timing run and 1.183 here).
+- Not tested: generation quality of `dfm_sample`, held-out data, the corrector, larger models.
+
+```bash
+kairos overfit configs/ablations/flow_dfm_linear.yaml --steps 600 --mask-p-max 1.0 --no-mask-reweight --seed <0|1|2>
+kairos overfit configs/ablations/flow_mdlm_control.yaml --steps 600 --mask-p-max 1.0 --mask-reweight --seed <0|1|2>
+```
+
 ## Takeaways
 
 - **Codec choice dominates**; depth, MoE top-k, and QKV-sharing barely move the needle
@@ -173,3 +198,4 @@ need many more steps/epochs to say whether the memory gate's content matters.
   transfer to real, diverse data at scale.
 - Memory gate and `n_layers=8` remain inconclusive (too few steps / too little compute
   budget respectively) - flagged, not resolved.
+- Flow-matching arms (§11): the `1/p`-weighted control is not beaten by plain-CE DFM training at this scale.

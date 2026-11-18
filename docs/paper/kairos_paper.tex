@@ -217,7 +217,7 @@ objective ($\alpha=0$) is its posterior cross-entropy. Discrete flow matching wa
 now include ELF~\citep{hu2026elf}, LangFlow~\citep{chen2026langflow} and
 FLM~\citep{lee2026flowmaplm}, reported at 0.1--0.7B parameters on OpenWebText. Kairos
 does not train with any of them; the trainer exposes the discrete scheduler (\texttt{mask\_path}) and
-an Euler sampler for it (\texttt{dfm\_sample}), neither compared with the current setup.
+an Euler sampler for it (\texttt{dfm\_sample}); only the training arms were compared with the current objective, on the overfitting protocol, and the sampler was not.
 
 \paragraph{Recurrent memory.} Transformer-XL carries hidden states across
 segments~\citep{dai2019transformerxl}, Titans learn a test-time
@@ -731,6 +731,16 @@ optimizer steps, so absolute losses are not comparable to the rest of the
 study): min.\ loss $7.512$ without the gate, $7.453$ with the previous batch's
 state only, $7.423$ with a random bank, and final loss $12.927$, $12.893$ and
 $9.752$. Twelve steps cannot separate the variants; we draw no conclusion.
+
+\subsection{Flow-matching training arms}
+
+Three arms share the tiny baseline model and train over the full range $p_{\max}=1$ for 600 steps: the
+$1/p$-weighted objective of \S\ref{sec:objective}, and two unweighted (discrete flow matching) arms with a linear or a
+cubic path. Their training losses differ in definition, so all are compared on one reference: plain cross-entropy
+under the linear path, measured on the memorized subset. Over three seeds it is $0.548\pm0.170$ (weighted control),
+$0.795\pm0.341$ (linear flow matching) and $0.777\pm0.157$ (cubic). The control is lowest on each seed, but the gap lies
+within the seed spread, linear and cubic do not differ, and the measure is a training-set one. We therefore report
+no advantage for flow matching; generation with its sampler is untested (ablation log, \S11).
 
 \section{Discussion}
 

@@ -39,6 +39,7 @@ has not been instantiated or trained.
 * The implementation optimizes: tiny networks drive the denoising loss of a fixed 440-byte sentence near zero.
 * Codec ranking after 600 steps is stable over 3 seeds (patch codec 0.018 to depthwise conv codec 0.354).
 * The advantage of shared over separate attention projections is a convergence-speed effect, not a capacity effect.
+* A discrete flow-matching training arm (`configs/ablations/flow_*.yaml`) did not beat the `1/p`-weighted objective in the overfit test (3 seeds).
 * The curriculum and the memory gate have no supporting result yet.
 
 ```bibtex

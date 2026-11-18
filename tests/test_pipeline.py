@@ -71,9 +71,7 @@ def multimodal_examples(rng):
 
 @pytest.fixture
 def model_config():
-    return KairosConfig(
-        d_model=32, n_heads=4, n_layers=4, num_modalities=8, attnres_block_size=2, intermediate_size=64
-    )
+    return KairosConfig(d_model=32, n_heads=4, n_layers=4, num_modalities=8, attnres_block_size=2, intermediate_size=64)
 
 
 @pytest.fixture
@@ -2222,8 +2220,9 @@ def test_overfit_test_default_skips_stages_with_zero_epochs(tmp_path, model_conf
     pipe.hf_trainer.compute_loss = spy
     pipe.overfit_test(n_examples=16, steps=5)
 
-    assert all(v == pytest.approx(0.3) for v in captured_p_max)
-    assert all(v == pytest.approx(0.0) for v in captured_reweight)
+    # the 5 training steps come first; later calls are the reference-loss yardstick
+    assert all(v == pytest.approx(0.3) for v in captured_p_max[:5])
+    assert all(v == pytest.approx(0.0) for v in captured_reweight[:5])
 
 
 def test_overfit_test_mask_override_is_applied_and_restored(tmp_path, model_config):
@@ -2246,8 +2245,8 @@ def test_overfit_test_mask_override_is_applied_and_restored(tmp_path, model_conf
     pipe.hf_trainer.compute_loss = spy
     pipe.overfit_test(n_examples=16, steps=3, mask_p_max=0.3, mask_reweight=False)
 
-    assert all(v == 0.3 for v in captured_p_max)
-    assert all(v == 0.0 for v in captured_reweight)  # continuous blend factor now, not a bool identity
+    assert all(v == 0.3 for v in captured_p_max[:3])  # later calls are the reference-loss yardstick
+    assert all(v == 0.0 for v in captured_reweight[:3])  # continuous blend factor now, not a bool identity
     # restored to the pipe's original (Stage 2 / diffusion) settings after the call
     assert pipe.hf_trainer.mask_p_max == 1.0
     assert pipe.hf_trainer.mask_reweight is True
@@ -2328,3 +2327,18 @@ def test_train_raises_clear_error_when_dataset_is_smaller_than_one_batch(tmp_pat
 
     with pytest.raises(ValueError, match="no training batch"):
         pipe.train()
+
+
+def test_overfit_test_reports_reference_loss_and_keeps_mask_path(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(epochs=1, run_dir=str(tmp_path / "run"), mask_path="cubic", mask_reweight=False)
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    pipe.overfit_test(n_examples=16, steps=3, mask_p_max=1.0, mask_reweight=False)
+    assert math.isfinite(pipe.overfit_reference_loss) and pipe.hf_trainer.mask_path == "cubic"
+
+
+def test_train_config_rejects_unknown_mask_path():
+    with pytest.raises(ValueError, match="mask_path"):
+        TrainConfig(mask_path="quadratic")

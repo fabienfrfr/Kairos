@@ -3,5 +3,7 @@ sanity-check architecture ablations. See docs/experiments/ablations_codec_attent
 for full results (all sweeps run) and docs/experiments/planned_experiments.md for the
 list of what was covered.
 
+Flow-matching arms (`flow_*.yaml`, see docs/experiments/flow_matching.md) need `--mask-p-max 1.0`.
+
 Run with e.g.:
     kairos overfit configs/ablations/baseline.yaml --steps 600 --mask-p-max 0.3 --no-mask-reweight

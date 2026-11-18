@@ -22,5 +22,9 @@
 - No flow-matching LLM at frontier scale was found. Masked diffusion (LLaDA, Dream) dominates.
 - Correlation caveat: ELF's gain over MDLM/Duo mixes the objective with data, encoder and optimizer.
 
+## Overfit comparison (ablations log §11)
+Configs `flow_mdlm_control`, `flow_dfm_linear`, `flow_dfm_cubic`; common reference CE, 3 seeds, 600 steps:
+0.548 ± 0.170, 0.795 ± 0.341, 0.777 ± 0.157. The `1/p` control is lowest on every seed; no DFM gain observed.
+
 ## Next experiment
-Compare alpha = 0 plus `dfm_sample` against the current entropy-bound sampler at equal steps, 3 seeds.
+Compare `dfm_sample` against the current entropy-bound sampler at equal steps on a trained control and DFM model, 3 seeds.

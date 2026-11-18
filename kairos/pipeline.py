@@ -41,6 +41,7 @@ from .dataset import (
 from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_memory_bank
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import (
+    FLOW_PATHS,
     KairosDiffusionTrainer,
     compute_masked_diffusion_losses,
     make_diffusion_mask,
@@ -97,6 +98,7 @@ class TrainConfig:
     mask_eps: float = 1e-3  # floor of masked-diffusion rate p; CE/p variance grows as this shrinks
     mask_p_max: float = 1.0  # diffusion-stage (target) ceiling of p
     mask_reweight: bool = True  # diffusion-stage (target): divide CE by p
+    mask_path: str = "linear"  # DFM scheduler of p (linear or cubic); see trainer.FLOW_PATHS
     mask_reweight_clip: float | None = 3.0  # caps 1/p weight; bounds variance from rare low-p rows
     mask_mae_p_max: float = 0.3  # MAE-stage fixed-ish corruption ceiling (cheap/stable to optimize)
     mask_mae_reweight: bool = False  # MAE-stage: plain CE, no 1/p variance blowup
@@ -130,6 +132,8 @@ class TrainConfig:
                 "TrainConfig needs at least one epoch: mae_epochs + transition_epochs + "
                 f"diffusion_epochs must be > 0, got {self.epochs}"
             )
+        if self.mask_path not in FLOW_PATHS:
+            raise ValueError(f"TrainConfig.mask_path must be one of {sorted(FLOW_PATHS)}, got {self.mask_path!r}")
         if self.amp_dtype is not None and self.amp_dtype not in ("bf16", "fp16"):
             raise ValueError(f"TrainConfig.amp_dtype must be None, 'bf16', or 'fp16', got {self.amp_dtype!r}")
 
@@ -476,6 +480,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_eps = tc.mask_eps
         self.hf_trainer.mask_p_max = tc.mask_p_max
         self.hf_trainer.mask_reweight = tc.mask_reweight
+        self.hf_trainer.mask_path = tc.mask_path
         self.hf_trainer.mask_reweight_clip = tc.mask_reweight_clip
         self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
         self.hf_trainer.self_conditioning_prob = tc.self_conditioning_prob
@@ -926,9 +931,11 @@ class KairosMultimodalPipeline:
                 if progress_callback is not None:
                     progress_callback(self.global_step, steps, loss_val)
 
+            self.overfit_reference_loss = self._reference_loss(loader)
             first, last = logs[0]["loss"], logs[-1]["loss"]
             tail = sum(r["loss"] for r in logs[-max(1, len(logs) // 10) :]) / max(1, len(logs) // 10)
             print(f"overfit_test: {len(logs)} steps on {n} examples - loss {first:.4f} -> {tail:.4f} (last {last:.4f})")
+            print(f"overfit_test: reference CE (linear, p_max=1, no reweight) {self.overfit_reference_loss:.4f}")
             return logs
         finally:
             self.model.load_state_dict(saved_model)
@@ -944,6 +951,23 @@ class KairosMultimodalPipeline:
             self.best_eval_loss = saved_best_eval
             self.hf_trainer.mask_p_max = saved_mask_p_max
             self.hf_trainer.mask_reweight = saved_mask_reweight
+
+    def _reference_loss(self, loader, n_batches: int = 20) -> float:
+        # common yardstick across regimes: plain CE, linear path, p ~ U(0, 1), never the training regime
+        trainer = self.hf_trainer
+        saved = (trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight)
+        trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight = "linear", 1.0, False
+        losses = []
+        try:
+            with torch.no_grad():
+                for _ in range(n_batches):
+                    batch = next(iter(loader))
+                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+                    with self._autocast():
+                        losses.append(trainer.compute_loss(self._forward_model, batch).item())
+        finally:
+            trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight = saved
+        return sum(losses) / len(losses)
 
     # ---------------------------------------------------------------- train
     def _require_built(self):
