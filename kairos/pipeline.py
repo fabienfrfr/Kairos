@@ -42,9 +42,14 @@ from .modeling import KairosConfig, KairosDiffusionFM, KairosMultiCache, gate_me
 from .tokenizer import KairosTokenizer, Modality
 from .trainer import (
     FLOW_PATHS,
+    MASK_SAMPLINGS,
+    OPTIMIZERS,
     KairosDiffusionTrainer,
     compute_masked_diffusion_losses,
+    dfm_euler_step,
     make_diffusion_mask,
+    make_optimizer,
+    make_scheduler,
     stage_mask_schedule,
     update_moe_bias,
 )
@@ -82,6 +87,11 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     lr: float = 3e-4
+    optimizer: str = "adamw"  # adamw, or muon_hybrid (Muon on 2D backbone matrices, AdamW elsewhere)
+    weight_decay: float = 0.01  # decoupled; applied by both optimizers
+    adam_betas: tuple = (0.9, 0.999)  # AdamW part
+    warmup_frac: float = 0.0  # linear warmup share of the total steps before the cosine decay
+    mask_sampling: str = "uniform"  # uniform, stratified or antithetic draws of the noise level t
     # epochs (deprecated): if set, means diffusion_epochs=epochs, mae/transition=0.
     epochs: int | None = None
     # single-pipeline MAE -> transition -> diffusion; see trainer.stage_mask_schedule
@@ -132,6 +142,11 @@ class TrainConfig:
                 "TrainConfig needs at least one epoch: mae_epochs + transition_epochs + "
                 f"diffusion_epochs must be > 0, got {self.epochs}"
             )
+        self.adam_betas = tuple(self.adam_betas)
+        if self.optimizer not in OPTIMIZERS:
+            raise ValueError(f"TrainConfig.optimizer must be one of {OPTIMIZERS}, got {self.optimizer!r}")
+        if self.mask_sampling not in MASK_SAMPLINGS:
+            raise ValueError(f"TrainConfig.mask_sampling must be one of {MASK_SAMPLINGS}, got {self.mask_sampling!r}")
         if self.mask_path not in FLOW_PATHS:
             raise ValueError(f"TrainConfig.mask_path must be one of {sorted(FLOW_PATHS)}, got {self.mask_path!r}")
         if self.amp_dtype is not None and self.amp_dtype not in ("bf16", "fp16"):
@@ -462,9 +477,9 @@ class KairosMultimodalPipeline:
             self.model_forward = torch.compile(self.model) if should_compile else self.model
         # separate compiled instance: keeps eval's no_grad() from forcing train's graph to recompile
         self.eval_forward = torch.compile(self.model) if should_compile else self.model_forward
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tc.lr, fused=torch.cuda.is_available())
+        self.optimizer = make_optimizer(self.model, tc.optimizer, tc.lr, tc.weight_decay, tc.adam_betas)
         n_steps = max(1, tc.epochs * len(self.loader))
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=n_steps)
+        self.scheduler = make_scheduler(self.optimizer, n_steps, tc.warmup_frac)
 
         run_dir = Path(tc.run_dir)
         self.ckpt_dir = run_dir / "checkpoints"
@@ -481,6 +496,7 @@ class KairosMultimodalPipeline:
         self.hf_trainer.mask_p_max = tc.mask_p_max
         self.hf_trainer.mask_reweight = tc.mask_reweight
         self.hf_trainer.mask_path = tc.mask_path
+        self.hf_trainer.mask_sampling = tc.mask_sampling
         self.hf_trainer.mask_reweight_clip = tc.mask_reweight_clip
         self.hf_trainer.octet_loss_weight = tc.octet_loss_weight
         self.hf_trainer.self_conditioning_prob = tc.self_conditioning_prob
@@ -835,6 +851,7 @@ class KairosMultimodalPipeline:
         mask_reweight: bool | None = None,
         log_every: int = 0,
         freeze_callback=None,
+        heldout: int = 0,
     ) -> list[dict]:
         """Trains on a tiny subset to check memorization, walking the active curriculum stages."""
         self._require_built()
@@ -854,6 +871,8 @@ class KairosMultimodalPipeline:
         saved_mask_p_max = self.hf_trainer.mask_p_max
         saved_mask_reweight = self.hf_trainer.mask_reweight
 
+        # the seed drives step order, masking noise and the sampling metrics, not only the subset
+        torch.manual_seed(seed)
         tc = self.train_config
         if mask_p_max is not None or mask_reweight is not None:
             # single fixed regime for the whole call, explicitly requested
@@ -889,8 +908,8 @@ class KairosMultimodalPipeline:
             batch_size=self.data_config.batch_size,
             shuffle=True,
         )
-        opt = torch.optim.AdamW(self.model.parameters(), lr=lr)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps))
+        opt = make_optimizer(self.model, tc.optimizer, lr, tc.weight_decay, tc.adam_betas)
+        sch = make_scheduler(opt, max(1, steps), tc.warmup_frac)
         self.log_rows = []
         self.eval_log_rows = []
         self.best_loss = float("inf")
@@ -932,10 +951,20 @@ class KairosMultimodalPipeline:
                     progress_callback(self.global_step, steps, loss_val)
 
             self.overfit_reference_loss = self._reference_loss(loader)
+            self.overfit_sampling_accuracy = self._sampling_accuracy(loader)
+            self.overfit_heldout_loss = None
+            rest = sorted(set(range(len(self.dataset))) - set(indices))
+            if heldout > 0 and rest:
+                picked = random.Random(seed + 1).sample(rest, min(heldout, len(rest)))
+                held = DataLoader(Subset(self.dataset, picked), batch_size=self.data_config.batch_size, shuffle=True)
+                self.overfit_heldout_loss = self._reference_loss(held)
             first, last = logs[0]["loss"], logs[-1]["loss"]
             tail = sum(r["loss"] for r in logs[-max(1, len(logs) // 10) :]) / max(1, len(logs) // 10)
             print(f"overfit_test: {len(logs)} steps on {n} examples - loss {first:.4f} -> {tail:.4f} (last {last:.4f})")
             print(f"overfit_test: reference CE (linear, p_max=1, no reweight) {self.overfit_reference_loss:.4f}")
+            print(f"overfit_test: sampling accuracy {self.overfit_sampling_accuracy}")
+            if self.overfit_heldout_loss is not None:
+                print(f"overfit_test: held-out reference CE {self.overfit_heldout_loss:.4f}")
             return logs
         finally:
             self.model.load_state_dict(saved_model)
@@ -955,8 +984,9 @@ class KairosMultimodalPipeline:
     def _reference_loss(self, loader, n_batches: int = 20) -> float:
         # common yardstick across regimes: plain CE, linear path, p ~ U(0, 1), never the training regime
         trainer = self.hf_trainer
-        saved = (trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight)
+        saved = (trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight, trainer.mask_sampling)
         trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight = "linear", 1.0, False
+        trainer.mask_sampling = "uniform"
         losses = []
         try:
             with torch.no_grad():
@@ -966,8 +996,42 @@ class KairosMultimodalPipeline:
                     with self._autocast():
                         losses.append(trainer.compute_loss(self._forward_model, batch).item())
         finally:
-            trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight = saved
+            trainer.mask_path, trainer.mask_p_max, trainer.mask_reweight, trainer.mask_sampling = saved
         return sum(losses) / len(losses)
+
+    def _sampling_accuracy(self, loader, steps=(8, 16)) -> dict[str, float]:
+        # exact-token rate of continuations of memorized rows: DFM Euler sampler vs the entropy-bound generate()
+        batch = {k: v.to(self.device) for k, v in next(iter(loader)).items()}
+        ids, modality = batch["input_ids"], batch.get("modality_ids")
+        prompt = min(32, ids.size(1) // 2)
+        new = min(64, ids.size(1) - prompt, self.model.config.canvas_length)
+        target = ids[:, prompt : prompt + new]
+        vocab, result = self.model.lm_head.vocab_size, {}
+        self.model.eval()
+        try:
+            with torch.no_grad(), self._autocast():
+                for n_steps in steps:
+                    x = ids[:, : prompt + new].clone()
+                    x[:, prompt:] = torch.randint(0, vocab, x[:, prompt:].shape, device=x.device)
+                    for i in range(n_steps):
+                        mod = None if modality is None else modality[:, : x.size(1)]
+                        logits = self.model(decoder_input_ids=x, modality_ids=mod).logits[:, prompt:]
+                        x[:, prompt:] = dfm_euler_step(
+                            x[:, prompt:], logits, i / n_steps, 1.0 / n_steps, self.hf_trainer.mask_path
+                        )
+                    result[f"dfm_{n_steps}"] = (x[:, prompt:] == target).float().mean().item()
+                    generated = [
+                        self.generate(row[:prompt].tolist(), max_new_tokens=new, max_denoising_steps=n_steps, seed=0)
+                        for row in ids
+                    ]
+                    hits = [
+                        torch.tensor(g[prompt : prompt + new], device=ids.device) == target[r]
+                        for r, g in enumerate(generated)
+                    ]
+                    result[f"gen_{n_steps}"] = torch.stack(hits).float().mean().item()
+        finally:
+            self.model.train()
+        return result
 
     # ---------------------------------------------------------------- train
     def _require_built(self):

@@ -17,6 +17,15 @@ future sweeps.
 9. Sequence length (`max_len`) - done, §8.
 10. Batch size - done, §9.
 
+Added after the v1 draft (seeded, reproducible; see `README.md` in this folder):
+
+13. Seeded re-measurement of §1 and the 600-step row of §7 - done, `ablations_codec_attention.md` §12.
+14. Training objective: `1/p` weight, plain CE, linear and cubic path, on memorization and on unseen passages - done, §11.
+15. Curriculum against none - done, §13.
+16. Objective, held-out and curriculum repeated at the tuned rate 8e-3 - done, §11c and §13.
+17. Training algorithm: optimizer (AdamW, tuned AdamW, Muon hybrid) and noise sampling (stratified, antithetic), with
+    a learning-rate sweep - done, `training_algorithms.md`.
+
 ## Still open
 
 - `n_layers=8` and the memory gate both need a larger compute/step budget than this
@@ -25,6 +34,12 @@ future sweeps.
   at this scale is large enough (+/-0.03 to +/-0.19 depending on config) that any of
   these could shift with a different seed. Worth a 3-seed rerun before citing precise
   numbers.
+
+- Seeded reruns of §2-§6, §8-§10 and the 3000-step and frozen-projection checks of §7 (all still unseeded single runs).
+- Sampling accuracy is measured on a batch whose rows depend on the random state consumed: evaluate a fixed set of rows
+  before comparing samplers across arms.
+- Not implemented or not tested: complementary-mask (MIRROR) antithetic masking, weight averaging, Lion / SOAP /
+  Schedule-Free / NorMuon, a weight-decay and warmup sweep, a measured throughput, multimodal data.
 
 ## Not yet covered by the ablation study (from the paper's old "Anticipated Results")
 

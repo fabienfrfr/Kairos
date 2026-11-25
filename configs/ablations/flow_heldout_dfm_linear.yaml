@@ -1,0 +1,250 @@
+# held-out overfit arm (linear, plain CE): 96 distinct doc passages, train on a subset; see docs/experiments/flow_matching.md
+data:
+  batch_size: 4
+  max_len: 128
+  text_examples:
+  - modality: text
+    text: then huggingface-cli login or export HFTOKEN. It uses ffurfaro/keep-it-simple (text) and
+  - modality: text
+    text: (+/-0.03 to +/-0.19 depending on config) that any of these could shift with a different seed.
+      Worth
+  - modality: text
+    text: 'sentences, patch codec, 1.6M params, ~1 min pretrain (bundled) Real pretraining: HF datasets,
+      3.8M'
+  - modality: text
+    text: text-only. A large, isolated gap on one modality would flag a codec-scale or tokenizer mismatch
+      for
+  - modality: text
+    text: Per-modality loss (pipe.checkpermodalityloss()) - mean masked CE loss broken down by modality
+  - modality: text
+    text: 'result yet. Tokenizer: one 290-entry byte vocabulary for every modality (ByT5-based), plus
+      modality'
+  - modality: text
+    text: torch.cuda.Event Kaplan 2020 Scaling Laws for Neural Language Models, arXiv:2001.08361 Hoffmann
+  - modality: text
+    text: (Ntotal / Nact) x ridge Weights are read once per microbatch, not per token; the old 94-375
+      tok/s
+  - modality: text
+    text: methodology. No single testable hypothesis. Backward is bandwidth-gated by Ntotal Analytical
+      only,
+  - modality: text
+    text: 'Next step (from the paper): a pretraining run with held-out loss per stage and modality, and
+      a'
+  - modality: text
+    text: '"PoC''s actual setting" is 1 layer, MoE off, 2.50M; Table 1 PoC is 4 layers, MoE, ~14-15M'
+  - modality: text
+    text: liz2sharedvsseparatefollowupraw.jsonl, absent from the project snapshot Also cited in
+  - modality: text
+    text: the package. To change the model, data or Hub target, export one, Fused DeltaNet / causal-conv1d
+  - modality: text
+    text: 'central claim (planned experiment 12): vary Ntotal at fixed Nact (e.g. 200M vs 50M) on one
+      GPU and'
+  - modality: text
+    text: 31 pt), regex cross-check of cite/ref against the .bib and labels (no missing key, no dangling
+  - modality: text
+    text: 'baseline.yaml (nlayers: 1, usemoe: false) 5 Table 4, Table 1 TBD / "not yet logged" for PoC
+      Nact,'
+  - modality: text
+    text: positions with random tokens and gives no mask indicator; MDLM uses an absorbing state Ablation
+  - modality: text
+    text: the config's rundir is used. make test / make lint / make coverage Tests / ruff / coverage make
+  - modality: text
+    text: Pretraining/SFT/RL dataset builders, multimodal packing kairos/pipeline.py Tokenizer, dataset,
+  - modality: text
+    text: over-training is correct for edge Before any of this? Run 100 steps, measure real tok/s with
+  - modality: text
+    text: 'arXiv:2601.02609 Biderman 2023 Pythia: A Suite for Analyzing LLMs Across Training and Scaling,'
+  - modality: text
+    text: "configs/ablations/baseline.yaml. 1 Abstract, Table 1 vs \xA7compute Target is \"25M active\"\
+      \ but every"
+  - modality: text
+    text: amortizes only Adam over the batch. In a standard training step, weights are read once per
+  - modality: text
+    text: objective over one byte space shared by text, image, audio, video, lidar and control streams.
+      The
+  - modality: text
+    text: precedent" .bib has no byte-level, hierarchical or memory-transformer work (checked by grep)
+  - modality: text
+    text: HFTOKEN=hf... to read the datasets and push the model minimal and pretrain are configs shipped
+      with
+  - modality: text
+    text: convergence speed - this is exactly what made the shared-vs-separate-QKV and liz2-vs-vanilla
+  - modality: text
+    text: ARGS="--no-push" train only make pretrain NAME=dev ARGS="--set hfdata.textpct=1 --no-push" quick
+  - modality: text
+    text: single local machine. It combines bidirectional gated DeltaNet and sliding-window attention
+      over
+  - modality: text
+    text: 'diffusion). Memory gate: seeds each DeltaNet state from states left by earlier sequences. export'
+  - modality: text
+    text: 'Unverifiable or wrong (5060 Ti bandwidth is 448 GB/s, not 600) Added: per-stage table (item
+      13),'
+  - modality: text
+    text: '2022 Training Compute-Optimal LLMs (Chinchilla), arXiv:2203.15556 Williams 2009 Roofline: An'
+  - modality: text
+    text: 'kernels are optional (pure-PyTorch fallback otherwise): AMD/ROCm: uv sync --extra rocm --no-group'
+  - modality: text
+    text: 'kairos/diagnostics.py and unrelated to Scope: read-only review of the draft against the code
+      and'
+  - modality: text
+    text: test. against a constant LR needs exposing the schedule choice, not just a --set. Deliberately
+      not
+  - modality: text
+    text: 'planned: a classic MoE load-balancing auxiliary loss ablation. This codebase doesn''t use one
+      -'
+  - modality: text
+    text: Corruption described as uniform token replacement (D3PM-like), clip c added Code fills masked
+  - modality: text
+    text: tests/testpaper.py (citations, labels, placeholders, seed statistics, generated table) and
+  - modality: text
+    text: 'compute number uses 4M Eq. 1 with E=32, k=4 gives at most 25M; 4M needs k/E ~ 1/50. At 25M:
+      C ='
+  - modality: text
+    text: 'opposed to the roofline model''s done: on baseline.yaml (1.98M params) in this CPU-only sandbox,'
+  - modality: text
+    text: 'tail-mean=1.555 (n=200). One Methodology note: measure steps-to-threshold, not loss-at-fixed-steps'
+  - modality: text
+    text: 'Q/K/V/O) and a shared-expert MoE FFN. AttnRes: learned, block-windowed aggregation of earlier
+      layer'
+  - modality: text
+    text: micro-batch and reused by all its tokens, so matmul arithmetic intensity grows with tokens per
+  - modality: text
+    text: curve or number Undocumented liz2 / codec / depth / MoE effects 9 of 11 ablation configs train
+      on
+  - modality: text
+    text: "restated as a bound) before other edits. \xA7QKV sharing: \"effective higher early learning\
+      \ rate\" is"
+  - modality: text
+    text: "without optimized kernels is typically 15\u201325%. The only reliable number comes from profiling:"
+  - modality: text
+    text: "domain-scoped. Is 30B tokens justified? Yes \u2014 MoE benefits more from tokens than dense;"
+  - modality: text
+    text: 'for the fused kernels). In a clone of the repo: minimal (bundled) Offline CPU smoke run: 4'
+  - modality: text
+    text: dev run Rerunning the same --name resumes that run; a new name starts from scratch. Without
+      --name,
+  - modality: text
+    text: sentence near zero. Codec ranking after 600 steps is stable over 3 seeds (patch codec 0.018
+      to
+  - modality: text
+    text: routing balance is controlled by a learned bias (moebiasupdaterate), already explored in
+  - modality: text
+    text: 'Insightful Visual Performance Model, CACM 2009 Abnar 2025 Parameters vs FLOPs: Scaling Laws
+      for'
+  - modality: text
+    text: coherent text generation is possible well below 4M active params if data is high-quality and
+  - modality: text
+    text: feed-forward layer and a multi-scale byte PyramidalCodec, trained with a uniform-noise denoising
+  - modality: text
+    text: shared projections (LiZAttention2), block-wise Attention Residuals (AttnRes), a sparse MoE
+  - modality: text
+    text: '(rather than only min/final over the whole run, as in the ablation study above). Done: on'
+  - modality: text
+    text: 'fused after upsampling. Backbone block: pre-norm LiZAttention2 (DeltaNet + window attention,
+      shared'
+  - modality: text
+    text: that stream 12. Instrumented compute report (pipe.summary(benchmark=True), pipe.memoryreport(),
+  - modality: text
+    text: achievable loss at Kairos scale. Model Params (total) Params (active) Tokens seen Dataset Batch
+  - modality: text
+    text: is an experimental byte-level, multimodal, hybrid MoE diffusion model designed to be trained
+      on a
+  - modality: text
+    text: a 3-seed rerun before citing precise Not yet covered by the ablation study (from the paper's
+      old
+  - modality: text
+    text: 'Coherent English?, arXiv:2305.07759 Install: uv add kairos-fm (add the fast-attn extra on NVIDIA'
+  - modality: text
+    text: (configs/ablations/flow.yaml) and its sampler were not separated from the 1/p objective and
+      the
+  - modality: text
+    text: cuda (PyTorch ROCm build only); add --extra fast-attn-rocm to compile the fused kernels (needs
+      the
+  - modality: text
+    text: setup stated exactly One 440-byte string x16, about 2.9 copies per 128 tokens, window 128 is
+  - modality: text
+    text: (liz2sharedvsseparatefollowupraw.jsonl), computing steps-to-reach-threshold instead is free
+      and
+  - modality: text
+    text: 'baseline.yaml, 600 steps, seed 0 (pipe.curriculumbounds gives the exact stage boundaries):
+      MAE'
+  - modality: text
+    text: Optimal Sparsity, arXiv:2501.12370 Chronicals 2025 High-Performance Framework for LLM Fine-Tuning,
+  - modality: text
+    text: referenced cosmetic The bandwidth argument charges 4 N bytes of weight traffic per token and
+  - modality: text
+    text: depends on batch tokens x k/E. This is the abstract's central claim, so it should be checked
+      (or
+  - modality: text
+    text: 'params is out of range. Joint MoE scaling law (Ludziejewski et al., arXiv 2502.05172): The'
+  - modality: text
+    text: pipe.profile()) - measured tok/s, peak memory, and per-module step time on real hardware, as
+  - modality: text
+    text: LR-scaled separate variant). Table 3 gives single values with no seed count. Suggest "consistent
+  - modality: text
+    text: Comparing minloss at a fixed step count (as items 1-10 mostly do) conflates final capacity with
+  - modality: text
+    text: MFU 25% (assumed), and arXiv identifiers of the 10 added references (BLT and the Kimi report
+      were
+  - modality: text
+    text: 'lines 3-5 Paper: deltaf + deltab combination. Code: concat, then mergenorm, outleftright, outproj'
+  - modality: text
+    text: 'and octet-family streams. PyramidalCodec: parallel views of the sequence at growing patch sizes,'
+  - modality: text
+    text: 'measure tokens/s at several batch sizes. Every finding above is addressed in the rewrite. Checks:'
+  - modality: text
+    text: docs/experiments/.md 7 Labels sec:codec, sec:memgate, tab:bandwidth, tab:throughput never
+  - modality: text
+    text: low-active-param regime. They inform realistic expectations for data volume, compute, and
+  - modality: text
+    text: current sampler in the overfit test (6 runs). The curriculum and the memory gate have no supporting
+  - modality: text
+    text: "below have been run. Results are in ablationscodecattention.md (\xA71-10). Kept here as the\
+      \ historical"
+  - modality: text
+    text: "nlayers=4, not the 7. Attention: shared vs. separate QKV, DeltaNet alone - done, \xA77. 8.\
+      \ Memory gate"
+  - modality: text
+    text: lidar, control) Only text memorization reported Untested Codec / memory gate have "no direct
+  - modality: text
+    text: 'absent from the draft To confirm by the author: Table 3 parameter counts other than the baseline'
+  - modality: text
+    text: 4 Ntotal = 0.03, not 1.5, so Fig. 2 and Table 5 use different intensities. Expert-level reuse
+  - modality: text
+    text: NAME=d64-e7 HF data - train - push to ffurfaro/kairos/d64-e7/ make pretrain NAME=test
+  - modality: text
+    text: '"Anticipated Results") These three were specified in an earlier draft of docs/paper/kairospaper.tex'
+  - modality: text
+    text: mechanism-consistent The one robust result (methodological) Title says "Compute-Efficient",
+      yet
+  - modality: text
+    text: bits-per-byte kairos/modeling.py KairosConfig, top-level model, DeltaNet/SWA blocks, MoE wiring,
+  - modality: text
+    text: pipe.pushtohub("ffurfaro/kairos") (native HF format, checkpoints, TensorBoard run, model card).
+  - modality: text
+    text: figures are the T=1 regime Active parameters fixed at 25M everywhere (Eq. 1 with E=32, k=4);
+      4M
+  - modality: text
+    text: 'tests/testroofline.py (sizing model). Bandwidth thesis replaced by a threshold model: Tmin
+      ='
+  - modality: text
+    text: 'paper; it The implementation optimizes: tiny networks drive the denoising loss of a fixed 440-byte'
+  - modality: text
+    text: 'undocumented 3 Table 2 caption "under half patch''s cost" is false: 2.50M / 4.93M = 50.7% "2.7x'
+  - modality: text
+    text: "TinyStories (GPT-4 generated children's stories) \u2014 \u2014 Transformer, ~8L \xD7 d64 Demonstrates\
+      \ a 1M-param"
+model:
+  attn_type: liz2
+  codec_mode: conv
+  d_model: 64
+  n_heads: 4
+  n_layers: 1
+  use_moe: false
+train:
+  mask_eps: 0.001
+  mask_reweight_clip: 10.0
+  run_dir: /tmp/ablations/flow_heldout_dfm_linear
+  save_every: 10000
+  mask_path: linear
+  mask_reweight: false

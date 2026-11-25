@@ -50,6 +50,39 @@ kairos generate configs/example.yaml --n-examples 3 --max-new-tokens 64 --denois
 kairos moe-bias-check REGIME --rate 0.001 --steps 200   # REGIME: see `kairos moe-bias-check --help`
 ```
 
+## Tiny overfit experiments (one line, one yaml)
+
+Each experiment arm is a yaml in `configs/ablations/`; a run is one command, and any arm can also be built from
+`baseline.yaml` with `--set`. Results are printed (reference CE, sampling accuracy, optional held-out CE). Environment,
+the full list and the batch scripts are in `docs/experiments/README.md`.
+
+```bash
+# codec / attention tables (600 steps, restricted masking range)
+kairos overfit configs/ablations/codec_patch.yaml --steps 600 --mask-p-max 0.3 --no-mask-reweight --seed 0 --save-curve curve.json
+# training objective: 1/p weight vs plain CE, linear vs cubic path (full range)
+kairos overfit configs/ablations/flow_dfm_cubic.yaml --steps 1800 --mask-p-max 1.0 --no-mask-reweight --seed 0
+# unseen passages: train on 48, also report the CE on 24 never seen
+kairos overfit configs/ablations/flow_heldout_dfm_linear.yaml --steps 1000 --n-examples 48 --heldout 24 --mask-p-max 1.0 --no-mask-reweight
+# curriculum: leave --mask-p-max out to walk the stages inside --steps
+kairos overfit configs/ablations/flow_mdlm_control.yaml --steps 1800 --seed 0
+# training algorithm: same run, overrides on any config (JSON values accepted)
+kairos overfit configs/ablations/train_adamw.yaml --steps 1800 --mask-p-max 1.0 --mask-reweight --lr 8e-3 \
+  --set train.optimizer=muon_hybrid --set train.mask_sampling=stratified --set train.warmup_frac=0.05 --set 'train.adam_betas=[0.9,0.95]'
+```
+
+| Option | Effect |
+|---|---|
+| `--steps N` | Optimizer steps (with no `--mask-p-max`, the curriculum stages are compressed into N steps) |
+| `--n-examples N` | Size of the training subset (default 16) |
+| `--mask-p-max P`, `--mask-reweight / --no-mask-reweight` | Fixed masking regime; the `1/p` weight is clipped at `train.mask_reweight_clip` |
+| `--seed N` | Seeds initialization, step order and masking, and picks the subset: a rerun matches bit for bit |
+| `--lr X` | Peak learning rate of the overfit optimizer (default 1e-3; `--set train.lr` does not change it) |
+| `--heldout N` | Also report the reference CE on N examples outside the subset |
+| `--save-curve PATH` | Write the per-step training loss as JSON |
+
+New `train.*` keys: `optimizer` (`adamw`, `muon_hybrid`), `weight_decay`, `adam_betas`, `warmup_frac`,
+`mask_sampling` (`uniform`, `stratified`, `antithetic`) and `mask_path` (`linear`, `cubic`).
+
 ## Useful `--set` overrides
 
 ```bash

@@ -2342,3 +2342,58 @@ def test_overfit_test_reports_reference_loss_and_keeps_mask_path(tmp_path, model
 def test_train_config_rejects_unknown_mask_path():
     with pytest.raises(ValueError, match="mask_path"):
         TrainConfig(mask_path="quadratic")
+
+
+def test_overfit_test_reports_sampling_accuracy_for_both_samplers(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(epochs=1, run_dir=str(tmp_path / "run")))
+    pipe.build()
+    pipe.overfit_test(n_examples=16, steps=3, mask_p_max=1.0, mask_reweight=False)
+    assert set(pipe.overfit_sampling_accuracy) == {"dfm_8", "gen_8", "dfm_16", "gen_16"}
+    assert all(0.0 <= v <= 1.0 for v in pipe.overfit_sampling_accuracy.values())
+
+
+def test_overfit_test_is_reproducible_for_a_fixed_seed(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(epochs=1, run_dir=str(tmp_path / "run")))
+    pipe.build()
+    runs, accs = [], []
+    for _ in range(2):
+        runs.append(pipe.overfit_test(n_examples=16, steps=4, seed=3, mask_p_max=1.0, mask_reweight=False))
+        accs.append(pipe.overfit_sampling_accuracy)
+    assert [r["loss"] for r in runs[0]] == [r["loss"] for r in runs[1]]
+    assert accs[0] == accs[1]
+
+
+def test_overfit_test_reports_heldout_loss_only_on_unseen_examples(tmp_path, model_config):
+    texts = [{"modality": "text", "text": f"passage {i} " + "abcdefgh" * 12} for i in range(24)]
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    pipe = KairosMultimodalPipeline(model_config, data_config, TrainConfig(epochs=1, run_dir=str(tmp_path / "run")))
+    pipe.build()
+    pipe.overfit_test(n_examples=8, steps=3, mask_p_max=1.0, mask_reweight=False, heldout=6)
+    assert math.isfinite(pipe.overfit_heldout_loss)
+    pipe.overfit_test(n_examples=8, steps=3, mask_p_max=1.0, mask_reweight=False)
+    assert pipe.overfit_heldout_loss is None
+
+
+def test_train_config_rejects_unknown_optimizer_and_sampling():
+    with pytest.raises(ValueError, match="optimizer"):
+        TrainConfig(optimizer="sgd")
+    with pytest.raises(ValueError, match="mask_sampling"):
+        TrainConfig(mask_sampling="sobol")
+    assert TrainConfig(adam_betas=[0.9, 0.95]).adam_betas == (0.9, 0.95)
+
+
+def test_overfit_test_runs_with_muon_hybrid_warmup_and_stratified_sampling(tmp_path, model_config):
+    texts = [{"modality": "text", "text": "the quick brown fox jumps over the lazy dog " * 10}] * 16
+    data_config = DataConfig(text_examples=texts, max_len=64, batch_size=2)
+    train_config = TrainConfig(
+        epochs=1, run_dir=str(tmp_path / "run"), optimizer="muon_hybrid", warmup_frac=0.2, mask_sampling="stratified"
+    )
+    pipe = KairosMultimodalPipeline(model_config, data_config, train_config)
+    pipe.build()
+    logs = pipe.overfit_test(n_examples=16, steps=5, mask_p_max=1.0, mask_reweight=False)
+    assert all(math.isfinite(r["loss"]) for r in logs) and math.isfinite(pipe.overfit_reference_loss)
+    assert pipe.hf_trainer.mask_sampling == "stratified"

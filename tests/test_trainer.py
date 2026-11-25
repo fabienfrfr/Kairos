@@ -695,3 +695,57 @@ def test_dfm_sampler_recovers_oracle_target():
     for path in ("linear", "cubic"):
         assert torch.equal(dfm_sample(oracle, torch.randint(0, 11, target.shape), 8, path), target)
     assert torch.equal(dfm_euler_step(target, oracle(target), 0.0, 0.0), target)
+
+
+class _FakeNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbones = torch.nn.ModuleDict({"0": torch.nn.Linear(8, 8), "router": torch.nn.Linear(8, 4)})
+        self.embedding = torch.nn.Embedding(10, 8)
+
+
+def test_make_optimizer_muon_hybrid_splits_parameters_exactly_once():
+    from kairos.trainer import HybridOptimizer, make_optimizer
+
+    net = _FakeNet()
+    opt = make_optimizer(net, "muon_hybrid", 1e-3)
+    muon, adam = opt.optimizers
+    muon_ids = {id(p) for g in muon.param_groups for p in g["params"]}
+    adam_ids = {id(p) for g in adam.param_groups for p in g["params"]}
+    assert isinstance(opt, HybridOptimizer) and muon_ids == {id(net.backbones["0"].weight)}
+    assert muon_ids.isdisjoint(adam_ids) and muon_ids | adam_ids == {id(p) for p in net.parameters()}
+    before = net.backbones["0"].weight.detach().clone()
+    for p in net.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    assert not torch.equal(net.backbones["0"].weight, before)
+    with pytest.raises(ValueError, match="optimizer"):
+        make_optimizer(net, "sgd", 1e-3)
+
+
+def test_make_scheduler_warmup_ramps_then_decays_both_inner_optimizers():
+    from kairos.trainer import make_optimizer, make_scheduler
+
+    opt = make_optimizer(_FakeNet(), "muon_hybrid", 1e-2)
+    sched = make_scheduler(opt, 20, warmup_frac=0.25)
+    lrs = []
+    for _ in range(20):
+        lrs.append(opt.optimizers[0].param_groups[0]["lr"])
+        assert opt.optimizers[1].param_groups[0]["lr"] == lrs[-1]
+        opt.step()
+        sched.step()
+    assert lrs[0] < 1e-4 < lrs[4] and lrs[5] == pytest.approx(1e-2, rel=0.05) and lrs[-1] < lrs[6]
+
+
+def test_sample_noise_time_stratified_and_antithetic_structure():
+    from kairos.trainer import sample_noise_time
+
+    torch.manual_seed(0)
+    strat = sample_noise_time(64, "stratified", "cpu")
+    assert sorted((strat * 64).floor().long().tolist()) == list(range(64))
+    anti = sample_noise_time(64, "antithetic", "cpu").sort().values
+    assert torch.allclose(anti + anti.flip(0), torch.ones(64), atol=1e-5)
+    spread = lambda mode: torch.stack([sample_noise_time(16, mode, "cpu").mean() for _ in range(300)]).std()
+    assert spread("stratified") < spread("uniform") and spread("antithetic") < spread("uniform")
+    with pytest.raises(ValueError, match="sampling"):
+        sample_noise_time(4, "sobol", "cpu")

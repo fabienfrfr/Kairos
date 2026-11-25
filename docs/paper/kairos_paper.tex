@@ -41,13 +41,13 @@
 \usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 \sloppy
 
-\title{Kairos: Toward a Byte-Level Foundation Model for Every Modality\\
+\title{KairosFM: Toward a Byte-Level Foundation Model for Every Modality\\
 \large A Pyramidal Codec and Denoising Diffusion over Bidirectional Delta/Window-Attention\\
 \large Mixture-of-Experts -- Does It Converge? Sanity Checks at Tiny Scale}
 
 \author{Fabien Furfaro\thanks{Code and configurations:
 \url{https://github.com/fabienfrfr/Kairos}}}
-\date{September 2026}
+\date{November 2026}
 
 \usepackage{titling}
 \setlength{\droptitle}{-1.6cm}
@@ -69,13 +69,15 @@ at all before asking whether it is useful.
 \textbf{Methods:} We give code-derived algorithms for each component, including a
 cross-session recurrent-state memory gate, then run convergence sanity checks: overfitting
 a single 440-byte sentence at 1--15M parameters, text only, with three seeds for codec and
-attention choices and single-run sweeps for seven further factors.
+attention choices, four seeds for the training objective and the training algorithm, and single-run sweeps for seven further factors.
 \textbf{Results:} The two attention variants tested at 3\,000 steps (LiZAttention2 and
 window attention alone) reach a minimum loss near $10^{-3}$. After 600 steps, the mean
-minimum loss ranges from 0.018 (patch codec) to 0.354 (depthwise convolutional codec) with
-an identical ranking on three seeds. An apparent advantage of shared over separate
-attention projections closes with more steps or more diverse data and reverses when the
-projections are frozen: it is a convergence-speed effect, not a capacity effect.
+minimum loss ranges from 0.017 (patch codec) to 0.273 (depthwise convolutional codec) with
+the same codec ranking on every seed (five seeds, three for the two largest codecs). The
+hybrid attention is not separable from window attention alone ($0.273\pm0.309$ against
+$0.336\pm0.177$). An apparent advantage of shared over separate attention projections, seen in
+unseeded single runs, closes with more steps or more diverse data, reverses when the projections are
+frozen, and does not replicate across five seeded runs.
 \textbf{Conclusions:} These checks suggest that the implementation optimizes; they say
 nothing about generalization, multimodal training or comparison with existing models, which
 a planned pretraining run is meant to address. The Discussion sizes a 200M-total/25M-active
@@ -143,12 +145,12 @@ are planned and not reported (\S\ref{sec:future}).
         (Algorithm~\ref{alg:diffusion}), each adapted from a specific prior
         method or, for the codec and the memory gate, combining existing
         ideas.
-  \item A convergence study at tiny scale (\S\ref{sec:ablations}) with 3-seed
-        statistics for codec and attention choices and single-run sweeps for
+  \item A convergence study at tiny scale (\S\ref{sec:ablations}, \S\ref{sec:flowarms}) with seeded
+        multi-seed statistics for codec, attention and training-objective choices and single-run sweeps for
         seven further factors.
   \item A worked correlation-versus-causation case
         (\S\ref{sec:qkv-sharing}): a clear single-run effect that does not
-        survive three controls, and a recommendation to report
+        survive three controls or a seeded replication, and a recommendation to report
         steps-to-threshold rather than loss at a fixed step.
 \end{enumerate}
 The Discussion also sizes an untrained 200M-total/25M-active target with a roofline argument
@@ -214,10 +216,16 @@ self-conditioning~\citep{chen2022analogbits} and a three-stage curriculum
 path~\citep{gat2024dfm} with a uniform source and a linear scheduler, so the unweighted
 objective ($\alpha=0$) is its posterior cross-entropy. Discrete flow matching was scaled to
 1.7B parameters on code~\citep{gat2024dfm}; continuous flow-matching language models
-now include ELF~\citep{hu2026elf}, LangFlow~\citep{chen2026langflow} and
-FLM~\citep{lee2026flowmaplm}, reported at 0.1--0.7B parameters on OpenWebText. Kairos
+now include ELF~\citep{hu2026elf} (105M to 652M parameters), LangFlow~\citep{chen2026langflow}
+(130M) and FLM~\citep{lee2026flowmaplm}, all evaluated on OpenWebText. Kairos
 does not train with any of them; the trainer exposes the discrete scheduler (\texttt{mask\_path}) and
-an Euler sampler for it (\texttt{dfm\_sample}); only the training arms were compared with the current objective, on the overfitting protocol, and the sampler was not.
+an Euler sampler for it (\texttt{dfm\_sample}); both were compared with the current objective and sampler only on the overfitting protocol (\S\ref{sec:flowarms}).
+
+\paragraph{Optimizers and noise sampling.} Muon~\citep{jordan2024muon} orthogonalizes the update of each 2D weight
+matrix and was reported at about twice the compute efficiency of AdamW at multi-billion scale~\citep{liu2025muon};
+block diffusion clips the noise schedule to reduce gradient variance~\citep{arriola2025bd3lm}. We test Muon on the
+backbone matrices and stratified or antithetic draws of the noise level at tiny scale (\S\ref{sec:optarms}); we do not
+test other optimizers.
 
 \paragraph{Recurrent memory.} Transformer-XL carries hidden states across
 segments~\citep{dai2019transformerxl}, Titans learn a test-time
@@ -496,8 +504,8 @@ only on the persisted step count. It is flat at $(0.3,\,0)$ in the MAE stage,
 ramps linearly to $(1.0,\,1)$ over the transition stage, then stays flat in
 the diffusion stage. The staging was introduced after an informal observation
 of optimization instability when sampling the full masking range from a random
-initialization; that observation is not quantified here, and no run without
-the curriculum is reported.
+initialization; that observation is not quantified here. A seeded control without the
+curriculum is reported in \S\ref{sec:curriculum-control}.
 
 \section{Experimental Protocol}
 
@@ -572,9 +580,10 @@ positions of the finest scale, so the window branch attends globally. Every
 step draws a fresh corruption, and \emph{min.\ loss} is the minimum over the
 run of the per-step training loss, an extreme value of a noisy per-batch
 quantity. Training and evaluation data coincide, so the study measures
-memorization speed, not generalization. Runs are not bit-reproducible even at
-a fixed seed: the baseline at seed 0 gave $0.227$ in one run and $0.31$ in
-another. Seeds are 0, 1, 2 where stated; standard deviations are sample
+memorization speed, not generalization. The runs behind Tables~\ref{tab:seeds}--\ref{tab:qkv-sharing}
+were not bit-reproducible at a fixed seed (the baseline at seed 0 gave $0.227$ in one run and $0.31$ in
+another) because the seed only selected the training subset; it now also seeds initialization, step order and
+masking, and the flow-matching runs of \S\ref{sec:flowarms} are reproducible. Seeds are 0, 1, 2 where stated; standard deviations are sample
 standard deviations ($n-1$).
 
 \section{Results}
@@ -582,19 +591,20 @@ standard deviations ($n-1$).
 All results are convergence sanity checks (\S\ref{sec:protocol}) on the ablation networks of
 Table~\ref{tab:configs}: the training data are the evaluation data, so they measure
 memorization speed, not generalization. \S\ref{sec:ablations} compares codecs and attention
-variants, \S\ref{sec:qkv-sharing} reports a single-run effect that did not survive controls,
+variants, \S\ref{sec:flowarms} compares training objectives (loss weight and corruption path), \S\ref{sec:optarms} compares optimizers and noise sampling,
+\S\ref{sec:qkv-sharing} reports a single-run effect that did not survive controls,
 and the last subsection covers the curriculum and the memory gate.
 
 \subsection{Convergence of the tiny-scale networks}
 \label{sec:ablations}
 
-Table~\ref{tab:seeds} reports the codec and attention choices under three
-seeds, on the setup of \S\ref{sec:protocol}. Codec ranking is identical on
+Table~\ref{tab:seeds} reports the codec and attention choices under five
+seeds (three for the two largest codecs), on the setup of \S\ref{sec:protocol}. Codec ranking is identical on
 every seed: \texttt{patch} $<$ dense \texttt{conv} $<$ \texttt{conv} with 8
 channels per group $<$ depthwise \texttt{conv} (\texttt{liz2}
-baseline), from $0.018$ to $0.354$. The hybrid attention beats SWA alone on
-every seed ($0.227$, $0.258$, $0.576$ against $0.596$, $0.728$, $0.798$),
-although the mean $\pm$ sd ranges overlap. The notebook config uses \texttt{conv} with 8
+baseline), from $0.017$ to $0.273$. The hybrid attention is not separable from SWA alone:
+its minimum loss is lower on three of five seeds ($0.101$, $0.100$, $0.070$ against $0.219$, $0.584$,
+$0.144$) and higher on two, and it reaches a loss of 1 earlier on three seeds, ties on one and is later on one. The notebook config uses \texttt{conv} with 8
 channels per group, a compromise between the depthwise default and the dense
 variants.
 
@@ -603,26 +613,26 @@ variants.
 \small
 \begin{tabular}{lrrrrr}
 \toprule
-Configuration & Seed 0 & Seed 1 & Seed 2 & Mean $\pm$ sd & Params \\
+Configuration & Seeds & Min.\ loss (mean $\pm$ sd) & Last-100 mean & Steps to $\le 1$ & Params \\
 \midrule
-\texttt{liz2}, depthwise codec (baseline) & 0.227 & 0.258 & 0.576 & $0.354 \pm 0.193$ & 1.98M \\
-\texttt{vanilla} (SWA only), depthwise codec & 0.596 & 0.728 & 0.798 & $0.707 \pm 0.103$ & 1.81M \\
-\texttt{conv} codec, 8 channels per group & 0.106 & 0.045 & 0.075 & $0.075 \pm 0.031$ & 2.50M \\
-\texttt{conv} codec, dense (64 channels per group) & 0.037 & 0.024 & 0.024 & $0.028 \pm 0.007$ & 8.10M \\
-\texttt{patch} codec (one \texttt{Linear} per scale) & 0.019 & 0.016 & 0.018 & $0.018 \pm 0.002$ & 4.93M \\
+\texttt{liz2}, depthwise codec (baseline) & 5 & $0.273 \pm 0.309$ & 0.387 & 232 & 1.98M \\
+\texttt{vanilla} (SWA only), depthwise codec & 5 & $0.336 \pm 0.177$ & 0.607 & 273 & 1.81M \\
+\texttt{conv} codec, 8 channels per group & 5 & $0.054 \pm 0.018$ & 0.067 & 178 & 2.50M \\
+\texttt{conv} codec, dense (64 channels per group) & 3 & $0.024 \pm 0.001$ & 0.028 & 112 & 8.10M \\
+\texttt{patch} codec (one \texttt{Linear} per scale) & 3 & $0.017 \pm 0.001$ & 0.019 & 86 & 4.93M \\
 \bottomrule
 \end{tabular}
-\caption{Minimum training loss after 600 steps, three seeds
-(\nolinkurl{docs/experiments/ablations_codec_attention.md}, \S1). Depthwise
-saves parameters relative to \texttt{patch} (1.98M against 4.93M) at the cost
-of slower memorization; 8 channels per group recovers most of the gap for
-about half of \texttt{patch}'s parameters (2.50M against 4.93M). The
-\texttt{liz2}-versus-\texttt{vanilla} gap is a convergence-speed effect
-(\S\ref{sec:qkv-sharing}).}
+\caption{Seeded, reproducible re-measurement after 600 steps (seeds 0--4, or 0--2 for the two
+largest codecs; \nolinkurl{docs/experiments/ablations_codec_attention.md}, \S12). Min.\ loss is the
+minimum of the per-step training loss, last-100 the mean of the final 100 steps, steps-to-1 the mean first step
+with loss $\le 1$. Depthwise saves parameters relative to \texttt{patch} (1.98M against 4.93M) at the cost
+of slower memorization; 8 channels per group recovers most of the gap for about half of
+\texttt{patch}'s parameters. The \texttt{liz2}-versus-\texttt{vanilla} gap of the earlier unseeded runs
+($0.354$ against $0.707$ over three seeds) is not reproduced.}
 \label{tab:seeds}
 \end{table}
 
-The seed spread ($\pm0.002$ to $\pm0.193$) sets the noise floor for the
+The seed spread ($\pm0.001$ to $\pm0.309$) sets the noise floor for the
 single-run sweeps of Table~\ref{tab:sweeps}, so differences of a few
 hundredths there are not readable. Monotone trends are consistent with the
 expected direction but confounded with the setup: at 128 tokens a sequence
@@ -657,6 +667,114 @@ level.}
 \label{tab:sweeps}
 \end{table}
 
+\subsection{Convergence by training objective: loss weight and corruption path}\label{sec:flowarms}
+
+Beyond the architecture, the denoising objective is itself a factor of the convergence study. The uniform-noise
+objective of \S\ref{sec:objective} is a special case of discrete flow matching~\citep{gat2024dfm}, so we vary the
+corruption path and the loss weight with the architecture fixed. Because the loss definitions differ, this factor is
+compared on a common reference rather than on the minimum training loss of the other tables.
+
+Three arms share the tiny baseline model and train over the full range $p_{\max}=1$: the $1/p$-weighted objective of
+\S\ref{sec:objective}, and two unweighted (discrete flow matching) arms with a linear or a cubic path. Training losses
+differ in definition, so we compare on common measures taken before the weights are restored: the plain cross-entropy under
+the linear path, and the exact-token rate of a 64-token continuation of a 32-token prompt, sampled from noise in 8 and 16
+steps by the discrete flow-matching Euler sampler and by the entropy-bound sampler. Runs are seeded and reproducible, and
+arms are paired by seed (four seeds).
+
+\paragraph{Results at two learning rates.} Each experiment ran at a learning rate of $10^{-3}$, which was not swept, and
+again at $8\times10^{-3}$, the rate selected for AdamW in \S\ref{sec:optarms}. Memorization uses 1800 steps on one sentence and
+the unseen-passage test 1000 steps (48 training and 24 held-out passages); Table~\ref{tab:objective} gives the reference
+cross-entropy on the memorized subset and on the held-out passages.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+ & \multicolumn{2}{c}{Memorized subset} & \multicolumn{2}{c}{Held-out passages} \\
+Arm & $10^{-3}$ & $8\times10^{-3}$ & $10^{-3}$ & $8\times10^{-3}$ \\
+\midrule
+Weighted $1/p$ (control) & $0.140 \pm 0.099$ & $0.082 \pm 0.106$ & $3.494 \pm 0.026$ & $3.591 \pm 0.045$ \\
+Flow matching, linear path & $0.132 \pm 0.137$ & $0.073 \pm 0.052$ & $3.526 \pm 0.025$ & $3.675 \pm 0.064$ \\
+Flow matching, cubic path & $0.145 \pm 0.078$ & $0.034 \pm 0.027$ & $3.571 \pm 0.030$ & $3.805 \pm 0.079$ \\
+\bottomrule
+\end{tabular}
+\caption{Reference cross-entropy of the training-objective arms (mean $\pm$ sd over four seeds) at two
+learning rates (\nolinkurl{docs/experiments/ablations_codec_attention.md}, \S11).}
+\label{tab:objective}
+\end{table}
+
+On the memorized subset no flow-matching arm is separated from the control at either rate. Paired by seed, the linear arm
+differs from the control by $-0.008\pm0.065$ and the cubic arm by $+0.005\pm0.085$ at $10^{-3}$, and by
+$-0.009\pm0.072$ and $-0.048\pm0.091$ at $8\times10^{-3}$ (the cubic arm is lower on two seeds of four). On sampling,
+the entropy-bound sampler is above the flow-matching sampler in 10 and 11 of 12 runs at $10^{-3}$ (about $+0.12$
+exact-token rate at 8 and 16 steps); at $8\times10^{-3}$ the two samplers tie in 10 and 11 of 12 runs because the
+accuracy saturates, so no sampler comparison is possible at that rate.
+
+On the held-out passages both flow-matching arms are worse than the control on all four seeds at both rates: by
+$+0.032\pm0.009$ and $+0.077\pm0.010$ at $10^{-3}$, and by $+0.084\pm0.019$ and $+0.214\pm0.123$ at $8\times10^{-3}$. At
+$8\times10^{-3}$ their training cross-entropy is lower on all four seeds ($-0.086\pm0.057$ and $-0.161\pm0.144$), so the
+train--held-out gap grows from $0.517$ (control) to $0.687$ and $0.892$ ($0.416$, $0.475$ and $0.574$ at $10^{-3}$).
+A smoothed unigram predictor fitted on 48 random passages scores $3.446$ nats on 24 others (four random splits) and a
+bigram predictor $2.927$ (characters rather than model tokens and no masking, so indicative only); the held-out values
+at $8\times10^{-3}$ lie above the unigram reference. The $1/p$ weight also changes the effective gradient scale, which we
+did not control, and we do not claim a cause.
+
+We therefore report no advantage for flow matching in training or sampling at either rate, and a larger generalization
+gap on unseen passages. The corrector, time conditioning, larger models and real corpora are untested (ablation log,
+\S11).
+
+\subsection{Convergence by training algorithm: optimizer and noise sampling}\label{sec:optarms}
+
+Two further factors of the training algorithm are varied with the architecture and the objective of
+\S\ref{sec:objective} fixed (full masking range, $1/p$ weight clipped at 10, linear path): the optimizer, and how the
+noise level $t$ is drawn for the rows of a batch. The optimizer is AdamW; AdamW with betas $(0.9,0.95)$, weight decay $0.1$
+and a 5\% linear warmup; or Muon~\citep{jordan2024muon} on the 2D matrices of the backbone (routers excluded) with AdamW on
+every other parameter. The noise level is drawn independently per row (uniform, the default), one per stratum of width $1/B$
+(stratified), or as $(t,1-t)$ pairs (antithetic). The antithetic arm pairs rows that carry different sequences, so it is not
+the complementary-mask scheme of the literature, which pairs two corruptions of the same sequence.
+
+\paragraph{Protocol.} The learning rate is swept per optimizer over seven values from $5\times10^{-4}$ to
+$3.2\times10^{-2}$ (600 steps, seeds 9 and 10, which are not used afterwards) and the value with the lowest mean
+reference cross-entropy is kept; all three optimizers select $8\times10^{-3}$, bracketed by $4\times10^{-3}$ and
+$1.6\times10^{-2}$, and the two noise-sampling arms reuse the AdamW rate. The sweep is noisy over two seeds, for
+instance AdamW scores $0.121$ at $3.2\times10^{-2}$ and $0.431$ at $1.6\times10^{-2}$. The final runs use the
+1800-step memorization protocol of \S\ref{sec:flowarms} on seeds 0--3, paired by seed.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+Arm & Seeds & Reference CE (mean $\pm$ sd) & Paired difference to AdamW \\
+\midrule
+AdamW & 4 & $0.082 \pm 0.106$ & --- \\
+AdamW (betas 0.9/0.95, decay 0.1, warmup) & 4 & $0.052 \pm 0.065$ & $-0.030 \pm 0.105$ (lower on 3/4) \\
+Muon on backbone matrices & 4 & $0.052 \pm 0.050$ & $-0.030 \pm 0.061$ (lower on 3/4) \\
+Stratified $t$ & 4 & $0.069 \pm 0.045$ & $-0.013 \pm 0.112$ (lower on 2/4) \\
+Antithetic $t$ & 4 & $0.136 \pm 0.124$ & $+0.054 \pm 0.159$ (lower on 2/4) \\
+\bottomrule
+\end{tabular}
+\caption{Training-algorithm arms after 1800 steps at a learning rate of $8\times10^{-3}$ on one memorized sentence
+(reference cross-entropy as in \S\ref{sec:flowarms}; \nolinkurl{docs/experiments/training_algorithms.md}).}
+\label{tab:optarms}
+\end{table}
+
+Table~\ref{tab:optarms} shows that no arm is separated from AdamW: every paired difference is smaller than its own standard deviation, and the seed spread
+(some seeds memorize almost perfectly, with a reference cross-entropy near $10^{-3}$, others stay between $0.05$ and
+$0.29$ for the same arm) is as large as the differences between arms. The tuned AdamW and Muon are lower on three seeds
+of four, which is not enough to claim an effect. We do not report generation accuracy across arms: it is measured on a
+batch drawn from the training subset, whose rows are different windows of the sentence, and the batch depends on how much
+random state the arm consumed, so the three uniform arms are evaluated on the same rows and the two noise-sampling arms
+on different ones.
+
+Two limits apply. The objective and curriculum experiments were run at $10^{-3}$ and repeated at $8\times10^{-3}$
+(\S\ref{sec:flowarms}, \S\ref{sec:curriculum-control}) and their conclusions do not depend on the rate, although the rate matters
+elsewhere: at 600 steps AdamW scores $0.864$ at $10^{-3}$ against $0.054$ at $8\times10^{-3}$, while at 1800 steps on seed 0
+it scores $0.2368$ and $0.2378$. The complementary-mask antithetic scheme and weight averaging
+were not tested, and a single memorized sentence on a tiny model says little about Muon at the scale where it is
+reported to help.
+
 \subsection{A correlation-versus-causation case: shared versus separate QKV}
 \label{sec:qkv-sharing}
 
@@ -686,6 +804,13 @@ steps or diverse data both variants reach the same floor.}
 \label{tab:qkv-sharing}
 \end{table}
 
+\paragraph{Seeded replication.} Five reproducible 600-step runs (seeds 0--4, otherwise the setup of
+Table~\ref{tab:seeds}) give a minimum loss of $0.273 \pm 0.309$ for shared and $0.179 \pm 0.098$ for separate projections
+(last-100 means $0.387$ and $0.272$; steps to a loss of 1: 232 and 221). Shared is lower on two seeds of five, so the
+600-step row of Table~\ref{tab:qkv-sharing} is not reproduced. The earlier unseeded runs differed from the seeded ones
+in an uncontrolled way (the seed then drove only the subset), and run-to-run noise of this size, one baseline seed at
+$0.803$ against $0.07$--$0.29$, is enough to produce the apparent gap, though we did not isolate that cause.
+
 The same check applies to \texttt{liz2} against \texttt{vanilla}: at
 3\,000 steps \texttt{vanilla} reaches $0.0014$, matching \texttt{liz2}'s
 $0.0011$. Computing steps-to-threshold from the saved curves shows that the
@@ -706,7 +831,7 @@ Table~\ref{tab:stages} splits one 600-step run (baseline, seed 0) by
 curriculum stage (200 steps each). Losses are not comparable across stages
 because the objective changes with $(p_{\max},\alpha)$; the higher tail mean
 of the transition stage is consistent with the reweighting ramp raising the
-loss scale. This is a single seed, and no run without the curriculum exists.
+loss scale. This is a single seed; the control of \S\ref{sec:curriculum-control} compares with a run without the curriculum.
 
 \begin{table}[t]
 \centering
@@ -726,21 +851,22 @@ definition is given there.}
 \label{tab:stages}
 \end{table}
 
+\paragraph{Curriculum control.}\label{sec:curriculum-control} The 1800-step memorization protocol of
+\S\ref{sec:flowarms} (four seeds, reproducible) was run with the three-stage curriculum compressed into 1800 steps and
+without it (full masking range with the $1/p$ weight from random initialization), at learning rates of $10^{-3}$ and
+$8\times10^{-3}$. The reference cross-entropy is $0.126\pm0.102$ with the curriculum and $0.140\pm0.099$ without at
+$10^{-3}$ (paired difference $-0.014\pm0.018$, lower with the curriculum on three of four seeds), and $0.067\pm0.099$
+against $0.082\pm0.106$ at $8\times10^{-3}$ ($-0.015\pm0.149$, lower on two of four seeds). No optimization instability
+appeared without the curriculum in these runs, so the observation that motivated the staging is not reproduced at this
+scale, and no benefit of the curriculum is detected either. This is a memorization setting on a tiny model; it says
+nothing about larger models or held-out data.
+
+
 The memory gate was tested through the full training loop for 3 epochs (12
 optimizer steps, so absolute losses are not comparable to the rest of the
 study): min.\ loss $7.512$ without the gate, $7.453$ with the previous batch's
 state only, $7.423$ with a random bank, and final loss $12.927$, $12.893$ and
 $9.752$. Twelve steps cannot separate the variants; we draw no conclusion.
-
-\subsection{Flow-matching training arms}
-
-Three arms share the tiny baseline model and train over the full range $p_{\max}=1$ for 600 steps: the
-$1/p$-weighted objective of \S\ref{sec:objective}, and two unweighted (discrete flow matching) arms with a linear or a
-cubic path. Their training losses differ in definition, so all are compared on one reference: plain cross-entropy
-under the linear path, measured on the memorized subset. Over three seeds it is $0.548\pm0.170$ (weighted control),
-$0.795\pm0.341$ (linear flow matching) and $0.777\pm0.157$ (cubic). The control is lowest on each seed, but the gap lies
-within the seed spread, linear and cubic do not differ, and the measure is a training-set one. We therefore report
-no advantage for flow matching; generation with its sampler is untested (ablation log, \S11).
 
 \section{Discussion}
 
@@ -750,19 +876,20 @@ learns transferable structure. Taken together, the observations suggest that:
 \begin{itemize}
   \item the codec ranking of Table~\ref{tab:seeds} is stable across three seeds, but it was
         measured after 600 steps on one repeated sentence and is a memorization-speed ranking;
-  \item the hybrid attention (\texttt{liz2}) reaches a lower loss than window attention alone
-        at 600 steps on every seed, and both reach the same floor at 3\,000 steps;
-  \item the shared-projection advantage is a convergence-speed effect (\S\ref{sec:qkv-sharing});
-        the mechanism is consistent with the freezing control but not isolated;
+  \item the hybrid attention (\texttt{liz2}) is not separable from window attention alone at 600 steps
+        over five seeded runs, and both reach the same floor at 3\,000 steps;
+  \item the shared-projection advantage seen in unseeded runs does not replicate under five seeds
+        (\S\ref{sec:qkv-sharing}); the earlier mechanism remained consistent with the freezing control but was never isolated;
   \item depth, top-1 versus top-2 routing and the AttnRes block size show no measurable
         effect in this setup, the block-size result being a saturation effect;
-  \item the curriculum and the memory gate have no supporting result: one seed for the
-        former, twelve optimizer steps for the latter.
+  \item the curriculum shows no detectable effect over four seeds on one memorized sentence
+        (\S\ref{sec:curriculum-control}), and the memory gate has no supporting result beyond twelve
+        optimizer steps.
 \end{itemize}
 
 \paragraph{Practical implications.} The ablation runs used a CPU. A memorization test of this
-kind can be repeated whenever a component changes, but the seed spread ($\pm0.002$ to
-$\pm0.193$ in Table~\ref{tab:seeds}) limits which differences it can detect.
+kind can be repeated whenever a component changes, but the seed spread ($\pm0.001$ to
+$\pm0.309$ in Table~\ref{tab:seeds}) limits which differences it can detect.
 
 \paragraph{Compute sizing of the target.}
 \label{sec:sizing}
@@ -797,7 +924,7 @@ The numbers come from \texttt{scripts/roofline.py}.
 \subsection{Limitations}
 
 The ablation study memorizes one sentence in 16 copies on text only, with a window branch that
-attends globally, on CPU, with runs that are not bit-reproducible; its metric is a minimum over
+attends globally, on CPU, with the runs of Tables~\ref{tab:seeds}--\ref{tab:qkv-sharing} produced before seeds were fixed (not bit-reproducible); its metric is a minimum over
 noisy per-step losses. Only Table~\ref{tab:seeds} and \S\ref{sec:qkv-sharing} carry multi-seed
 or multi-control statistics; the other sweeps are single-run. Parameter counts of the ablation
 rows in Table~\ref{tab:seeds} other than the baseline are carried over from earlier logs. The
@@ -824,7 +951,7 @@ byte-level vocabulary puts nearly all Kairos parameters in the backbone, so tota
 non-embedding and active parameters and FLOPs per byte should all be reported. A Pythia-shaped
 model trained on the same data would separate architecture from data, and a held-out corpus
 that neither model has seen would avoid favoring Kairos; (iii) 3-seed, steps-to-threshold
-reruns of the single-run sweeps on diverse data; (iv) a run without the curriculum; (v) a
+reruns of the single-run sweeps on diverse data; (iv) the curriculum control of \S\ref{sec:curriculum-control} repeated on held-out data and at larger scale; (v) a
 measured tokens/s against microbatch size for the 200M/25M and a 50M/25M variant, which tests
 Eq.~\ref{eq:tmin} directly.
 
@@ -832,9 +959,9 @@ Eq.~\ref{eq:tmin} directly.
 
 Kairos poses a design question at 1--15M parameters: whether a hybrid bidirectional
 DeltaNet/window-attention, MoE, denoising architecture over a byte-level space optimizes at
-all. Memorization tests answer yes at this scale. The clearest architectural effect in these tests, a
-shared-projection advantage, was a convergence-speed artifact, which is why we recommend
-steps-to-threshold and control runs before reading a tiny-scale comparison. Generalization,
+all. Memorization tests answer yes at this scale. The clearest architectural effect in the first runs, a
+shared-projection advantage, closed with more steps or data and did not replicate across five seeded runs,
+which is why we recommend seeded runs, steps-to-threshold and control runs before reading a tiny-scale comparison. Generalization,
 multimodal training and comparison with existing models are the objectives of the run described
 in \S\ref{sec:future}; the 200M/25M design point of \S\ref{sec:sizing} is a sizing exercise only.
 

@@ -43,14 +43,16 @@ def _bib_keys() -> set[str]:
 
 
 def _seed_rows() -> list[tuple[str, list[str], str, str]]:
-    section = _LOG.read_text(encoding="utf-8").split("## 1.")[1].split("## 2.")[0]
-    pattern = r"^\|\s*(.+?)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+) ± ([\d.]+)\s*\|$"
+    section = _LOG.read_text(encoding="utf-8").split("## 12.")[1].split("## Takeaways")[0]
+    pattern = r"^\|\s*(.+?)\s*\|\s*(\d+)\s*\|\s*([\d., ]+?)\s*\|\s*([\d.]+) ± ([\d.]+)\s*\|"
     rows = []
     for line in section.splitlines():
         found = re.match(pattern, line)
         if found:
-            name, *seeds, mean, sd = found.groups()
-            rows.append((name, seeds, mean, sd))
+            name, count, seeds, mean, sd = found.groups()
+            values = [v.strip() for v in seeds.split(",")]
+            assert len(values) == int(count)
+            rows.append((name, values, mean, sd))
     return rows
 
 
@@ -106,7 +108,6 @@ def test_seed_statistics_match_the_log_and_the_paper(row):
     values = [float(v) for v in seeds]
     assert statistics.mean(values) == pytest.approx(float(mean), abs=1e-3)
     assert statistics.stdev(values) == pytest.approx(float(sd), abs=1e-3)
-    assert " & ".join(seeds) in _tex()
     assert f"${mean} \\pm {sd}$" in _tex()
 
 

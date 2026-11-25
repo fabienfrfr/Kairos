@@ -37,10 +37,11 @@ has not been instantiated or trained.
 ## What the paper shows
 
 * The implementation optimizes: tiny networks drive the denoising loss of a fixed 440-byte sentence near zero.
-* Codec ranking after 600 steps is stable over 3 seeds (patch codec 0.018 to depthwise conv codec 0.354).
-* The advantage of shared over separate attention projections is a convergence-speed effect, not a capacity effect.
-* A discrete flow-matching training arm (`configs/ablations/flow_*.yaml`) did not beat the `1/p`-weighted objective in the overfit test (3 seeds).
-* The curriculum and the memory gate have no supporting result yet.
+* Codec ranking after 600 steps is stable over 5 seeded runs (patch codec 0.017 to depthwise conv codec 0.273; 3 seeds for the two largest codecs).
+* The hybrid attention is not separable from window attention alone at 600 steps, and the apparent advantage of shared over separate projections (unseeded runs) did not replicate.
+* The curriculum shows no detectable effect on a memorized sentence (4 seeds, two learning rates); the memory gate has no supporting result yet.
+* Training algorithm (optimizer: AdamW, tuned AdamW, Muon on the backbone matrices; noise sampling: stratified, antithetic): no arm is separated from AdamW over 4 seeds at a swept learning rate. Reproduction instructions: `docs/experiments/README.md`.
+* Training objective as a convergence factor: the denoising objective is a special case of discrete flow matching; on 4 seeds and at two learning rates (1e-3 and the tuned 8e-3), changing its path (linear, cubic) or dropping the `1/p` weight gave no gain on memorization and was worse on unseen passages (4/4 seeds at both rates).
 
 ```bibtex
 @misc{furfaro2026kairos,

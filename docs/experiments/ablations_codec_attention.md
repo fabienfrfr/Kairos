@@ -2,17 +2,18 @@
 
 ## Reproducibility
 
-- **kairos**: `0.4.1.dev46` (`python -c "import kairos; print(kairos.__version__)"`)
-- **torch**: `2.14.0+cu130` (project requires `torch>=2.10.0`)
-- Base setup: `d_model=64`, 1 layer unless noted, MoE off unless noted, 16 identical
-  repeated sentences, 600 steps, fixed mask regime (`mask_p_max=0.3`, no reweighting)
-  unless noted. Configs in `configs/ablations/`.
-- **Known limitation**: even at a fixed seed, results vary run to run (non-deterministic
-  CPU ops) — e.g. `baseline` at seed 0 measured 0.227 in one run, 0.31 in another. Single
-  numbers below (everything but §1) should be read as indicative, not exact; §1
-  quantifies the actual noise floor.
+Full instructions, commands and the environment are in `docs/experiments/README.md`; this log holds the interpretation.
 
-## 1. Seed robustness (3 seeds, `--seed 0/1/2`)
+- **Original runs (§1-§10)**: `kairos 0.4.1.dev46`, `torch 2.14.0+cu130`. They are **not reproducible**: `--seed` then
+  only selected the training subset, while initialization, step order and masking used an unseeded global RNG (this, not
+  non-deterministic CPU ops, is why `baseline` at seed 0 gave 0.227 in one run and 0.31 in another).
+- **Seeded runs (§11-§13 and `training_algorithms.md`)**: `kairos 0.4.1.dev28` (version file of the sandbox), `torch 2.15.0` CPU, Python 3.12.3, transformers 5.23.0, one core.
+  `--seed` now also seeds initialization, step order and masking; a repeated run matched bit for bit on this machine.
+- Base setup: `d_model=64`, 1 layer unless noted, MoE off unless noted, one sentence split into 4 windows each repeated
+  16 times (64 examples; the overfit subset takes 16), 600 steps, fixed mask regime (`mask_p_max=0.3`, no reweighting)
+  unless noted. Configs in `configs/ablations/`.
+
+## 1. Seed robustness (v1, 3 unseeded runs; superseded by §12)
 
 | Config | seed 0 | seed 1 | seed 2 | mean ± std |
 |---|---:|---:|---:|---:|
@@ -22,9 +23,8 @@
 | `codec_conv_dense` | 0.037 | 0.024 | 0.024 | 0.028 ± 0.007 |
 | `codec_patch` | 0.019 | 0.016 | 0.018 | 0.018 ± 0.002 |
 
-`baseline` beats `attn_vanilla` on all 3 individual seeds (paired comparison), despite
-overlapping mean±std ranges — the gap is real, not a single-seed fluke. Codec ranking
-(`patch` < `conv-dense` < `conv-cpg8`) is stable across all seeds too.
+Historical record: these runs were not reproducible (the seed only chose the subset). The claim that `baseline`
+beats `attn_vanilla` on every seed does not survive the seeded re-measurement (§12); the codec ranking does.
 
 ```bash
 kairos overfit configs/ablations/<name>.yaml --steps 600 --mask-p-max 0.3 --no-mask-reweight --seed <0|1|2>
@@ -158,30 +158,120 @@ far fewer steps - 3 epochs x 4 batches).
 All three are close; 12 steps total is too few to draw a conclusion either way. Would
 need many more steps/epochs to say whether the memory gate's content matters.
 
-## 11. Flow-matching training arms (`flow_*`, full range `mask_p_max=1.0`, 600 steps)
+## 11. Flow-matching training arms (`flow_*`, `mask_p_max=1.0`)
 
-Arms differ in the corruption path and loss weight; configs `flow_mdlm_control`, `flow_dfm_linear`,
-`flow_dfm_cubic` (same tiny `baseline` model). Training losses are **not comparable** across arms (different
-weights and path distributions), so each run also reports a common *reference CE*: plain CE, linear path,
-`p ~ U(0, 1)`, measured on the memorized subset after training (`pipe.overfit_reference_loss`).
+Arms differ in the corruption path and loss weight: `flow_mdlm_control` (linear, `1/p` clipped at 10),
+`flow_dfm_linear` and `flow_dfm_cubic` (plain CE). Training losses are not comparable across arms, so each run reports
+common yardsticks computed before the weights are restored: a *reference CE* (plain CE, linear path, `p ~ U(0, 1)`) and a
+*sampling accuracy* (exact-token rate over a 64-token continuation of a 32-token prompt, from uniform noise) for the arm's
+`dfm_sample` and the entropy-bound `generate()` at 8 and 16 steps. An earlier 600-step batch (6 runs per arm, seeds not yet
+reproducible) is superseded: the seed only drove the subset choice; it now also seeds init, step order and masking
+(`test_overfit_test_is_reproducible_for_a_fixed_seed`).
 
-| Arm | path / weight | seed 0 | seed 1 | seed 2 | mean ± std |
-|---|---|---:|---:|---:|---:|
-| `flow_mdlm_control` | linear, `1/p` (clip 10) | 0.743 | 0.423 | 0.480 | 0.548 ± 0.170 |
-| `flow_dfm_linear` | linear, plain CE | 1.183 | 0.539 | 0.662 | 0.795 ± 0.341 |
-| `flow_dfm_cubic` | cubic, plain CE | 0.951 | 0.735 | 0.646 | 0.777 ± 0.157 |
+### 11a. Memorization of one sentence (1800 steps, seeds 0-3, paired by seed)
 
-- The `1/p` control has the lowest reference CE on all 3 seeds; the gap to the DFM arms (0.23-0.25 on average) is
-  within the seed spread, so it is a 3-of-3 pairing, not a measured effect size.
-- `linear` vs `cubic` DFM are indistinguishable at this budget.
-- Caveats: memorized 16-copy sentence (reference CE is a training-set measure), one tiny model, 3 seeds, and
-  run-to-run non-determinism (`flow_dfm_linear` seed 0 gave 1.136 in a timing run and 1.183 here).
-- Not tested: generation quality of `dfm_sample`, held-out data, the corrector, larger models.
+| Arm | reference CE | `dfm_sample` 8 | `generate` 8 | `dfm_sample` 16 | `generate` 16 |
+|---|---:|---:|---:|---:|---:|
+| `flow_mdlm_control` | 0.140 ± 0.099 | 0.812 ± 0.221 | 0.888 ± 0.131 | 0.760 ± 0.196 | 0.892 ± 0.127 |
+| `flow_dfm_linear` | 0.132 ± 0.137 | 0.660 ± 0.217 | 0.831 ± 0.188 | 0.700 ± 0.219 | 0.762 ± 0.186 |
+| `flow_dfm_cubic` | 0.145 ± 0.078 | 0.797 ± 0.169 | 0.906 ± 0.108 | 0.762 ± 0.178 | 0.935 ± 0.126 |
+
+- Reference CE, arm minus control per seed: linear -0.008 ± 0.065 (lower in 3/4), cubic +0.005 ± 0.085 (lower in 1/4).
+  No training-objective effect is detectable.
+- `generate()` minus `dfm_sample` over the 12 runs: +0.119 ± 0.147 at 8 steps (higher in 10, tie in 1, lower in 1) and
+  +0.122 ± 0.120 at 16 steps (higher in 11, tie in 1, lower in 0).
+- Caveats: one memorized sentence (training-set measures), tiny model, 4 seeds; `dfm_sample` has no corrector and no
+  time conditioning. `generate()` returns identical accuracy at 8 and 16 steps in some runs (early stopping, not checked).
+
+### 11b. Held-out passages (1000 steps, seeds 0-3, `--n-examples 48 --heldout 24`)
+
+Configs `flow_heldout_*`: 96 distinct documentation passages (<= 100 characters, one window each); training uses 48,
+the reference CE is also measured on 24 passages never seen. Nothing is memorized at this budget.
+
+| Arm | train CE | held-out CE | gap | `dfm_sample` 16 | `generate` 16 |
+|---|---:|---:|---:|---:|---:|
+| `flow_heldout_mdlm_control` | 3.078 ± 0.036 | 3.494 ± 0.026 | 0.416 | 0.062 ± 0.012 | 0.148 ± 0.019 |
+| `flow_heldout_dfm_linear` | 3.051 ± 0.030 | 3.526 ± 0.025 | 0.475 | 0.065 ± 0.009 | 0.155 ± 0.019 |
+| `flow_heldout_dfm_cubic` | 2.997 ± 0.029 | 3.571 ± 0.030 | 0.574 | 0.064 ± 0.008 | 0.155 ± 0.021 |
+
+- Held-out CE, arm minus control per seed: linear +0.032 ± 0.009 and cubic +0.077 ± 0.010, **worse in 4/4 seeds** for
+  both. The DFM arms fit the training set as well or better (cubic lowest) but generalize slightly less.
+- Sampling accuracy is near the floor for every arm; `generate()` is again above `dfm_sample` (about 0.15 vs 0.06).
+- Trivial references on the same kind of split (random 48/24 passage splits, 4 seeds, characters, no masking, add-one or
+  0.1-interpolated smoothing): unigram 3.446 nats, bigram 2.927, uniform over 257 symbols 5.549. All three arms (3.49-3.57)
+  are near the unigram level and far from the bigram one. The metrics differ (model CE is measured on masked positions
+  with `p ~ U(0, 1)`), so this is indicative only.
+- Caveats: the effect is small (0.03-0.08 nats on about 3.5), 4 seeds, one tiny model, short training. The `1/p` weight also
+  changes the effective gradient scale (Adam, clip 10), which is not controlled here, so the cause is not established.
 
 ```bash
-kairos overfit configs/ablations/flow_dfm_linear.yaml --steps 600 --mask-p-max 1.0 --no-mask-reweight --seed <0|1|2>
-kairos overfit configs/ablations/flow_mdlm_control.yaml --steps 600 --mask-p-max 1.0 --mask-reweight --seed <0|1|2>
+kairos overfit configs/ablations/flow_dfm_linear.yaml --steps 1800 --mask-p-max 1.0 --no-mask-reweight --seed <0..3>
+kairos overfit configs/ablations/flow_heldout_dfm_cubic.yaml --steps 1000 --n-examples 48 --heldout 24 \
+  --mask-p-max 1.0 --no-mask-reweight --seed <0..3>
 ```
+
+### 11c. Same experiments at the tuned learning rate (8e-3)
+
+The §11a/§11b runs use `--lr 1e-3`, which was not swept. They were repeated with `--lr 0.008` (the rate selected for AdamW in
+`training_algorithms.md`): `python scripts/run_convergence_experiments.py flow --lr 0.008` and `... heldout --lr 0.008`
+(results in `results/flow_lr0.008.jsonl`, `results/heldout_lr0.008.jsonl`).
+
+| Arm | memorization CE (1800 steps) | held-out CE | train CE (held-out run) |
+|---|---:|---:|---:|
+| control `1/p` | 0.082 ± 0.106 | 3.591 ± 0.045 | 3.074 ± 0.034 |
+| DFM linear | 0.073 ± 0.052 | 3.675 ± 0.064 | 2.988 ± 0.062 |
+| DFM cubic | 0.034 ± 0.027 | 3.805 ± 0.079 | 2.913 ± 0.144 |
+
+- Memorization, arm minus control per seed: linear -0.009 ± 0.072 (lower on 1/4), cubic -0.048 ± 0.091 (lower on 2/4): no
+  detectable effect, as at 1e-3.
+- Held-out CE, arm minus control: linear +0.084 ± 0.019, cubic +0.214 ± 0.123, **worse on 4/4 seeds**; train CE lower on 4/4
+  (-0.086 ± 0.057, -0.161 ± 0.144). Train-held-out gap 0.517 (control), 0.687, 0.892 (0.416, 0.475, 0.574 at 1e-3).
+- All three held-out values (3.59-3.81) are above the smoothed unigram reference (3.446); indicative only (metrics differ).
+- Sampling accuracy at 8e-3 saturates: `generate` and `dfm_sample` tie in 10 (8 steps) and 11 (16 steps) of 12 runs, so no
+  sampler comparison is made at this rate. Accuracy across arms is also batch-dependent (see `README.md`).
+
+## 12. Seeded re-measurement of §1 and §7 (600 steps, `--mask-p-max 0.3 --no-mask-reweight`, `--save-curve`)
+
+Since `--seed` now seeds init, step order and masking, §1 and the 600-step row of §7 were re-run (curves saved with
+`--save-curve`). Seeds 0-4, except dense `conv` and `patch` (seeds 0-2, about 250 s per dense run).
+
+| Config | n | min loss (per seed) | min ± sd | last-100 mean | steps to <=1.0 (per seed) |
+|---|---:|---|---:|---:|---|
+| `baseline` (liz2, depthwise) | 5 | 0.101, 0.100, 0.293, 0.070, 0.803 | 0.273 ± 0.309 | 0.387 | 187, 192, 234, 204, 344 |
+| `attn_vanilla` | 5 | 0.219, 0.584, 0.289, 0.144, 0.443 | 0.336 ± 0.177 | 0.607 | 303, 301, 234, 244, 282 |
+| `codec_conv_cpg8` | 5 | 0.058, 0.037, 0.070, 0.033, 0.072 | 0.054 ± 0.018 | 0.067 | 185, 175, 156, 170, 203 |
+| `codec_conv_dense` | 3 | 0.025, 0.024, 0.023 | 0.024 ± 0.001 | 0.028 | 120, 112, 105 |
+| `codec_patch` | 3 | 0.017, 0.018, 0.017 | 0.017 ± 0.001 | 0.019 | 86, 88, 85 |
+| `liz2_separate_qkv` | 5 | 0.326, 0.182, 0.199, 0.065, 0.121 | 0.179 ± 0.098 | 0.272 | 268, 260, 193, 182, 204 |
+
+- Codec ranking `patch < dense < cpg8 < depthwise` holds on every seed measured.
+- `liz2` vs `vanilla`: min loss lower on 3/5 seeds (0, 1, 3), higher on 2; steps to <=1.0 faster on 3, tie on 1, slower on 1.
+  The v1 gap (0.354 vs 0.707, 3 unseeded runs) is not reproduced; means overlap heavily (one `liz2` seed at 0.803).
+- Shared vs separate QKV: shared min loss lower on 2/5 seeds only; means 0.273 vs 0.179. The §7 first-row effect
+  (0.369 vs 0.610) is not reproduced. Cause of the earlier gap not isolated (unseeded runs, seed drove only the subset).
+- Not re-run: §1 thresholds below 1.0 for the non-baseline arms, the 3000-step and frozen-QKV checks of §7, all sweeps of §2-§6.
+- Raw curves are not versioned; they are regenerated with `kairos overfit <config> --steps 600 --mask-p-max 0.3
+  --no-mask-reweight --seed <n> --save-curve <path>`.
+
+## 13. Curriculum vs no curriculum (1800 steps, seeds 0-3, `flow_mdlm_control`)
+
+Curriculum arm: `kairos overfit configs/ablations/flow_mdlm_control.yaml --steps 1800 --seed <n>` (stages walked, as in the
+default). No-curriculum arm: the same with `--mask-p-max 1.0 --mask-reweight` (§11a `flow_mdlm_control`). Reference CE
+(plain, linear path, `p ~ U(0, 1)`):
+
+| Arm | seed 0 | seed 1 | seed 2 | seed 3 | mean ± sd |
+|---|---:|---:|---:|---:|---:|
+| curriculum | 0.219 | 0.015 | 0.065 | 0.204 | 0.126 ± 0.102 |
+| no curriculum | 0.237 | 0.052 | 0.059 | 0.213 | 0.140 ± 0.099 |
+
+- Paired difference (curriculum - none): -0.014 ± 0.018, lower on 3/4 seeds: no detectable effect.
+- Sampling (16 steps, curriculum arm): `generate()` 0.839 ± 0.115, `dfm_sample` 0.795 ± 0.138.
+- No instability without the curriculum was observed, contrary to the informal motivation in the paper. Memorization on one
+  sentence only.
+
+Repeated at `--lr 0.008` (`... curriculum --lr 0.008`, `results/curriculum_lr0.008.jsonl`): curriculum 0.067 ± 0.099 against
+0.082 ± 0.106 without (the `flow_mdlm_control` run of §11c); paired difference -0.015 ± 0.149, lower with the curriculum on 2/4
+seeds: no detectable effect at either rate.
 
 ## Takeaways
 
@@ -198,4 +288,6 @@ kairos overfit configs/ablations/flow_mdlm_control.yaml --steps 600 --mask-p-max
   transfer to real, diverse data at scale.
 - Memory gate and `n_layers=8` remain inconclusive (too few steps / too little compute
   budget respectively) - flagged, not resolved.
-- Flow-matching arms (§11): the `1/p`-weighted control is not beaten by plain-CE DFM training at this scale.
+- Flow-matching arms (§11): no training-objective effect on memorization; on unseen passages the `1/p` control is slightly better in 4/4 seeds; `dfm_sample` is below `generate()` (higher in 11 of 12 runs at 16 steps in 11a; mean 0.06 vs 0.15 in 11b).
+- Seeded re-measurement (§12): the `liz2`-vs-`vanilla` and shared-vs-separate QKV gaps of §1/§7 do not replicate; the codec ranking does.
+- Curriculum control (§13): no detectable effect of the curriculum over 4 seeds; no instability without it at this scale.

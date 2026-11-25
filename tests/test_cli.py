@@ -117,3 +117,16 @@ def test_apply_overrides_parses_scientific_floats_and_json_lists():
 
     assert result["train"]["lr"] == 3e-4
     assert result["data"]["text_examples"] == [{"modality": "text", "text": "hi"}]
+
+
+def test_overfit_save_curve_writes_per_step_losses(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    config, curve = tmp_path / "cfg.yaml", tmp_path / "curve.json"
+    config.write_text("model: {}\ndata: {}\ntrain: {}\n")
+    monkeypatch.setattr(cli_mod, "build_pipeline", lambda *a, **k: "FAKE_PIPE")
+    monkeypatch.setattr(cli_mod, "overfit_with_progress", lambda pipe, **kw: [{"loss": 2.0}, {"loss": 1.5}])
+
+    result = CliRunner().invoke(cli_mod.app, ["overfit", str(config), "--save-curve", str(curve)])
+
+    assert result.exit_code == 0 and json.loads(curve.read_text()) == [2.0, 1.5]

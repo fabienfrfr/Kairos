@@ -91,6 +91,8 @@ def overfit_with_progress(
     mask_reweight: bool | None = None,
     seed: int = 0,
     freeze_callback=None,
+    heldout: int = 0,
+    lr: float = 1e-3,
 ) -> list[dict] | None:
     """Runs pipe.overfit_test() with a marimo bar when available, else a plain call."""
     global _overfit_call_count
@@ -108,6 +110,8 @@ def overfit_with_progress(
                 mask_p_max=mask_p_max,
                 mask_reweight=mask_reweight,
                 seed=seed,
+                heldout=heldout,
+                lr=lr,
                 freeze_callback=freeze_callback,
                 progress_callback=lambda step, total, loss_val: bar.update(
                     increment=1, subtitle=f"loss={loss_val:.4f} stage={stage_at(step)}"
@@ -122,6 +126,8 @@ def overfit_with_progress(
             mask_p_max=mask_p_max,
             mask_reweight=mask_reweight,
             seed=seed,
+            heldout=heldout,
+            lr=lr,
             freeze_callback=freeze_callback,
             progress_callback=cb,
         )

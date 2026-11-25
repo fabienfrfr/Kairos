@@ -7,6 +7,8 @@ from transformers import Trainer
 from .modeling import KairosTopkRouter
 
 # DFM schedulers (Gat et al., 2024): kappa_t is the clean-token probability at time t, with its derivative
+OPTIMIZERS = ("adamw", "muon_hybrid")
+MASK_SAMPLINGS = ("uniform", "stratified", "antithetic")
 FLOW_PATHS = {"linear": (lambda t: t, lambda t: 1.0), "cubic": (lambda t: t**3, lambda t: 3 * t**2)}
 
 
@@ -45,14 +47,90 @@ def collect_moe_aux_loss(model) -> torch.Tensor:
     return torch.stack(losses).sum()
 
 
-def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0, path="linear"):
+def make_optimizer(model, name, lr, weight_decay=0.01, betas=(0.9, 0.999)):
+    """AdamW, or Muon on the 2D backbone matrices with AdamW on everything else (one optimizer object)."""
+    fused = torch.cuda.is_available()
+    if name == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=betas, fused=fused)
+    if name != "muon_hybrid":
+        raise ValueError(f"optimizer must be one of {OPTIMIZERS}, got {name!r}")
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    is_muon = lambda n, p: p.ndim == 2 and n.startswith("backbones") and "router" not in n
+    muon = torch.optim.Muon(
+        [p for n, p in named if is_muon(n, p)], lr=lr, weight_decay=weight_decay, adjust_lr_fn="match_rms_adamw"
+    )
+    rest = torch.optim.AdamW(
+        [p for n, p in named if not is_muon(n, p)], lr=lr, weight_decay=weight_decay, betas=betas, fused=fused
+    )
+    return HybridOptimizer(muon, rest)
+
+
+class HybridOptimizer(torch.optim.Optimizer):
+    """Steps several optimizers as one; shares their param_groups so LR schedulers act on all of them."""
+
+    def __init__(self, *optimizers):
+        self.optimizers = optimizers
+        super().__init__([{"params": [torch.zeros(1)], "lr": 0.0}], {})
+        self.param_groups = [g for o in optimizers for g in o.param_groups]
+
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for o in self.optimizers:
+            o.step()
+        return loss
+
+    def zero_grad(self, set_to_none=True):
+        for o in self.optimizers:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {"optimizers": [o.state_dict() for o in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        for o, sd in zip(self.optimizers, state_dict["optimizers"], strict=True):
+            o.load_state_dict(sd)
+
+
+def make_scheduler(optimizer, n_steps, warmup_frac=0.0):
+    """Cosine decay over n_steps, with an optional linear warmup over the first warmup_frac of them."""
+    if warmup_frac <= 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_steps)
+    warm = max(1, int(n_steps * warmup_frac))
+    sched = torch.optim.lr_scheduler
+    return sched.SequentialLR(
+        optimizer,
+        [
+            sched.LinearLR(optimizer, start_factor=1e-3, total_iters=warm),
+            sched.CosineAnnealingLR(optimizer, T_max=max(1, n_steps - warm)),
+        ],
+        milestones=[warm],
+    )
+
+
+def sample_noise_time(batch, sampling, device):
+    """t in (0, 1) per row: iid uniform, stratified (one draw per 1/B stratum) or antithetic (t, 1 - t) pairs."""
+    if sampling not in MASK_SAMPLINGS:
+        raise ValueError(f"sampling must be one of {MASK_SAMPLINGS}, got {sampling!r}")
+    u = torch.rand(batch, device=device)
+    if sampling == "uniform":
+        return u
+    if sampling == "stratified":
+        return (torch.randperm(batch, device=device) + u) / batch
+    half = batch // 2
+    t = u.clone()
+    t[half : 2 * half] = 1.0 - u[:half]
+    return t[torch.randperm(batch, device=device)]
+
+
+def make_diffusion_mask(x0, prompt_len, pad_mask=None, eps=1e-3, p_max=1.0, path="linear", sampling="uniform"):
     """Random per-token mask + per-row rate p for the masked-diffusion objective.
 
     p ~ U(eps, p_max). Full diffusion uses p_max=1.0 (rows can be up to 100% noised).
     A capped p_max (e.g. 0.3) gives a fixed-ish-rate MAE-style corruption instead.
     """
     # flow-matching path: p = 1 - kappa(t) with t ~ U(0, 1); "linear" is exactly p ~ U(0, 1)
-    p = (1.0 - FLOW_PATHS[path][0](torch.rand(x0.size(0), device=x0.device))).clamp(eps, p_max)
+    t = sample_noise_time(x0.size(0), sampling, x0.device)
+    p = (1.0 - FLOW_PATHS[path][0](t)).clamp(eps, p_max)
     p = p[:, None].expand_as(x0)
     noise_mask = torch.rand(x0.shape, device=x0.device) < p
     for i in range(x0.size(0)):
@@ -179,6 +257,7 @@ class KairosDiffusionTrainer(Trainer):
     last_loss_diagnostics: dict | None = None
     mask_eps: float = 1e-3  # floor of p ~ U(eps, p_max); CE/p makes rare low-p rows dominate
     mask_p_max: float = 1.0  # ceiling of p; 1.0 = full diffusion, cap for MAE-style corruption
+    mask_sampling: str = "uniform"  # how t is drawn per batch: uniform, stratified or antithetic
     mask_path: str = "linear"  # DFM scheduler for p; with mask_reweight=0 the loss is the DFM posterior CE
     mask_reweight: bool = True  # divide CE by p; False for plain CE
     mask_reweight_clip: float | None = 3.0  # caps 1/p weight; bounds variance from rare low-p rows
@@ -195,7 +274,13 @@ class KairosDiffusionTrainer(Trainer):
         pad_mask = inputs.get("mask")
 
         noise_mask, p = make_diffusion_mask(
-            x0, prompt_len, pad_mask, eps=self.mask_eps, p_max=self.mask_p_max, path=self.mask_path
+            x0,
+            prompt_len,
+            pad_mask,
+            eps=self.mask_eps,
+            p_max=self.mask_p_max,
+            path=self.mask_path,
+            sampling=self.mask_sampling,
         )
         if not noise_mask.any():
             # exceedingly rare: short sequence + low mask ratio

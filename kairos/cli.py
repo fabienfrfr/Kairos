@@ -182,11 +182,17 @@ def overfit(
         bool | None, typer.Option("--mask-reweight/--no-mask-reweight", help="Fix mask_reweight, paired with p_max.")
     ] = None,
     seed: Annotated[int, typer.Option(help="RNG seed for init, masking and step order.")] = 0,
+    heldout: Annotated[int, typer.Option(help="Extra unseen examples for a held-out reference CE (0 disables).")] = 0,
+    lr: Annotated[float, typer.Option(help="Peak learning rate of the overfit optimizer.")] = 1e-3,
+    save_curve: Annotated[Path | None, typer.Option(help="Write the per-step training loss as JSON.")] = None,
     set_: OverrideOpt = None,
 ) -> None:
     """Runs pipe.overfit_test() to sanity-check that the model can memorize a tiny subset."""
+    import torch
+
+    torch.manual_seed(seed)  # model init; overfit_test re-seeds step order and masking
     pipe = build_pipeline(config, set_ or [])
-    overfit_with_progress(
+    logs = overfit_with_progress(
         pipe,
         n_examples=n_examples,
         steps=steps,
@@ -195,7 +201,11 @@ def overfit(
         mask_p_max=mask_p_max,
         mask_reweight=mask_reweight,
         seed=seed,
+        heldout=heldout,
+        lr=lr,
     )
+    if save_curve is not None and logs:
+        save_curve.write_text(json.dumps([row["loss"] for row in logs]))
 
 
 @app.command()
