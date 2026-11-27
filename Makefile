@@ -76,6 +76,24 @@ mapper: ## Export full project structure to JSON
 mapper-lean: ## Export project structure to JSON, excluding scripts/tests/docs
 	uv run python3 mapper.py --to-json . project_structure.json --exclude scripts tests docs
 
+fetch-datasets: ## Download keep-it-simple and keep-it-simple-multimodal to data/ (needs access to huggingface.co)
+	uv run python scripts/fetch_datasets.py
+
+sample-pretrain: ## Small multimodal sample run on the local datasets (run fetch-datasets first)
+	uv run $(UV_TORCH_EXTRA) kairos pretrain configs/pretrain_sample.yaml --no-push --name sample
+
+datasets-branch: ## Create or update a GitHub branch with both Hub datasets (BRANCH=datasets REMOTE=<url, default origin> TEXT_ROWS=<all>)
+	uv run python scripts/mirror_datasets_to_github.py --out .datasets-branch --push --branch $(or $(BRANCH),datasets) $(if $(REMOTE),--remote $(REMOTE),) $(if $(TEXT_ROWS),--text-rows $(TEXT_ROWS),)
+
+mirror-datasets: ## Like datasets-branch but only commits locally in OUT (OUT=../kairos-data TEXT_ROWS=20000); see docs/experiments/share_datasets.md
+	uv run python scripts/mirror_datasets_to_github.py --out $(or $(OUT),../kairos-data) --text-rows $(or $(TEXT_ROWS),20000)
+
+gpu-bench: ## Seconds/step, tokens/s and peak GPU memory per batch size on the real datasets (needs fetch-datasets)
+	uv run python scripts/check_pretraining_readiness.py bench --source hf --batch-sizes 4,8,16,32 --steps 50 --out gpu_bench.json
+
+readiness: ## Check that the model trains on synthetic rows with the dataset schema (CPU, about 4 min)
+	uv run python scripts/check_pretraining_readiness.py train --per-modality 14 --lr 0.008
+
 build-multimodal: ## Build + push the multimodal dataset (uv sync --group scripts first)
 	uv run --group scripts python3 scripts/pretrain/build_keep_it_simple_multimodal.py
 

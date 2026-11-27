@@ -105,6 +105,14 @@ Fused DeltaNet / causal-conv1d kernels are optional (pure-PyTorch fallback other
    It uses `ffurfaro/keep-it-simple` (text) and `ffurfaro/keep-it-simple-multimodal`, and logs to TensorBoard.
 3. Push: `pipe.push_to_hub("ffurfaro/kairos")` (native HF format, checkpoints, TensorBoard run, model card).
 
+Datasets without Hugging Face access: `make datasets-branch` publishes both datasets as a branch of this repository, and
+`hf_data.github: <user>/<repo>@datasets` (see `configs/pretrain_sample_github.yaml`) or
+`kairos.hf_data.load_github_datasets("<user>/<repo>@datasets")` imports them back (`docs/experiments/share_datasets.md`).
+
+A small multimodal sample run with the settings that converged fastest (lr 8e-3 and per-modality scale factors) is
+`make fetch-datasets` then `make sample-pretrain`; what was verified without the Hub, and what was not, is in
+`docs/experiments/pretraining_readiness.md`.
+
 **Next step** (from the paper): a pretraining run with held-out loss per stage and modality, and a bits-per-byte
 comparison with Pythia-14M.
 

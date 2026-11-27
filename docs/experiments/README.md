@@ -29,6 +29,7 @@ Bit-exactness is not claimed across other hardware, thread counts or torch versi
 | Same on unseen passages (1000 steps) | `... heldout` | 12 | 95 s | `results/heldout.jsonl` | Results, objective | §11b |
 | Curriculum vs none (1800 steps) | `... curriculum` | 4 | 207 s | `results/curriculum.jsonl` | Results, curriculum | §13 |
 | Same three at the tuned rate 8e-3 | `... flow --lr 0.008`, `... heldout --lr 0.008`, `... curriculum --lr 0.008` | 12 + 12 + 4 | 200-230 s / 115 s / 195 s | `results/*_lr0.008.jsonl` | Results, objective and curriculum | §11c, §13 |
+| Pretraining readiness on dataset-schema rows (4 learning rates; GPU continuation in `rtx_quickstart.md`) | `python scripts/check_pretraining_readiness.py train --per-modality 14 --lr 0.008` | 1 per rate | 200 s | `results/pretraining_readiness_lr*.json` | not in the paper | `pretraining_readiness.md` |
 | Optimizer and noise sampling | `python scripts/run_training_algorithms.py sweep`, then `final` | 42 + 20 | 80 s / 207 s | `results/training_algorithms.jsonl` | Results, training algorithm | `training_algorithms.md` |
 
 (`...` is `python scripts/run_convergence_experiments.py`.) Add `--budget-s 250` to stop starting runs before the 300 s
@@ -39,6 +40,9 @@ To start from scratch, delete the matching `results/*.jsonl` file (and `results/
 The configs are in `configs/ablations/` (`baseline`, `attn_vanilla`, `codec_*`, `liz2_separate_qkv`, `flow_*`,
 `flow_heldout_*`, `train_*`). The exact flags of each run are built by `command()` in the scripts, for example
 `kairos overfit configs/ablations/flow_dfm_cubic.yaml --steps 1800 --mask-p-max 1.0 --no-mask-reweight --seed 2 --log-every 0`.
+
+Datasets for the pretraining checks: `rtx_quickstart.md` (GPU PC with Hub access) and `share_datasets.md` (GitHub mirror so that
+the analysis sandbox can read them).
 
 ## Checks tying the paper to the data
 

@@ -1,3 +1,6 @@
+.datasets-branch/
+data/
+
 uv.lock
 project_structure.json
 project_structure*

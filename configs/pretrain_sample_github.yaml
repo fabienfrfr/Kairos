@@ -1,0 +1,40 @@
+# Same as pretrain_sample.yaml but reads the two datasets from the GitHub branch made by `make datasets-branch`
+# (no Hugging Face access needed): the branch zip is downloaded once into ~/.cache/kairos/datasets.
+# Run: kairos pretrain configs/pretrain_sample_github.yaml --no-push --name sample
+hf_data: {github: fabienfrfr/Kairos@datasets, text_pct: 1, eval_pct: 0.01, seed: 0}
+model:
+  d_model: 64
+  n_heads: 4
+  n_layers: 4
+  stride: 3
+  num_modalities: 9
+  num_scales: 4
+  modality_scales:
+    0: [0, 1]
+    8: [0]
+    1: [1, 2]
+    4: [1]
+    3: [2]
+    2: [2, 3]
+    7: [3]
+  intermediate_size: 544
+  moe_intermediate_size: 544
+  use_moe: true
+  n_routed_experts: 7
+  num_local_experts: 7
+  num_experts_per_tok: 1
+  n_shared_experts: 1
+  attnres_block_size: 4
+  use_memory_gate: true
+  share_backbones: true
+  codec_mode: conv
+  codec_conv_channels_per_group: 8
+data:
+  max_len: 1024
+  stride: 3
+  batch_size: 4
+  pack: true
+  modality_scale_factors: {image_caption: 2, video_caption: 4, lidar: 4, audio_caption: 16, control: 32}
+train: {lr: 0.008, mae_epochs: 1, transition_epochs: 1, diffusion_epochs: 1, mask_eps: 0.001, mask_mae_p_max: 0.3,
+  mask_mae_reweight: false, mask_p_max: 1.0, mask_reweight: true, save_every: 100, eval_every: 25, eval_batches: 2,
+  run_dir: checkpoints/kairos-multimodal/sample, hub_repo_id: null, hub_push_every_ckpt: false, hub_private: false}
